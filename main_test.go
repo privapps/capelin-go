@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestLoadConfigDefaults(t *testing.T) {
@@ -299,6 +303,18 @@ func TestDisabledToolReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected disabled-tool error for execute_skill")
 	}
+
+	_, err = a.runTool(context.Background(), apiToolCall{
+		ID:   "4",
+		Type: "function",
+		Function: apiFunctionCall{
+			Name:      toolCreateSubagent,
+			Arguments: `{"question":"hello"}`,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected disabled-tool error for create_subagent")
+	}
 }
 
 func TestResolveWorkspacePathRejectsAbsolute(t *testing.T) {
@@ -362,6 +378,19 @@ func TestNoYoloRejectsAbsolutePath(t *testing.T) {
 	}
 }
 
+func TestResolveWorkspacePathRejectsSymlinkEscape(t *testing.T) {
+	outside := t.TempDir()
+	root := t.TempDir()
+	linkPath := filepath.Join(root, "link")
+	if err := os.Symlink(outside, linkPath); err != nil {
+		t.Skipf("symlinks not supported on this platform: %v", err)
+	}
+	_, err := resolveWorkspacePath(root, "link/secret.txt")
+	if err == nil {
+		t.Fatal("expected symlink escape to be rejected")
+	}
+}
+
 func TestExtractExecutableCommands(t *testing.T) {
 	content := `---
 name: demo
@@ -414,5 +443,291 @@ func TestRunExecuteSkillRejectsUndeclaredCommand(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected undeclared command to be rejected")
+	}
+}
+
+func TestLoadConfigSubagentFlags(t *testing.T) {
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	cfg, err := loadConfig([]string{
+		"--allow-tool", toolCreateSubagent,
+		"--allow-tool", toolRunSubagent,
+		"--subagent-max-depth", "2",
+		"--subagent-max-children", "5",
+		"--subagent-max-parallel", "3",
+		"--subagent-timeout-seconds", "45",
+		"task",
+	})
+	if err != nil {
+		t.Fatalf("loadConfig returned error: %v", err)
+	}
+	if !cfg.allowedTools[toolCreateSubagent] || !cfg.allowedTools[toolRunSubagent] {
+		t.Fatal("expected subagent tools to be enabled")
+	}
+	if cfg.subagents.MaxDepth != 2 || cfg.subagents.MaxChildren != 5 || cfg.subagents.MaxParallel != 3 || cfg.subagents.DefaultTimeoutSec != 45 {
+		t.Fatalf("unexpected subagent cfg: %+v", cfg.subagents)
+	}
+}
+
+func TestSubagentLifecycleAndAggregation(t *testing.T) {
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	cfg, err := loadConfig([]string{
+		"--allow-tool", toolCreateSubagent,
+		"--allow-tool", toolRunSubagent,
+		"--allow-tool", toolAwaitSubagent,
+		"--allow-tool", toolListSubagents,
+		"--allow-tool", toolReadSubagent,
+		"--allow-tool", toolCancelSubagent,
+		"task",
+	})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	a, err := newApp(cfg)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	a.subagents.runner = func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+		return "done: " + session.Question, nil
+	}
+
+	createCall := apiToolCall{
+		ID:   "1",
+		Type: "function",
+		Function: apiFunctionCall{
+			Name:      toolCreateSubagent,
+			Arguments: `{"name":"worker-a","question":"inspect repo","execution_mode":"sequential"}`,
+		},
+	}
+	createOut, err := a.runTool(context.Background(), createCall)
+	if err != nil {
+		t.Fatalf("create_subagent error: %v", err)
+	}
+	var created subagentEnvelope
+	if err := json.Unmarshal([]byte(createOut), &created); err != nil {
+		t.Fatalf("decode create output: %v", err)
+	}
+	if created.Status != string(subagentStatusPending) {
+		t.Fatalf("unexpected initial status: %s", created.Status)
+	}
+
+	runCall := apiToolCall{
+		ID:   "2",
+		Type: "function",
+		Function: apiFunctionCall{
+			Name:      toolRunSubagent,
+			Arguments: `{"id":"` + created.ID + `","wait":true}`,
+		},
+	}
+	runOut, err := a.runTool(context.Background(), runCall)
+	if err != nil {
+		t.Fatalf("run_subagent error: %v", err)
+	}
+	var ran subagentEnvelope
+	if err := json.Unmarshal([]byte(runOut), &ran); err != nil {
+		t.Fatalf("decode run output: %v", err)
+	}
+	if ran.Status != string(subagentStatusCompleted) {
+		t.Fatalf("expected completed status, got %s", ran.Status)
+	}
+	if !strings.Contains(ran.Output, "inspect repo") {
+		t.Fatalf("unexpected output: %q", ran.Output)
+	}
+
+	readAggregate := apiToolCall{
+		ID:   "3",
+		Type: "function",
+		Function: apiFunctionCall{
+			Name:      toolReadSubagent,
+			Arguments: `{"ids":["` + created.ID + `"]}`,
+		},
+	}
+	aggregateOut, err := a.runTool(context.Background(), readAggregate)
+	if err != nil {
+		t.Fatalf("read_subagent aggregate error: %v", err)
+	}
+	var agg subagentAggregateEnvelope
+	if err := json.Unmarshal([]byte(aggregateOut), &agg); err != nil {
+		t.Fatalf("decode aggregate output: %v", err)
+	}
+	if agg.Kind != "aggregate" || agg.Count != 1 || agg.Completed != 1 {
+		t.Fatalf("unexpected aggregate envelope: %+v", agg)
+	}
+}
+
+func TestSubagentPolicyInheritancePreventsEscalation(t *testing.T) {
+	parentAllowed := map[string]bool{
+		toolListFiles: true,
+		toolReadFile:  true,
+	}
+	_, err := deriveChildAllowedTools(parentAllowed, []string{toolWriteFile}, 1, 2)
+	if err == nil {
+		t.Fatal("expected escalation to be rejected")
+	}
+}
+
+func TestSubagentMaxDepthAndChildren(t *testing.T) {
+	cfg := defaultSubagentRuntimeConfig()
+	cfg.MaxDepth = 1
+	cfg.MaxChildren = 1
+	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+		return "ok", nil
+	})
+	root := &agentRuntime{
+		sessionID:         rootAgentID,
+		depth:             0,
+		allowedTools:      map[string]bool{toolCreateSubagent: true},
+		maxToolIterations: 5,
+	}
+	_, err := m.create(root, createSubagentArgs{Question: "a"})
+	if err != nil {
+		t.Fatalf("first create failed: %v", err)
+	}
+	_, err = m.create(root, createSubagentArgs{Question: "b"})
+	if err == nil {
+		t.Fatal("expected max-children rejection")
+	}
+
+	childRuntime := &agentRuntime{
+		sessionID:         "subagent-1",
+		depth:             1,
+		allowedTools:      map[string]bool{toolCreateSubagent: true},
+		maxToolIterations: 5,
+	}
+	_, err = m.create(childRuntime, createSubagentArgs{Question: "nested"})
+	if err == nil {
+		t.Fatal("expected max-depth rejection")
+	}
+}
+
+func TestSubagentParallelBoundedWorkerPool(t *testing.T) {
+	cfg := defaultSubagentRuntimeConfig()
+	cfg.MaxParallel = 2
+	cfg.MaxDepth = 1
+	m := newSubagentManager(cfg, nil)
+
+	var concurrent atomic.Int64
+	var peak atomic.Int64
+	m.runner = func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+		now := concurrent.Add(1)
+		for {
+			currentPeak := peak.Load()
+			if now <= currentPeak || peak.CompareAndSwap(currentPeak, now) {
+				break
+			}
+		}
+		time.Sleep(80 * time.Millisecond)
+		concurrent.Add(-1)
+		return "ok", nil
+	}
+
+	root := &agentRuntime{
+		sessionID:         rootAgentID,
+		depth:             0,
+		allowedTools:      map[string]bool{toolCreateSubagent: true, toolRunSubagent: true, toolAwaitSubagent: true},
+		maxToolIterations: 5,
+	}
+	ids := make([]string, 0, 3)
+	for i := 0; i < 3; i++ {
+		session, err := m.create(root, createSubagentArgs{Question: fmt.Sprintf("q-%d", i), ExecutionMode: "parallel"})
+		if err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+		ids = append(ids, session.ID)
+		if _, err := m.run(context.Background(), root, runSubagentArgs{ID: session.ID, ExecutionMode: "parallel"}); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+	}
+	for _, id := range ids {
+		if _, err := m.await(context.Background(), root, awaitSubagentArgs{ID: id, TimeoutSeconds: 5}); err != nil {
+			t.Fatalf("await %s: %v", id, err)
+		}
+	}
+	if peak.Load() > 2 {
+		t.Fatalf("expected peak parallelism <= 2, got %d", peak.Load())
+	}
+}
+
+func TestRunSubagentPreservesCreatedExecutionMode(t *testing.T) {
+	cfg := defaultSubagentRuntimeConfig()
+	cfg.MaxDepth = 1
+	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+		return "mode=" + session.ExecutionMode, nil
+	})
+	root := &agentRuntime{
+		sessionID: rootAgentID,
+		depth:     0,
+		allowedTools: map[string]bool{
+			toolCreateSubagent: true,
+			toolRunSubagent:    true,
+			toolAwaitSubagent:  true,
+		},
+		maxToolIterations: 5,
+	}
+
+	created, err := m.create(root, createSubagentArgs{Question: "q", ExecutionMode: "parallel"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	queued, err := m.run(context.Background(), root, runSubagentArgs{ID: created.ID})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if queued.ExecutionMode != "parallel" {
+		t.Fatalf("expected queued execution mode to remain parallel, got %q", queued.ExecutionMode)
+	}
+	done, err := m.await(context.Background(), root, awaitSubagentArgs{ID: created.ID, TimeoutSeconds: 5})
+	if err != nil {
+		t.Fatalf("await: %v", err)
+	}
+	if done.Status != subagentStatusCompleted {
+		t.Fatalf("expected completed status, got %q", done.Status)
+	}
+	if !strings.Contains(done.Output, "mode=parallel") {
+		t.Fatalf("unexpected output: %q", done.Output)
+	}
+}
+
+func TestBuildAgentToolsHonorsRestrictedAlwaysTools(t *testing.T) {
+	enabled := map[string]bool{
+		toolReadFile: true,
+	}
+	tools := buildAgentTools(enabled)
+	if len(tools) != 1 {
+		t.Fatalf("expected exactly one tool, got %d", len(tools))
+	}
+	if tools[0].Function.Name != toolReadFile {
+		t.Fatalf("expected only read_file tool, got %q", tools[0].Function.Name)
+	}
+}
+
+func TestRunToolForRuntimeRejectsRestrictedAlwaysTool(t *testing.T) {
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	cfg, err := loadConfig([]string{"task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	a := &app{cfg: cfg}
+	runtime := &agentRuntime{
+		sessionID: rootAgentID,
+		depth:     0,
+		allowedTools: map[string]bool{
+			toolReadFile: true,
+		},
+		maxToolIterations: 5,
+	}
+
+	_, err = a.runToolForRuntime(context.Background(), runtime, apiToolCall{
+		ID:   "x",
+		Type: "function",
+		Function: apiFunctionCall{
+			Name:      toolWebSearch,
+			Arguments: `{"query":"test"}`,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected restricted always-enabled tool to be blocked by runtime policy")
+	}
+	if !strings.Contains(err.Error(), "disabled by current policy") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

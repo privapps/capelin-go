@@ -36,6 +36,8 @@ var ddgSearchURL = "https://html.duckduckgo.com/html"
 var bingSearchURL = "https://www.bing.com/search"
 var allowPrivateFetch = false
 
+var errListLimitReached = errors.New("list limit reached")
+
 var toolHTTPClient = &http.Client{
 	Timeout: toolTimeout,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -88,6 +90,40 @@ type executeSkillArgs struct {
 	Args           []string `json:"args"`
 	Cwd            string   `json:"cwd"`
 	TimeoutSeconds int      `json:"timeout_seconds"`
+}
+
+type createSubagentArgs struct {
+	Name           string   `json:"name"`
+	Question       string   `json:"question"`
+	AllowedTools   []string `json:"allowed_tools"`
+	TimeoutSeconds int      `json:"timeout_seconds"`
+	ExecutionMode  string   `json:"execution_mode"`
+}
+
+type runSubagentArgs struct {
+	ID             string `json:"id"`
+	Wait           bool   `json:"wait"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	ExecutionMode  string `json:"execution_mode"`
+}
+
+type awaitSubagentArgs struct {
+	ID             string `json:"id"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+}
+
+type listSubagentsArgs struct {
+	IncludeDescendants bool `json:"include_descendants"`
+}
+
+type readSubagentArgs struct {
+	ID            string   `json:"id"`
+	IDs           []string `json:"ids"`
+	IncludeOutput *bool    `json:"include_output"`
+}
+
+type cancelSubagentArgs struct {
+	ID string `json:"id"`
 }
 
 type searchResult struct {
@@ -285,6 +321,157 @@ func specReadSkill() apiTool {
 					"name": map[string]any{"type": "string", "description": "Skill name"},
 				},
 				"required":             []string{"name"},
+				"additionalProperties": false,
+			},
+		},
+	}
+}
+
+func specCreateSubagent() apiTool {
+	return apiTool{
+		Type: "function",
+		Function: apiToolSpec{
+			Name:        toolCreateSubagent,
+			Description: "Create a worker subagent session with inherited-and-restricted tool policy. Does not start execution.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{"type": "string", "description": "Optional subagent label"},
+					"question": map[string]any{
+						"type":        "string",
+						"description": "Task prompt for the subagent",
+					},
+					"allowed_tools": map[string]any{
+						"type":        "array",
+						"description": "Optional restricted tool allowlist (must be subset of parent allowed tools)",
+						"items":       map[string]any{"type": "string"},
+					},
+					"timeout_seconds": map[string]any{
+						"type":        "integer",
+						"description": "Execution timeout in seconds",
+					},
+					"execution_mode": map[string]any{
+						"type":        "string",
+						"description": `Execution mode: "sequential" (default) or "parallel"`,
+					},
+				},
+				"required":             []string{"question"},
+				"additionalProperties": false,
+			},
+		},
+	}
+}
+
+func specRunSubagent() apiTool {
+	return apiTool{
+		Type: "function",
+		Function: apiToolSpec{
+			Name:        toolRunSubagent,
+			Description: "Start a created subagent. Optional wait=true blocks until completion.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id": map[string]any{"type": "string", "description": "Subagent id"},
+					"wait": map[string]any{
+						"type":        "boolean",
+						"description": "Wait for completion before returning",
+					},
+					"timeout_seconds": map[string]any{
+						"type":        "integer",
+						"description": "Optional wait timeout when wait=true",
+					},
+					"execution_mode": map[string]any{
+						"type":        "string",
+						"description": `Scheduling mode override: "sequential" or "parallel"`,
+					},
+				},
+				"required":             []string{"id"},
+				"additionalProperties": false,
+			},
+		},
+	}
+}
+
+func specAwaitSubagent() apiTool {
+	return apiTool{
+		Type: "function",
+		Function: apiToolSpec{
+			Name:        toolAwaitSubagent,
+			Description: "Wait for a running subagent to finish and return its result envelope.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id": map[string]any{"type": "string", "description": "Subagent id"},
+					"timeout_seconds": map[string]any{
+						"type":        "integer",
+						"description": "Optional wait timeout in seconds",
+					},
+				},
+				"required":             []string{"id"},
+				"additionalProperties": false,
+			},
+		},
+	}
+}
+
+func specListSubagents() apiTool {
+	return apiTool{
+		Type: "function",
+		Function: apiToolSpec{
+			Name:        toolListSubagents,
+			Description: "List subagents visible to the current agent.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"include_descendants": map[string]any{
+						"type":        "boolean",
+						"description": "Include descendant subagents, not only direct children",
+					},
+				},
+				"additionalProperties": false,
+			},
+		},
+	}
+}
+
+func specReadSubagent() apiTool {
+	return apiTool{
+		Type: "function",
+		Function: apiToolSpec{
+			Name:        toolReadSubagent,
+			Description: "Read one subagent envelope or aggregate multiple subagent results by ids.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id": map[string]any{"type": "string", "description": "Single subagent id"},
+					"ids": map[string]any{
+						"type":        "array",
+						"description": "Multiple subagent ids for aggregate fan-in read",
+						"items":       map[string]any{"type": "string"},
+					},
+					"include_output": map[string]any{
+						"type":        "boolean",
+						"description": "When false, omit output payloads",
+					},
+				},
+				"additionalProperties": false,
+			},
+		},
+	}
+}
+
+func specCancelSubagent() apiTool {
+	return apiTool{
+		Type: "function",
+		Function: apiToolSpec{
+			Name:        toolCancelSubagent,
+			Description: "Cancel a pending or running subagent.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id": map[string]any{"type": "string", "description": "Subagent id"},
+				},
+				"required":             []string{"id"},
 				"additionalProperties": false,
 			},
 		},
@@ -664,11 +851,11 @@ func runListFiles(workspaceRoot string, yolo bool, args listFilesArgs) (string, 
 		}
 		entries = append(entries, filepath.ToSlash(rel)+marker)
 		if len(entries) >= maxListEntries {
-			return errors.New("list limit reached")
+			return errListLimitReached
 		}
 		return nil
 	})
-	if err != nil && !strings.Contains(err.Error(), "list limit reached") {
+	if err != nil && !errors.Is(err, errListLimitReached) {
 		return "", fmt.Errorf("list files: %w", err)
 	}
 	slices.Sort(entries)
@@ -919,7 +1106,7 @@ func containsDangerousPattern(command string, args []string) bool {
 		}
 	}
 	for _, arg := range args {
-		if strings.ContainsAny(arg, "\x00") {
+		if strings.Contains(arg, "\x00") {
 			return true
 		}
 	}
@@ -943,6 +1130,27 @@ func resolvePathForTool(workspaceRoot, userPath string, yolo bool) (string, erro
 	return resolveWorkspacePath(workspaceRoot, userPath)
 }
 
+// resolveExistingPath resolves symlinks for p, walking up to the nearest existing
+// ancestor and reconstructing the remaining path components without symlinks.
+func resolveExistingPath(p string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(p)
+	if err == nil {
+		return resolved, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+	parent := filepath.Dir(p)
+	if parent == p {
+		return p, nil
+	}
+	resolvedParent, err := resolveExistingPath(parent)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(resolvedParent, filepath.Base(p)), nil
+}
+
 func resolveWorkspacePath(workspaceRoot, userPath string) (string, error) {
 	if strings.TrimSpace(userPath) == "" {
 		return "", errors.New("path is required")
@@ -961,7 +1169,18 @@ func resolveWorkspacePath(workspaceRoot, userPath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve path: %w", err)
 	}
-	rel, err := filepath.Rel(absBase, absCandidate)
+
+	// Resolve symlinks on both paths to prevent symlink-based workspace escapes.
+	resolvedBase, err := resolveExistingPath(absBase)
+	if err != nil {
+		return "", fmt.Errorf("resolve path: %w", err)
+	}
+	resolvedCandidate, err := resolveExistingPath(absCandidate)
+	if err != nil {
+		return "", fmt.Errorf("resolve path: %w", err)
+	}
+
+	rel, err := filepath.Rel(resolvedBase, resolvedCandidate)
 	if err != nil {
 		return "", fmt.Errorf("resolve path: %w", err)
 	}
