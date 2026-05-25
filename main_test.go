@@ -731,3 +731,81 @@ func TestRunToolForRuntimeRejectsRestrictedAlwaysTool(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestLoadConfigMaxIterationsFlag(t *testing.T) {
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	t.Setenv("MAX_ITERATIONS", "")
+
+	// Default should be 40.
+	cfg, err := loadConfig([]string{"task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.maxIterations != defaultMaxIterations {
+		t.Fatalf("expected default maxIterations=%d, got %d", defaultMaxIterations, cfg.maxIterations)
+	}
+
+	// Flag overrides default.
+	cfg, err = loadConfig([]string{"--max-iterations", "100", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.maxIterations != 100 {
+		t.Fatalf("expected maxIterations=100, got %d", cfg.maxIterations)
+	}
+
+	// = form.
+	cfg, err = loadConfig([]string{"--max-iterations=75", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.maxIterations != 75 {
+		t.Fatalf("expected maxIterations=75, got %d", cfg.maxIterations)
+	}
+
+	// Reject non-positive value.
+	_, err = loadConfig([]string{"--max-iterations", "0", "task"})
+	if err == nil {
+		t.Fatal("expected error for --max-iterations=0")
+	}
+}
+
+func TestLoadConfigMaxIterationsEnv(t *testing.T) {
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	t.Setenv("MAX_ITERATIONS", "60")
+
+	cfg, err := loadConfig([]string{"task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.maxIterations != 60 {
+		t.Fatalf("expected maxIterations=60 from env, got %d", cfg.maxIterations)
+	}
+
+	// CLI flag wins over env.
+	cfg, err = loadConfig([]string{"--max-iterations", "25", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.maxIterations != 25 {
+		t.Fatalf("expected CLI flag (25) to override env (60), got %d", cfg.maxIterations)
+	}
+}
+
+func TestRootRuntimeUsesMaxIterations(t *testing.T) {
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	t.Setenv("MAX_ITERATIONS", "")
+
+	cfg, err := loadConfig([]string{"--max-iterations", "99", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	a, err := newApp(cfg)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	rt := a.rootRuntime()
+	if rt.maxToolIterations != 99 {
+		t.Fatalf("expected rootRuntime.maxToolIterations=99, got %d", rt.maxToolIterations)
+	}
+}

@@ -20,8 +20,8 @@ const (
 	defaultSubagentMaxDepth          = 1
 	defaultSubagentMaxChildren       = 8
 	defaultSubagentMaxParallel       = 1
-	defaultSubagentDefaultTimeoutSec = 120
-	defaultSubagentMaxTimeoutSec     = 300
+	defaultSubagentDefaultTimeoutSec = 300
+	defaultSubagentMaxTimeoutSec     = 600
 	defaultSubagentToolIterations    = 20
 	defaultSubagentResultChars       = 8000
 	defaultSubagentAggregateCount    = 12

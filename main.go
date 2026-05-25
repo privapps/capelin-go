@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -23,7 +24,7 @@ const (
 	defaultModel         = "gpt-5-mini"
 	defaultToken         = ""
 	defaultReasoning     = "medium"
-	maxToolIterations    = 40
+	defaultMaxIterations = 40
 	requestTimeout       = 10 * time.Minute
 	usageMessageTemplate = "Usage: %s [--allow-tool TOOL] \"your task\"\n"
 )
@@ -67,6 +68,12 @@ Decision policy:
 4. Produce the finished deliverable.
 5. Include optional improvements if high value.
 
+Tool efficiency rules:
+- Limit web_search calls to at most 5 per task; prefer broad, precise queries over many narrow ones.
+- Do not retry the same search intent with only minor query variations.
+- If the first search yields insufficient results, widen the query instead of repeating it.
+- Prefer fetch_page on a known URL over a new web_search when you already have a relevant link.
+
 Output policy:
 - Return final answers, not partial work.
 - Avoid hedging language.
@@ -84,6 +91,12 @@ const (
 	toolExecuteSkill   = "execute_skill"
 	toolListSkills     = "list_skills"
 	toolReadSkill      = "read_skill"
+	toolCreateSubagent = "create_subagent"
+	toolRunSubagent    = "run_subagent"
+	toolAwaitSubagent  = "await_subagent"
+	toolListSubagents  = "list_subagents"
+	toolReadSubagent   = "read_subagent"
+	toolCancelSubagent = "cancel_subagent"
 )
 
 var alwaysEnabledTools = []string{
@@ -100,6 +113,12 @@ var optInTools = map[string]struct{}{
 	toolAppendFile:     {},
 	toolExecuteProgram: {},
 	toolExecuteSkill:   {},
+	toolCreateSubagent: {},
+	toolRunSubagent:    {},
+	toolAwaitSubagent:  {},
+	toolListSubagents:  {},
+	toolReadSubagent:   {},
+	toolCancelSubagent: {},
 }
 
 type config struct {
@@ -113,13 +132,16 @@ type config struct {
 	workspaceRoot   string
 	allowedTools    map[string]bool
 	yolo            bool // enables all tools and unrestricted paths
+	maxIterations   int
+	subagents       subagentRuntimeConfig
 }
 
 type app struct {
-	cfg     config
-	client  *client
-	skills  map[string]skill
-	toolset []apiTool
+	cfg       config
+	client    *client
+	skills    map[string]skill
+	toolset   []apiTool
+	subagents *subagentManager
 }
 
 type client struct {
@@ -227,7 +249,7 @@ func newApp(cfg config) (*app, error) {
 		return nil, err
 	}
 
-	return &app{
+	instance := &app{
 		cfg: cfg,
 		client: &client{
 			baseURL:   strings.TrimRight(cfg.baseURL, "/"),
@@ -238,7 +260,9 @@ func newApp(cfg config) (*app, error) {
 		},
 		skills:  skills,
 		toolset: buildAgentTools(cfg.allowedTools),
-	}, nil
+	}
+	instance.subagents = newSubagentManager(cfg.subagents, instance.runSubagentSession)
+	return instance, nil
 }
 
 var errHelpRequested = errors.New("help requested")
@@ -250,6 +274,8 @@ func loadConfig(args []string) (config, error) {
 		allowedTools[name] = true
 	}
 	yolo := false
+	maxIter := 0
+	subagentCfg := defaultSubagentRuntimeConfig()
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -279,6 +305,86 @@ func loadConfig(args []string) (config, error) {
 				return config{}, fmt.Errorf("unknown or non-opt-in tool %q", name)
 			}
 			allowedTools[name] = true
+		case arg == "--subagent-max-depth":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--subagent-max-depth requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--subagent-max-depth")
+			if err != nil {
+				return config{}, err
+			}
+			subagentCfg.MaxDepth = value
+		case strings.HasPrefix(arg, "--subagent-max-depth="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--subagent-max-depth="), "--subagent-max-depth")
+			if err != nil {
+				return config{}, err
+			}
+			subagentCfg.MaxDepth = value
+		case arg == "--subagent-max-children":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--subagent-max-children requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--subagent-max-children")
+			if err != nil {
+				return config{}, err
+			}
+			subagentCfg.MaxChildren = value
+		case strings.HasPrefix(arg, "--subagent-max-children="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--subagent-max-children="), "--subagent-max-children")
+			if err != nil {
+				return config{}, err
+			}
+			subagentCfg.MaxChildren = value
+		case arg == "--subagent-max-parallel":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--subagent-max-parallel requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--subagent-max-parallel")
+			if err != nil {
+				return config{}, err
+			}
+			subagentCfg.MaxParallel = value
+		case strings.HasPrefix(arg, "--subagent-max-parallel="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--subagent-max-parallel="), "--subagent-max-parallel")
+			if err != nil {
+				return config{}, err
+			}
+			subagentCfg.MaxParallel = value
+		case arg == "--subagent-timeout-seconds":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--subagent-timeout-seconds requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--subagent-timeout-seconds")
+			if err != nil {
+				return config{}, err
+			}
+			subagentCfg.DefaultTimeoutSec = value
+		case strings.HasPrefix(arg, "--subagent-timeout-seconds="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--subagent-timeout-seconds="), "--subagent-timeout-seconds")
+			if err != nil {
+				return config{}, err
+			}
+			subagentCfg.DefaultTimeoutSec = value
+		case arg == "--max-iterations":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--max-iterations requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--max-iterations")
+			if err != nil {
+				return config{}, err
+			}
+			maxIter = value
+		case strings.HasPrefix(arg, "--max-iterations="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--max-iterations="), "--max-iterations")
+			if err != nil {
+				return config{}, err
+			}
+			maxIter = value
 		case strings.HasPrefix(arg, "-"):
 			return config{}, fmt.Errorf("unknown flag %q", arg)
 		default:
@@ -298,6 +404,19 @@ func loadConfig(args []string) (config, error) {
 	if err != nil {
 		return config{}, fmt.Errorf("resolving workspace root: %w", err)
 	}
+	subagentCfg.normalize()
+
+	// Resolve max iterations: flag > env > default
+	if maxIter == 0 {
+		if env := strings.TrimSpace(os.Getenv("MAX_ITERATIONS")); env != "" {
+			if v, err := parsePositiveInt(env, "MAX_ITERATIONS"); err == nil {
+				maxIter = v
+			}
+		}
+	}
+	if maxIter == 0 {
+		maxIter = defaultMaxIterations
+	}
 
 	return config{
 		baseURL:         baseURL,
@@ -309,7 +428,21 @@ func loadConfig(args []string) (config, error) {
 		workspaceRoot:   workspaceRoot,
 		allowedTools:    allowedTools,
 		yolo:            yolo,
+		maxIterations:   maxIter,
+		subagents:       subagentCfg,
 	}, nil
+}
+
+func parsePositiveInt(raw, flagName string) (int, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0, fmt.Errorf("%s requires a non-empty value", flagName)
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s expects a positive integer, got %q", flagName, value)
+	}
+	return parsed, nil
 }
 
 func readEnv(key, fallback string) string {
@@ -352,42 +485,70 @@ func readReasoningEffort() (string, error) {
 func printUsage(w io.Writer) {
 	fmt.Fprintf(w, usageMessageTemplate, filepath.Base(os.Args[0]))
 	fmt.Fprintln(w, "One-shot mode only. No interactive mode.")
-	fmt.Fprintln(w, "Env: BASE_URL, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt)")
-	fmt.Fprintln(w, "Opt-in tools (repeatable): --allow-tool write_file --allow-tool append_file --allow-tool execute_program --allow-tool execute_skill")
+	fmt.Fprintln(w, "Env: BASE_URL, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS")
+	fmt.Fprintln(w, "Opt-in tools (repeatable): --allow-tool write_file --allow-tool append_file --allow-tool execute_program --allow-tool execute_skill --allow-tool create_subagent --allow-tool run_subagent --allow-tool await_subagent --allow-tool list_subagents --allow-tool read_subagent --allow-tool cancel_subagent")
+	fmt.Fprintln(w, "Iteration limit: --max-iterations N (default 40; env MAX_ITERATIONS)")
+	fmt.Fprintln(w, "Subagent limits: --subagent-max-depth N --subagent-max-children N --subagent-max-parallel N --subagent-timeout-seconds N")
 	fmt.Fprintln(w, "All tools + unrestricted paths:  --yolo")
 }
 
 func (a *app) runQuestion(ctx context.Context, question string) error {
 	fmt.Fprintf(os.Stderr, "[capelin-go] Task: %s\n\n", question)
+	_, err := a.runConversation(ctx, question, a.rootRuntime(), a.toolset, true)
+	return err
+}
 
+func (a *app) runConversation(ctx context.Context, question string, runtime *agentRuntime, toolset []apiTool, emitOutput bool) (string, error) {
 	messages := []apiMessage{
 		{Role: "system", Content: a.systemPromptWithSkills()},
 		{Role: "user", Content: question},
 	}
+	maxIterations := defaultMaxIterations
+	if runtime != nil && runtime.maxToolIterations > 0 {
+		maxIterations = runtime.maxToolIterations
+	}
+	lastContent := ""
 
-	for iter := 0; iter < maxToolIterations; iter++ {
-		resp, err := a.client.complete(ctx, messages, a.toolset)
+	for iter := 0; iter < maxIterations; iter++ {
+		// Warn the model when it's 3 iterations from the cap so it can wrap up gracefully.
+		if iter == maxIterations-3 && maxIterations > 3 {
+			messages = append(messages, apiMessage{
+				Role:    "user",
+				Content: fmt.Sprintf("[SYSTEM] You have %d iterations remaining. Wrap up and produce a final answer now.", maxIterations-iter),
+			})
+		}
+
+		resp, err := a.client.complete(ctx, messages, toolset)
 		if err != nil {
-			return err
+			return "", err
 		}
 
 		if content := strings.TrimSpace(resp.Content()); content != "" {
-			fmt.Fprintln(os.Stdout, content)
+			lastContent = content
+			if emitOutput {
+				fmt.Fprintln(os.Stdout, content)
+			}
 		}
 
 		messages = append(messages, resp.asMessage())
 		if len(resp.ToolCalls()) == 0 {
-			fmt.Fprintln(os.Stdout)
-			return nil
+			if emitOutput {
+				fmt.Fprintln(os.Stdout)
+			}
+			return lastContent, nil
 		}
 
 		for _, call := range resp.ToolCalls() {
-			fmt.Fprintf(os.Stderr, "[tool] %s(%s)\n", call.Function.Name, call.Function.Arguments)
-			out, err := a.runTool(ctx, call)
+			if emitOutput {
+				fmt.Fprintf(os.Stderr, "[tool] %s(%s)\n", call.Function.Name, call.Function.Arguments)
+			}
+			out, err := a.runToolForRuntime(ctx, runtime, call)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "[tool] %s error: %v\n", call.Function.Name, err)
+				if emitOutput {
+					fmt.Fprintf(os.Stderr, "[tool] %s error: %v\n", call.Function.Name, err)
+				}
 				out = fmt.Sprintf("Tool error: %v", err)
-			} else {
+			} else if emitOutput {
 				fmt.Fprintf(os.Stderr, "[tool] %s done\n", call.Function.Name)
 			}
 
@@ -398,7 +559,7 @@ func (a *app) runQuestion(ctx context.Context, question string) error {
 			})
 		}
 	}
-	return fmt.Errorf("exceeded maximum tool iterations (%d)", maxToolIterations)
+	return "", fmt.Errorf("exceeded maximum tool iterations (%d)", maxIterations)
 }
 
 func (a *app) systemPromptWithSkills() string {
@@ -410,37 +571,57 @@ func (a *app) systemPromptWithSkills() string {
 	b.WriteString("Prefer execute_skill for skill-driven actions.\n")
 	b.WriteString("Follow loaded skill instructions when relevant to the user task.\n")
 	b.WriteString("Write and execute tools are disabled by default unless explicitly enabled.\n")
+	b.WriteString("Subagent tools are opt-in and enforce inherited limits/policies.\n")
 	return b.String()
 }
 
 func (a *app) runTool(ctx context.Context, call apiToolCall) (string, error) {
+	return a.runToolForRuntime(ctx, a.rootRuntime(), call)
+}
+
+func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call apiToolCall) (string, error) {
+	if runtime == nil {
+		runtime = a.rootRuntime()
+	}
 	switch call.Function.Name {
 	case toolWebSearch:
+		if !a.isToolEnabled(runtime, toolWebSearch) {
+			return "", fmt.Errorf("%s is disabled by current policy", toolWebSearch)
+		}
 		var args webSearchArgs
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
 			return "", fmt.Errorf("invalid web_search arguments: %w", err)
 		}
 		return runWebSearch(ctx, args.Query)
 	case toolFetchPage:
+		if !a.isToolEnabled(runtime, toolFetchPage) {
+			return "", fmt.Errorf("%s is disabled by current policy", toolFetchPage)
+		}
 		var args fetchPageArgs
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
 			return "", fmt.Errorf("invalid fetch_page arguments: %w", err)
 		}
 		return runFetchPage(ctx, args.URL)
 	case toolListFiles:
+		if !a.isToolEnabled(runtime, toolListFiles) {
+			return "", fmt.Errorf("%s is disabled by current policy", toolListFiles)
+		}
 		var args listFilesArgs
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
 			return "", fmt.Errorf("invalid list_files arguments: %w", err)
 		}
 		return runListFiles(a.cfg.workspaceRoot, a.cfg.yolo, args)
 	case toolReadFile:
+		if !a.isToolEnabled(runtime, toolReadFile) {
+			return "", fmt.Errorf("%s is disabled by current policy", toolReadFile)
+		}
 		var args readFileArgs
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
 			return "", fmt.Errorf("invalid read_file arguments: %w", err)
 		}
 		return runReadFile(a.cfg.workspaceRoot, a.cfg.yolo, args)
 	case toolWriteFile:
-		if !a.isToolEnabled(toolWriteFile) {
+		if !a.isToolEnabled(runtime, toolWriteFile) {
 			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolWriteFile, toolWriteFile)
 		}
 		var args writeFileArgs
@@ -449,7 +630,7 @@ func (a *app) runTool(ctx context.Context, call apiToolCall) (string, error) {
 		}
 		return runWriteFile(a.cfg.workspaceRoot, a.cfg.yolo, args)
 	case toolAppendFile:
-		if !a.isToolEnabled(toolAppendFile) {
+		if !a.isToolEnabled(runtime, toolAppendFile) {
 			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolAppendFile, toolAppendFile)
 		}
 		var args appendFileArgs
@@ -458,7 +639,7 @@ func (a *app) runTool(ctx context.Context, call apiToolCall) (string, error) {
 		}
 		return runAppendFile(a.cfg.workspaceRoot, a.cfg.yolo, args)
 	case toolExecuteProgram:
-		if !a.isToolEnabled(toolExecuteProgram) {
+		if !a.isToolEnabled(runtime, toolExecuteProgram) {
 			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolExecuteProgram, toolExecuteProgram)
 		}
 		var args executeProgramArgs
@@ -467,7 +648,7 @@ func (a *app) runTool(ctx context.Context, call apiToolCall) (string, error) {
 		}
 		return runExecuteProgram(ctx, a.cfg.workspaceRoot, a.cfg.yolo, args)
 	case toolExecuteSkill:
-		if !a.isToolEnabled(toolExecuteSkill) {
+		if !a.isToolEnabled(runtime, toolExecuteSkill) {
 			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolExecuteSkill, toolExecuteSkill)
 		}
 		var args executeSkillArgs
@@ -476,20 +657,137 @@ func (a *app) runTool(ctx context.Context, call apiToolCall) (string, error) {
 		}
 		return runExecuteSkill(ctx, a.cfg.workspaceRoot, a.cfg.yolo, a.skills, args)
 	case toolListSkills:
+		if !a.isToolEnabled(runtime, toolListSkills) {
+			return "", fmt.Errorf("%s is disabled by current policy", toolListSkills)
+		}
 		return runListSkills(a.skills), nil
 	case toolReadSkill:
+		if !a.isToolEnabled(runtime, toolReadSkill) {
+			return "", fmt.Errorf("%s is disabled by current policy", toolReadSkill)
+		}
 		var args readSkillArgs
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
 			return "", fmt.Errorf("invalid read_skill arguments: %w", err)
 		}
 		return runReadSkill(a.skills, args)
+	case toolCreateSubagent:
+		if !a.isToolEnabled(runtime, toolCreateSubagent) {
+			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolCreateSubagent, toolCreateSubagent)
+		}
+		var args createSubagentArgs
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+			return "", fmt.Errorf("invalid create_subagent arguments: %w", err)
+		}
+		session, err := a.subagents.create(runtime, args)
+		if err != nil {
+			return "", err
+		}
+		return marshalToolResult(a.subagents.snapshotLocked(session, false))
+	case toolRunSubagent:
+		if !a.isToolEnabled(runtime, toolRunSubagent) {
+			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolRunSubagent, toolRunSubagent)
+		}
+		var args runSubagentArgs
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+			return "", fmt.Errorf("invalid run_subagent arguments: %w", err)
+		}
+		session, err := a.subagents.run(ctx, runtime, args)
+		if err != nil {
+			return "", err
+		}
+		return marshalToolResult(a.subagents.snapshotLocked(session, true))
+	case toolAwaitSubagent:
+		if !a.isToolEnabled(runtime, toolAwaitSubagent) {
+			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolAwaitSubagent, toolAwaitSubagent)
+		}
+		var args awaitSubagentArgs
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+			return "", fmt.Errorf("invalid await_subagent arguments: %w", err)
+		}
+		session, err := a.subagents.await(ctx, runtime, args)
+		if err != nil {
+			return "", err
+		}
+		return marshalToolResult(a.subagents.snapshotLocked(session, true))
+	case toolListSubagents:
+		if !a.isToolEnabled(runtime, toolListSubagents) {
+			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolListSubagents, toolListSubagents)
+		}
+		var args listSubagentsArgs
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+			return "", fmt.Errorf("invalid list_subagents arguments: %w", err)
+		}
+		items, err := a.subagents.list(runtime, args)
+		if err != nil {
+			return "", err
+		}
+		return marshalToolResult(items)
+	case toolReadSubagent:
+		if !a.isToolEnabled(runtime, toolReadSubagent) {
+			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolReadSubagent, toolReadSubagent)
+		}
+		var args readSubagentArgs
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+			return "", fmt.Errorf("invalid read_subagent arguments: %w", err)
+		}
+		payload, err := a.subagents.read(runtime, args)
+		if err != nil {
+			return "", err
+		}
+		return marshalToolResult(payload)
+	case toolCancelSubagent:
+		if !a.isToolEnabled(runtime, toolCancelSubagent) {
+			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolCancelSubagent, toolCancelSubagent)
+		}
+		var args cancelSubagentArgs
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+			return "", fmt.Errorf("invalid cancel_subagent arguments: %w", err)
+		}
+		session, err := a.subagents.cancel(runtime, args)
+		if err != nil {
+			return "", err
+		}
+		return marshalToolResult(a.subagents.snapshotLocked(session, true))
 	default:
 		return "", fmt.Errorf("unknown tool %q", call.Function.Name)
 	}
 }
 
-func (a *app) isToolEnabled(name string) bool {
-	return a.cfg.allowedTools[name]
+func (a *app) isToolEnabled(runtime *agentRuntime, name string) bool {
+	if runtime == nil {
+		return a.cfg.allowedTools[name]
+	}
+	return runtime.allowedTools[name]
+}
+
+func (a *app) rootRuntime() *agentRuntime {
+	return &agentRuntime{
+		sessionID:         rootAgentID,
+		depth:             0,
+		role:              agentRoleCoordinator,
+		allowedTools:      cloneAllowedTools(a.cfg.allowedTools),
+		maxToolIterations: a.cfg.maxIterations,
+	}
+}
+
+func (a *app) runSubagentSession(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+	if runtime == nil {
+		return "", errors.New("runtime is required")
+	}
+	toolset := buildAgentTools(runtime.allowedTools)
+	question := strings.TrimSpace(session.Question)
+	if question == "" {
+		return "", errors.New("subagent question is empty")
+	}
+	return a.runConversation(ctx, question, runtime, toolset, false)
+}
+
+func marshalToolResult(value any) (string, error) {
+	raw, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
 }
 
 func (c *client) complete(ctx context.Context, messages []apiMessage, tools []apiTool) (*completionMessage, error) {
@@ -560,13 +858,24 @@ func (m *completionMessage) asMessage() apiMessage {
 }
 
 func buildAgentTools(enabled map[string]bool) []apiTool {
-	tools := []apiTool{
-		specWebSearch(),
-		specFetchPage(),
-		specListFiles(),
-		specReadFile(),
-		specListSkills(),
-		specReadSkill(),
+	tools := []apiTool{}
+	if enabled[toolWebSearch] {
+		tools = append(tools, specWebSearch())
+	}
+	if enabled[toolFetchPage] {
+		tools = append(tools, specFetchPage())
+	}
+	if enabled[toolListFiles] {
+		tools = append(tools, specListFiles())
+	}
+	if enabled[toolReadFile] {
+		tools = append(tools, specReadFile())
+	}
+	if enabled[toolListSkills] {
+		tools = append(tools, specListSkills())
+	}
+	if enabled[toolReadSkill] {
+		tools = append(tools, specReadSkill())
 	}
 	if enabled[toolWriteFile] {
 		tools = append(tools, specWriteFile())
@@ -579,6 +888,24 @@ func buildAgentTools(enabled map[string]bool) []apiTool {
 	}
 	if enabled[toolExecuteSkill] {
 		tools = append(tools, specExecuteSkill())
+	}
+	if enabled[toolCreateSubagent] {
+		tools = append(tools, specCreateSubagent())
+	}
+	if enabled[toolRunSubagent] {
+		tools = append(tools, specRunSubagent())
+	}
+	if enabled[toolAwaitSubagent] {
+		tools = append(tools, specAwaitSubagent())
+	}
+	if enabled[toolListSubagents] {
+		tools = append(tools, specListSubagents())
+	}
+	if enabled[toolReadSubagent] {
+		tools = append(tools, specReadSubagent())
+	}
+	if enabled[toolCancelSubagent] {
+		tools = append(tools, specCancelSubagent())
 	}
 	slices.SortFunc(tools, func(a, b apiTool) int {
 		return strings.Compare(a.Function.Name, b.Function.Name)
