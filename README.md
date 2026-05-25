@@ -1,6 +1,6 @@
 # capelin-go
 
-`capelin-go` is a lightweight Go runtime for repeatedly executing skills written by Claude Code, Codex, or other agents.
+`capelin-go` is a lightweight Go runtime for AI agents. Write your agents using Claude Code, Codex, or any other AI tool — then run them with capelin-go, which is far more lightweight and controllable than the heavy runtimes those tools ship with.
 
 ## Features
 
@@ -92,6 +92,25 @@ Enable everything (all tools + unrestricted paths):
 - `BASE_URL` — model server base URL (default: `http://localhost:8235/v1`)
 - `MODEL` — model ID (default: `gpt-5-mini`)
 - `TOKEN` — optional API token
-- `REASONING_EFFORT` — passed through as a string to the model backend
+- `REASONING_EFFORT` — passed through to the model backend; set to `none` to omit the field entirely from the request
 - `SYSTEM_PROMPT` (or `systemPrompt`) — prompt override
 - `MAX_ITERATIONS` — root agent tool-call iteration cap (default: 40; overridden by `--max-iterations`)
+
+## Config file
+
+On first run capelin-go creates `~/.local/capelin-go/config.ini` with default values:
+
+```ini
+# capelin-go configuration
+# Edit this file to set persistent defaults.
+# Priority: CLI flags > environment variables > this file > built-in defaults.
+
+BASE_URL = http://localhost:8235/v1
+MODEL = gpt-5-mini
+TOKEN =
+REASONING_EFFORT = medium
+SYSTEM_PROMPT =
+MAX_ITERATIONS = 40
+```
+
+Edit that file to set your preferred model, server URL, or other defaults without needing environment variables every time. Environment variables and CLI flags still take priority over config file values.

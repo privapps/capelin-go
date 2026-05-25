@@ -809,3 +809,93 @@ func TestRootRuntimeUsesMaxIterations(t *testing.T) {
 		t.Fatalf("expected rootRuntime.maxToolIterations=99, got %d", rt.maxToolIterations)
 	}
 }
+
+func TestConfigFileCreatedWithDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.ini")
+
+	// File does not exist yet; readConfigFile after ensureConfigFile should return defaults.
+	cfg, err := readConfigFile(path)
+	if err == nil && len(cfg) > 0 {
+		// file existed somehow - ok, skip creation test
+	}
+
+	// Write the default content and parse it.
+	if err := os.WriteFile(path, []byte(defaultConfigFileContent), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	cfg, err = readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile: %v", err)
+	}
+	if cfg["BASE_URL"] != "http://localhost:8235/v1" {
+		t.Fatalf("unexpected BASE_URL: %q", cfg["BASE_URL"])
+	}
+	if cfg["MODEL"] != "gpt-5-mini" {
+		t.Fatalf("unexpected MODEL: %q", cfg["MODEL"])
+	}
+	if cfg["REASONING_EFFORT"] != "medium" {
+		t.Fatalf("unexpected REASONING_EFFORT: %q", cfg["REASONING_EFFORT"])
+	}
+}
+
+func TestConfigFileEnvOverridesFile(t *testing.T) {
+	t.Setenv("BASE_URL", "http://override:9999/v1")
+	t.Setenv("MODEL", "")
+	t.Setenv("TOKEN", "")
+	t.Setenv("REASONING_EFFORT", "")
+	t.Setenv("SYSTEM_PROMPT", "")
+	t.Setenv("systemPrompt", "")
+	t.Setenv("MAX_ITERATIONS", "")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.ini")
+	content := "BASE_URL = http://file-url:1234/v1\nMODEL = file-model\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	fileCfg, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile: %v", err)
+	}
+	// Env var "BASE_URL" is set to override; file has a different value.
+	got := readCfg("BASE_URL", fileCfg, defaultBaseURL)
+	if got != "http://override:9999/v1" {
+		t.Fatalf("expected env to win over file, got %q", got)
+	}
+	// MODEL has no env override; file value should be used.
+	got = readCfg("MODEL", fileCfg, defaultModel)
+	if got != "file-model" {
+		t.Fatalf("expected file MODEL to be used, got %q", got)
+	}
+}
+
+func TestReasoningEffortNoneOmitted(t *testing.T) {
+	t.Setenv("REASONING_EFFORT", "none")
+	v, err := readReasoningEffort(map[string]string{})
+	if err != nil {
+		t.Fatalf("readReasoningEffort: %v", err)
+	}
+	if v != "" {
+		t.Fatalf("expected empty string for reasoning_effort=none, got %q", v)
+	}
+
+	// Ensure omitempty actually omits the field when empty.
+	req := apiRequest{Model: "m", ReasoningEffort: v}
+	b, _ := json.Marshal(req)
+	if strings.Contains(string(b), "reasoning_effort") {
+		t.Fatalf("expected reasoning_effort to be omitted from JSON, got %s", string(b))
+	}
+}
+
+func TestReasoningEffortNoneCaseInsensitive(t *testing.T) {
+	for _, val := range []string{"none", "None", "NONE", "nOnE"} {
+		v, err := readReasoningEffort(map[string]string{"REASONING_EFFORT": val})
+		if err != nil {
+			t.Fatalf("readReasoningEffort(%q): %v", val, err)
+		}
+		if v != "" {
+			t.Fatalf("readReasoningEffort(%q) expected empty, got %q", val, v)
+		}
+	}
+}

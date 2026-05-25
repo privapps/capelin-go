@@ -268,6 +268,12 @@ func newApp(cfg config) (*app, error) {
 var errHelpRequested = errors.New("help requested")
 
 func loadConfig(args []string) (config, error) {
+	fileCfg, err := ensureConfigFile()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[capelin-go] warning: config file: %v\n", err)
+		fileCfg = map[string]string{}
+	}
+
 	filtered := make([]string, 0, len(args))
 	allowedTools := map[string]bool{}
 	for _, name := range alwaysEnabledTools {
@@ -392,11 +398,11 @@ func loadConfig(args []string) (config, error) {
 		}
 	}
 
-	baseURL, err := readBaseURL()
+	baseURL, err := readBaseURL(fileCfg)
 	if err != nil {
 		return config{}, err
 	}
-	reasoning, err := readReasoningEffort()
+	reasoning, err := readReasoningEffort(fileCfg)
 	if err != nil {
 		return config{}, err
 	}
@@ -406,9 +412,9 @@ func loadConfig(args []string) (config, error) {
 	}
 	subagentCfg.normalize()
 
-	// Resolve max iterations: flag > env > default
+	// Resolve max iterations: flag > env > file > default
 	if maxIter == 0 {
-		if env := strings.TrimSpace(os.Getenv("MAX_ITERATIONS")); env != "" {
+		if env := readCfg("MAX_ITERATIONS", fileCfg, ""); env != "" {
 			if v, err := parsePositiveInt(env, "MAX_ITERATIONS"); err == nil {
 				maxIter = v
 			}
@@ -420,10 +426,10 @@ func loadConfig(args []string) (config, error) {
 
 	return config{
 		baseURL:         baseURL,
-		model:           readEnv("MODEL", defaultModel),
-		token:           readEnv("TOKEN", defaultToken),
+		model:           readCfg("MODEL", fileCfg, defaultModel),
+		token:           readCfg("TOKEN", fileCfg, defaultToken),
 		reasoning:       reasoning,
-		systemPrompt:    readSystemPrompt(),
+		systemPrompt:    readSystemPrompt(fileCfg),
 		initialQuestion: strings.TrimSpace(strings.Join(filtered, " ")),
 		workspaceRoot:   workspaceRoot,
 		allowedTools:    allowedTools,
@@ -452,18 +458,32 @@ func readEnv(key, fallback string) string {
 	return fallback
 }
 
-func readSystemPrompt() string {
+// readCfg returns the first non-empty value from: env var → config file → fallback.
+func readCfg(key string, fileCfg map[string]string, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(fileCfg[key]); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func readSystemPrompt(fileCfg map[string]string) string {
 	if value := strings.TrimSpace(os.Getenv("SYSTEM_PROMPT")); value != "" {
 		return value
 	}
 	if value := strings.TrimSpace(os.Getenv("systemPrompt")); value != "" {
 		return value
 	}
+	if value := strings.TrimSpace(fileCfg["SYSTEM_PROMPT"]); value != "" {
+		return value
+	}
 	return defaultSystemPrompt
 }
 
-func readBaseURL() (string, error) {
-	value := readEnv("BASE_URL", defaultBaseURL)
+func readBaseURL(fileCfg map[string]string) (string, error) {
+	value := readCfg("BASE_URL", fileCfg, defaultBaseURL)
 	parsed, err := url.Parse(value)
 	if err != nil {
 		return "", fmt.Errorf("invalid URL: %w", err)
@@ -474,12 +494,78 @@ func readBaseURL() (string, error) {
 	return parsed.String(), nil
 }
 
-func readReasoningEffort() (string, error) {
-	value := strings.TrimSpace(os.Getenv("REASONING_EFFORT"))
-	if value == "" {
-		return defaultReasoning, nil
+func readReasoningEffort(fileCfg map[string]string) (string, error) {
+	value := readCfg("REASONING_EFFORT", fileCfg, defaultReasoning)
+	if strings.EqualFold(value, "none") {
+		return "", nil
 	}
 	return value, nil
+}
+
+// configFilePath returns the path to the user-level config file.
+func configFilePath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".local", "capelin-go", "config.ini")
+}
+
+const defaultConfigFileContent = `# capelin-go configuration
+# Edit this file to set persistent defaults.
+# Priority: CLI flags > environment variables > this file > built-in defaults.
+
+BASE_URL = http://localhost:8235/v1
+MODEL = gpt-5-mini
+TOKEN =
+REASONING_EFFORT = medium
+SYSTEM_PROMPT =
+MAX_ITERATIONS = 40
+`
+
+// ensureConfigFile creates the config file with defaults if it does not exist,
+// then reads and returns its key=value pairs.
+func ensureConfigFile() (map[string]string, error) {
+	path := configFilePath()
+	if path == "" {
+		return map[string]string{}, nil
+	}
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return map[string]string{}, fmt.Errorf("creating config dir: %w", err)
+		}
+		if err := os.WriteFile(path, []byte(defaultConfigFileContent), 0o644); err != nil {
+			return map[string]string{}, fmt.Errorf("writing default config: %w", err)
+		}
+	}
+
+	return readConfigFile(path)
+}
+
+// readConfigFile parses a simple KEY = VALUE file, ignoring blank lines and # comments.
+func readConfigFile(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]string{}, fmt.Errorf("reading config file: %w", err)
+	}
+	result := map[string]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.IndexByte(line, '=')
+		if idx < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:idx])
+		value := strings.TrimSpace(line[idx+1:])
+		if key != "" {
+			result[key] = value
+		}
+	}
+	return result, nil
 }
 
 func printUsage(w io.Writer) {
