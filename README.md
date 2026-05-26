@@ -67,12 +67,12 @@ Enable subagent orchestration:
   "break this task into workers and aggregate results"
 ```
 
-Tune subagent limits (conservative defaults):
+Tune subagent limits (all have env var equivalents, see below):
 
 ```bash
 ./capelin-go --allow-tool create_subagent --allow-tool run_subagent --allow-tool await_subagent \
-  --subagent-max-depth 1 --subagent-max-children 8 --subagent-max-parallel 2 --subagent-timeout-seconds 300 \
-  "coordinate two workers then combine outputs"
+  --subagent-max-depth 1 --subagent-max-children 8 --subagent-max-parallel 4 --subagent-timeout-seconds 300 \
+  "coordinate workers then combine outputs"
 ```
 
 Tune iteration cap (useful for complex research tasks):
@@ -95,10 +95,15 @@ Enable everything (all tools + unrestricted paths):
 - `REASONING_EFFORT` — passed through to the model backend; set to `none` to omit the field entirely from the request
 - `SYSTEM_PROMPT` (or `systemPrompt`) — prompt override
 - `MAX_ITERATIONS` — root agent tool-call iteration cap (default: 40; overridden by `--max-iterations`)
+- `ON_MAX_ITERATIONS` — behaviour when the cap is reached: `continue` (default, requests a final answer) or `error` (exits non-zero); overridden by `--on-max-iterations`
+- `SUBAGENT_MAX_DEPTH` — maximum subagent nesting depth (default: 1; overridden by `--subagent-max-depth`)
+- `SUBAGENT_MAX_CHILDREN` — maximum subagents a single parent can spawn (default: 8; overridden by `--subagent-max-children`)
+- `SUBAGENT_MAX_PARALLEL` — maximum concurrently running parallel subagents (default: 4; overridden by `--subagent-max-parallel`)
+- `SUBAGENT_TIMEOUT_SECONDS` — default subagent execution timeout in seconds (default: 300; overridden by `--subagent-timeout-seconds`)
 
 ## Config file
 
-On first run capelin-go creates `~/.local/capelin-go/config.ini` with default values:
+On first run capelin-go creates `~/.local/capelin-go/config.ini` with default values. If the file already exists, any keys added in newer versions are automatically appended (existing values are never changed).
 
 ```ini
 # capelin-go configuration
@@ -111,6 +116,14 @@ TOKEN =
 REASONING_EFFORT = medium
 SYSTEM_PROMPT =
 MAX_ITERATIONS = 40
+ON_MAX_ITERATIONS = continue
+
+# Subagent orchestration limits (env vars: SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN,
+# SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS; also settable via CLI flags)
+SUBAGENT_MAX_DEPTH = 1
+SUBAGENT_MAX_CHILDREN = 8
+SUBAGENT_MAX_PARALLEL = 4
+SUBAGENT_TIMEOUT_SECONDS = 300
 ```
 
 Edit that file to set your preferred model, server URL, or other defaults without needing environment variables every time. Environment variables and CLI flags still take priority over config file values.

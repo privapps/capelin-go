@@ -133,6 +133,7 @@ type config struct {
 	allowedTools    map[string]bool
 	yolo            bool // enables all tools and unrestricted paths
 	maxIterations   int
+	onMaxIterations string // "continue" (default) or "error"
 	subagents       subagentRuntimeConfig
 }
 
@@ -261,7 +262,9 @@ func newApp(cfg config) (*app, error) {
 		skills:  skills,
 		toolset: buildAgentTools(cfg.allowedTools),
 	}
-	instance.subagents = newSubagentManager(cfg.subagents, instance.runSubagentSession)
+	subagentCfg := cfg.subagents
+	subagentCfg.OnMaxIterations = cfg.onMaxIterations
+	instance.subagents = newSubagentManager(subagentCfg, instance.runSubagentSession)
 	return instance, nil
 }
 
@@ -281,7 +284,8 @@ func loadConfig(args []string) (config, error) {
 	}
 	yolo := false
 	maxIter := 0
-	subagentCfg := defaultSubagentRuntimeConfig()
+	onMaxIter := ""
+	subagentCfg := subagentRuntimeConfig{} // zero = "not set by flag"; env/file/normalize fills gaps
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -391,6 +395,22 @@ func loadConfig(args []string) (config, error) {
 				return config{}, err
 			}
 			maxIter = value
+		case arg == "--on-max-iterations":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--on-max-iterations requires a value")
+			}
+			i++
+			v := strings.TrimSpace(args[i])
+			if v != "error" && v != "continue" {
+				return config{}, fmt.Errorf("--on-max-iterations expects \"error\" or \"continue\", got %q", v)
+			}
+			onMaxIter = v
+		case strings.HasPrefix(arg, "--on-max-iterations="):
+			v := strings.TrimSpace(strings.TrimPrefix(arg, "--on-max-iterations="))
+			if v != "error" && v != "continue" {
+				return config{}, fmt.Errorf("--on-max-iterations expects \"error\" or \"continue\", got %q", v)
+			}
+			onMaxIter = v
 		case strings.HasPrefix(arg, "-"):
 			return config{}, fmt.Errorf("unknown flag %q", arg)
 		default:
@@ -410,7 +430,29 @@ func loadConfig(args []string) (config, error) {
 	if err != nil {
 		return config{}, fmt.Errorf("resolving workspace root: %w", err)
 	}
-	subagentCfg.normalize()
+	// Resolve subagent limits: flag (non-zero) > env > file > built-in default (via normalize).
+	// Check env/file only for fields the flag loop left at zero (i.e. not explicitly provided).
+	if subagentCfg.MaxDepth == 0 {
+		if v, err := parsePositiveInt(readCfg("SUBAGENT_MAX_DEPTH", fileCfg, ""), "SUBAGENT_MAX_DEPTH"); err == nil {
+			subagentCfg.MaxDepth = v
+		}
+	}
+	if subagentCfg.MaxChildren == 0 {
+		if v, err := parsePositiveInt(readCfg("SUBAGENT_MAX_CHILDREN", fileCfg, ""), "SUBAGENT_MAX_CHILDREN"); err == nil {
+			subagentCfg.MaxChildren = v
+		}
+	}
+	if subagentCfg.MaxParallel == 0 {
+		if v, err := parsePositiveInt(readCfg("SUBAGENT_MAX_PARALLEL", fileCfg, ""), "SUBAGENT_MAX_PARALLEL"); err == nil {
+			subagentCfg.MaxParallel = v
+		}
+	}
+	if subagentCfg.DefaultTimeoutSec == 0 {
+		if v, err := parsePositiveInt(readCfg("SUBAGENT_TIMEOUT_SECONDS", fileCfg, ""), "SUBAGENT_TIMEOUT_SECONDS"); err == nil {
+			subagentCfg.DefaultTimeoutSec = v
+		}
+	}
+	subagentCfg.normalize() // fills any remaining zeros with built-in defaults
 
 	// Resolve max iterations: flag > env > file > default
 	if maxIter == 0 {
@@ -424,6 +466,19 @@ func loadConfig(args []string) (config, error) {
 		maxIter = defaultMaxIterations
 	}
 
+	// Resolve on-max-iterations: flag > env > file > default "continue"
+	if onMaxIter == "" {
+		if env := readCfg("ON_MAX_ITERATIONS", fileCfg, ""); env != "" {
+			v := strings.TrimSpace(env)
+			if v == "error" || v == "continue" {
+				onMaxIter = v
+			}
+		}
+	}
+	if onMaxIter == "" {
+		onMaxIter = "continue"
+	}
+
 	return config{
 		baseURL:         baseURL,
 		model:           readCfg("MODEL", fileCfg, defaultModel),
@@ -435,6 +490,7 @@ func loadConfig(args []string) (config, error) {
 		allowedTools:    allowedTools,
 		yolo:            yolo,
 		maxIterations:   maxIter,
+		onMaxIterations: onMaxIter,
 		subagents:       subagentCfg,
 	}, nil
 }
@@ -503,7 +559,12 @@ func readReasoningEffort(fileCfg map[string]string) (string, error) {
 }
 
 // configFilePath returns the path to the user-level config file.
+// If the env var CAPELIN_CONFIG_FILE is set, it is used as-is (useful for tests
+// and users who want a non-default location).
 func configFilePath() string {
+	if override := strings.TrimSpace(os.Getenv("CAPELIN_CONFIG_FILE")); override != "" {
+		return override
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
@@ -521,10 +582,19 @@ TOKEN =
 REASONING_EFFORT = medium
 SYSTEM_PROMPT =
 MAX_ITERATIONS = 40
+ON_MAX_ITERATIONS = continue
+
+# Subagent orchestration limits (env vars: SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN,
+# SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS; also settable via CLI flags)
+SUBAGENT_MAX_DEPTH = 1
+SUBAGENT_MAX_CHILDREN = 8
+SUBAGENT_MAX_PARALLEL = 4
+SUBAGENT_TIMEOUT_SECONDS = 300
 `
 
 // ensureConfigFile creates the config file with defaults if it does not exist,
-// then reads and returns its key=value pairs.
+// appends any keys missing from an existing file, then reads and returns its
+// key=value pairs.
 func ensureConfigFile() (map[string]string, error) {
 	path := configFilePath()
 	if path == "" {
@@ -538,9 +608,66 @@ func ensureConfigFile() (map[string]string, error) {
 		if err := os.WriteFile(path, []byte(defaultConfigFileContent), 0o644); err != nil {
 			return map[string]string{}, fmt.Errorf("writing default config: %w", err)
 		}
+	} else {
+		// File exists: append any keys present in the default template but absent in the file.
+		if err := upsertConfigFileKeys(path); err != nil {
+			// Non-fatal: warn but continue with whatever is in the file.
+			fmt.Fprintf(os.Stderr, "[capelin-go] warning: updating config file: %v\n", err)
+		}
 	}
 
 	return readConfigFile(path)
+}
+
+// upsertConfigFileKeys appends any keys defined in defaultConfigFileContent that are
+// missing from the existing file at path. User-set values are never touched.
+func upsertConfigFileKeys(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading config file: %w", err)
+	}
+	existing := map[string]bool{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if idx := strings.IndexByte(line, '='); idx >= 0 {
+			if key := strings.TrimSpace(line[:idx]); key != "" {
+				existing[key] = true
+			}
+		}
+	}
+
+	// Collect keys+defaults from defaultConfigFileContent that are absent in the file.
+	var additions strings.Builder
+	for _, line := range strings.Split(defaultConfigFileContent, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		idx := strings.IndexByte(trimmed, '=')
+		if idx < 0 {
+			continue
+		}
+		key := strings.TrimSpace(trimmed[:idx])
+		if key != "" && !existing[key] {
+			if additions.Len() == 0 {
+				additions.WriteString("\n# Keys added by capelin-go upgrade.\n")
+			}
+			additions.WriteString(line + "\n")
+		}
+	}
+	if additions.Len() == 0 {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("opening config file for update: %w", err)
+	}
+	defer f.Close()
+	_, err = f.WriteString(additions.String())
+	return err
 }
 
 // readConfigFile parses a simple KEY = VALUE file, ignoring blank lines and # comments.
@@ -571,10 +698,18 @@ func readConfigFile(path string) (map[string]string, error) {
 func printUsage(w io.Writer) {
 	fmt.Fprintf(w, usageMessageTemplate, filepath.Base(os.Args[0]))
 	fmt.Fprintln(w, "One-shot mode only. No interactive mode.")
-	fmt.Fprintln(w, "Env: BASE_URL, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS")
+	fmt.Fprintln(w, "Env: BASE_URL, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS, ON_MAX_ITERATIONS")
+	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
 	fmt.Fprintln(w, "Opt-in tools (repeatable): --allow-tool write_file --allow-tool append_file --allow-tool execute_program --allow-tool execute_skill --allow-tool create_subagent --allow-tool run_subagent --allow-tool await_subagent --allow-tool list_subagents --allow-tool read_subagent --allow-tool cancel_subagent")
 	fmt.Fprintln(w, "Iteration limit: --max-iterations N (default 40; env MAX_ITERATIONS)")
-	fmt.Fprintln(w, "Subagent limits: --subagent-max-depth N --subagent-max-children N --subagent-max-parallel N --subagent-timeout-seconds N")
+	fmt.Fprintln(w, "On limit reached: --on-max-iterations continue|error (default continue; env ON_MAX_ITERATIONS)")
+	fmt.Fprintln(w, "  continue: inject a wrap-up prompt and request a final answer with no tools (default)")
+	fmt.Fprintln(w, "  error:    exit with a non-zero error (legacy behavior)")
+	fmt.Fprintln(w, "Subagent limits (flags, env vars, or config file):")
+	fmt.Fprintln(w, "  --subagent-max-depth N        (default 1;   env SUBAGENT_MAX_DEPTH)")
+	fmt.Fprintln(w, "  --subagent-max-children N     (default 8;   env SUBAGENT_MAX_CHILDREN)")
+	fmt.Fprintln(w, "  --subagent-max-parallel N     (default 4;   env SUBAGENT_MAX_PARALLEL)")
+	fmt.Fprintln(w, "  --subagent-timeout-seconds N  (default 300; env SUBAGENT_TIMEOUT_SECONDS)")
 	fmt.Fprintln(w, "All tools + unrestricted paths:  --yolo")
 }
 
@@ -592,6 +727,10 @@ func (a *app) runConversation(ctx context.Context, question string, runtime *age
 	maxIterations := defaultMaxIterations
 	if runtime != nil && runtime.maxToolIterations > 0 {
 		maxIterations = runtime.maxToolIterations
+	}
+	onMaxIter := "continue"
+	if runtime != nil && runtime.onMaxIterations != "" {
+		onMaxIter = runtime.onMaxIterations
 	}
 	lastContent := ""
 
@@ -645,7 +784,34 @@ func (a *app) runConversation(ctx context.Context, question string, runtime *age
 			})
 		}
 	}
-	return "", fmt.Errorf("exceeded maximum tool iterations (%d)", maxIterations)
+
+	if onMaxIter == "error" {
+		return "", fmt.Errorf("exceeded maximum tool iterations (%d)", maxIterations)
+	}
+
+	// "continue" mode: force a final answer with no tools available.
+	fmt.Fprintf(os.Stderr, "[capelin-go] Maximum tool iterations (%d) reached; requesting final answer.\n", maxIterations)
+	messages = append(messages, apiMessage{
+		Role:    "user",
+		Content: "[SYSTEM] Maximum tool iterations reached. Based on everything you have gathered so far, provide your best final answer now. Do not request any more tools.",
+	})
+	resp, err := a.client.complete(ctx, messages, nil)
+	if err != nil {
+		// Fall back to whatever content we collected so far.
+		if lastContent != "" {
+			fmt.Fprintf(os.Stderr, "[capelin-go] Final-answer call failed (%v); returning partial result.\n", err)
+			return lastContent, nil
+		}
+		return "", fmt.Errorf("exceeded maximum tool iterations (%d) and final-answer call failed: %w", maxIterations, err)
+	}
+	if content := strings.TrimSpace(resp.Content()); content != "" {
+		if emitOutput {
+			fmt.Fprintln(os.Stdout, content)
+			fmt.Fprintln(os.Stdout)
+		}
+		return content, nil
+	}
+	return lastContent, nil
 }
 
 func (a *app) systemPromptWithSkills() string {
@@ -853,6 +1019,7 @@ func (a *app) rootRuntime() *agentRuntime {
 		role:              agentRoleCoordinator,
 		allowedTools:      cloneAllowedTools(a.cfg.allowedTools),
 		maxToolIterations: a.cfg.maxIterations,
+		onMaxIterations:   a.cfg.onMaxIterations,
 	}
 }
 
@@ -881,8 +1048,10 @@ func (c *client) complete(ctx context.Context, messages []apiMessage, tools []ap
 		Model:           c.model,
 		Messages:        messages,
 		Tools:           tools,
-		ToolChoice:      "auto",
 		ReasoningEffort: c.reasoning,
+	}
+	if len(tools) > 0 {
+		reqBody.ToolChoice = "auto"
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {

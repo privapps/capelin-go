@@ -1,3 +1,4 @@
 capelin-go
 capelin-go-test
 dist/
+build/*

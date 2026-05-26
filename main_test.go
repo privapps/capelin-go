@@ -15,7 +15,15 @@ import (
 	"time"
 )
 
+// isolateConfigFile points CAPELIN_CONFIG_FILE to a fresh temp path so tests
+// are not affected by the developer's real ~/.local/capelin-go/config.ini.
+func isolateConfigFile(t *testing.T) {
+	t.Helper()
+	t.Setenv("CAPELIN_CONFIG_FILE", filepath.Join(t.TempDir(), "config.ini"))
+}
+
 func TestLoadConfigDefaults(t *testing.T) {
+	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "")
 	t.Setenv("MODEL", "")
 	t.Setenv("TOKEN", "")
@@ -42,6 +50,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 }
 
 func TestLoadConfigReasoningPassThrough(t *testing.T) {
+	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	t.Setenv("REASONING_EFFORT", "trace-heavy-v2")
 	cfg, err := loadConfig([]string{"task"})
@@ -54,6 +63,7 @@ func TestLoadConfigReasoningPassThrough(t *testing.T) {
 }
 
 func TestLoadConfigAllowTool(t *testing.T) {
+	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	cfg, err := loadConfig([]string{"--allow-tool", toolWriteFile, "--allow-tool=execute_program", "--allow-tool=execute_skill", "task"})
 	if err != nil {
@@ -65,6 +75,7 @@ func TestLoadConfigAllowTool(t *testing.T) {
 }
 
 func TestLoadConfigRejectUnknownAllowTool(t *testing.T) {
+	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	_, err := loadConfig([]string{"--allow-tool", "rm_rf", "task"})
 	if err == nil {
@@ -73,6 +84,7 @@ func TestLoadConfigRejectUnknownAllowTool(t *testing.T) {
 }
 
 func TestLoadConfigRejectInteractiveFlag(t *testing.T) {
+	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	_, err := loadConfig([]string{"-i", "task"})
 	if err == nil {
@@ -258,6 +270,7 @@ func TestParseSkillFileNameFallback(t *testing.T) {
 }
 
 func TestDisabledToolReturnsError(t *testing.T) {
+	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	cfg, err := loadConfig([]string{"task"})
 	if err != nil {
@@ -338,6 +351,7 @@ func TestContainsDangerousPatternRedirection(t *testing.T) {
 }
 
 func TestLoadConfigYolo(t *testing.T) {
+	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	cfg, err := loadConfig([]string{"--yolo", "task"})
 	if err != nil {
@@ -447,6 +461,7 @@ func TestRunExecuteSkillRejectsUndeclaredCommand(t *testing.T) {
 }
 
 func TestLoadConfigSubagentFlags(t *testing.T) {
+	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	cfg, err := loadConfig([]string{
 		"--allow-tool", toolCreateSubagent,
@@ -469,6 +484,7 @@ func TestLoadConfigSubagentFlags(t *testing.T) {
 }
 
 func TestSubagentLifecycleAndAggregation(t *testing.T) {
+	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	cfg, err := loadConfig([]string{
 		"--allow-tool", toolCreateSubagent,
@@ -701,6 +717,7 @@ func TestBuildAgentToolsHonorsRestrictedAlwaysTools(t *testing.T) {
 }
 
 func TestRunToolForRuntimeRejectsRestrictedAlwaysTool(t *testing.T) {
+	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	cfg, err := loadConfig([]string{"task"})
 	if err != nil {
@@ -733,6 +750,7 @@ func TestRunToolForRuntimeRejectsRestrictedAlwaysTool(t *testing.T) {
 }
 
 func TestLoadConfigMaxIterationsFlag(t *testing.T) {
+	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	t.Setenv("MAX_ITERATIONS", "")
 
@@ -771,6 +789,7 @@ func TestLoadConfigMaxIterationsFlag(t *testing.T) {
 }
 
 func TestLoadConfigMaxIterationsEnv(t *testing.T) {
+	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	t.Setenv("MAX_ITERATIONS", "60")
 
@@ -793,6 +812,7 @@ func TestLoadConfigMaxIterationsEnv(t *testing.T) {
 }
 
 func TestRootRuntimeUsesMaxIterations(t *testing.T) {
+	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	t.Setenv("MAX_ITERATIONS", "")
 
@@ -897,5 +917,126 @@ func TestReasoningEffortNoneCaseInsensitive(t *testing.T) {
 		if v != "" {
 			t.Fatalf("readReasoningEffort(%q) expected empty, got %q", val, v)
 		}
+	}
+}
+
+func TestLoadConfigSubagentEnvVars(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	t.Setenv("SUBAGENT_MAX_DEPTH", "3")
+	t.Setenv("SUBAGENT_MAX_CHILDREN", "12")
+	t.Setenv("SUBAGENT_MAX_PARALLEL", "6")
+	t.Setenv("SUBAGENT_TIMEOUT_SECONDS", "120")
+	defer func() {
+		t.Setenv("SUBAGENT_MAX_DEPTH", "")
+		t.Setenv("SUBAGENT_MAX_CHILDREN", "")
+		t.Setenv("SUBAGENT_MAX_PARALLEL", "")
+		t.Setenv("SUBAGENT_TIMEOUT_SECONDS", "")
+	}()
+
+	cfg, err := loadConfig([]string{"task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.subagents.MaxDepth != 3 {
+		t.Fatalf("expected MaxDepth=3 from env, got %d", cfg.subagents.MaxDepth)
+	}
+	if cfg.subagents.MaxChildren != 12 {
+		t.Fatalf("expected MaxChildren=12 from env, got %d", cfg.subagents.MaxChildren)
+	}
+	if cfg.subagents.MaxParallel != 6 {
+		t.Fatalf("expected MaxParallel=6 from env, got %d", cfg.subagents.MaxParallel)
+	}
+	if cfg.subagents.DefaultTimeoutSec != 120 {
+		t.Fatalf("expected DefaultTimeoutSec=120 from env, got %d", cfg.subagents.DefaultTimeoutSec)
+	}
+}
+
+func TestLoadConfigSubagentFlagOverridesEnv(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	t.Setenv("SUBAGENT_MAX_PARALLEL", "6")
+	defer t.Setenv("SUBAGENT_MAX_PARALLEL", "")
+
+	cfg, err := loadConfig([]string{"--subagent-max-parallel", "2", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.subagents.MaxParallel != 2 {
+		t.Fatalf("expected CLI flag (2) to override env (6), got %d", cfg.subagents.MaxParallel)
+	}
+}
+
+func TestLoadConfigSubagentDefaults(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	t.Setenv("SUBAGENT_MAX_DEPTH", "")
+	t.Setenv("SUBAGENT_MAX_CHILDREN", "")
+	t.Setenv("SUBAGENT_MAX_PARALLEL", "")
+	t.Setenv("SUBAGENT_TIMEOUT_SECONDS", "")
+
+	cfg, err := loadConfig([]string{"task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.subagents.MaxDepth != defaultSubagentMaxDepth {
+		t.Fatalf("expected default MaxDepth=%d, got %d", defaultSubagentMaxDepth, cfg.subagents.MaxDepth)
+	}
+	if cfg.subagents.MaxChildren != defaultSubagentMaxChildren {
+		t.Fatalf("expected default MaxChildren=%d, got %d", defaultSubagentMaxChildren, cfg.subagents.MaxChildren)
+	}
+	if cfg.subagents.MaxParallel != defaultSubagentMaxParallel {
+		t.Fatalf("expected default MaxParallel=%d, got %d", defaultSubagentMaxParallel, cfg.subagents.MaxParallel)
+	}
+	if cfg.subagents.DefaultTimeoutSec != defaultSubagentDefaultTimeoutSec {
+		t.Fatalf("expected default DefaultTimeoutSec=%d, got %d", defaultSubagentDefaultTimeoutSec, cfg.subagents.DefaultTimeoutSec)
+	}
+}
+
+func TestUpsertConfigFileKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.ini")
+
+	// Write a minimal existing config (old format, missing subagent keys).
+	existing := "BASE_URL = http://localhost:8235/v1\nMODEL = gpt-5-mini\n"
+	if err := os.WriteFile(path, []byte(existing), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if err := upsertConfigFileKeys(path); err != nil {
+		t.Fatalf("upsertConfigFileKeys: %v", err)
+	}
+
+	cfg, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile after upsert: %v", err)
+	}
+
+	// Pre-existing values must be unchanged.
+	if cfg["BASE_URL"] != "http://localhost:8235/v1" {
+		t.Fatalf("upsert changed existing BASE_URL: %q", cfg["BASE_URL"])
+	}
+
+	// New keys must have been added with their defaults.
+	if cfg["SUBAGENT_MAX_PARALLEL"] != "4" {
+		t.Fatalf("expected SUBAGENT_MAX_PARALLEL=4 after upsert, got %q", cfg["SUBAGENT_MAX_PARALLEL"])
+	}
+	if cfg["SUBAGENT_MAX_DEPTH"] != "1" {
+		t.Fatalf("expected SUBAGENT_MAX_DEPTH=1 after upsert, got %q", cfg["SUBAGENT_MAX_DEPTH"])
+	}
+	if cfg["ON_MAX_ITERATIONS"] != "continue" {
+		t.Fatalf("expected ON_MAX_ITERATIONS=continue after upsert, got %q", cfg["ON_MAX_ITERATIONS"])
+	}
+
+	// Calling upsert again must be idempotent.
+	if err := upsertConfigFileKeys(path); err != nil {
+		t.Fatalf("second upsertConfigFileKeys: %v", err)
+	}
+	cfg2, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile after second upsert: %v", err)
+	}
+	if cfg2["SUBAGENT_MAX_PARALLEL"] != cfg["SUBAGENT_MAX_PARALLEL"] {
+		t.Fatal("upsert is not idempotent")
 	}
 }

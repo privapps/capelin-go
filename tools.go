@@ -352,7 +352,7 @@ func specCreateSubagent() apiTool {
 					},
 					"execution_mode": map[string]any{
 						"type":        "string",
-						"description": `Execution mode: "sequential" (default) or "parallel"`,
+						"description": `Execution mode: "sequential" (serialized, one at a time) or "parallel" (concurrent, respects --subagent-max-parallel limit). Use "parallel" when spawning multiple independent subagents.`,
 					},
 				},
 				"required":             []string{"question"},
@@ -367,14 +367,14 @@ func specRunSubagent() apiTool {
 		Type: "function",
 		Function: apiToolSpec{
 			Name:        toolRunSubagent,
-			Description: "Start a created subagent. Optional wait=true blocks until completion.",
+			Description: "Start a created subagent. For parallel execution of multiple subagents: call run_subagent with wait=false for ALL subagents first (non-blocking fire), then call await_subagent for each to collect results. Use wait=true only when running a single subagent or intentionally serializing.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"id": map[string]any{"type": "string", "description": "Subagent id"},
 					"wait": map[string]any{
 						"type":        "boolean",
-						"description": "Wait for completion before returning",
+						"description": "Block until subagent completes. Set to false when launching multiple subagents in parallel — fire all with wait=false, then await_subagent each.",
 					},
 					"timeout_seconds": map[string]any{
 						"type":        "integer",

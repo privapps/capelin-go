@@ -19,7 +19,7 @@ const (
 const (
 	defaultSubagentMaxDepth          = 1
 	defaultSubagentMaxChildren       = 8
-	defaultSubagentMaxParallel       = 1
+	defaultSubagentMaxParallel       = 4
 	defaultSubagentDefaultTimeoutSec = 300
 	defaultSubagentMaxTimeoutSec     = 600
 	defaultSubagentToolIterations    = 20
@@ -45,6 +45,7 @@ type subagentRuntimeConfig struct {
 	MaxResultChars    int
 	MaxAggregateCount int
 	MaxAggregateChars int
+	OnMaxIterations   string // "continue" (default) or "error"
 }
 
 func defaultSubagentRuntimeConfig() subagentRuntimeConfig {
@@ -95,11 +96,12 @@ func (c *subagentRuntimeConfig) normalize() {
 }
 
 type agentRuntime struct {
-	sessionID         string
-	depth             int
-	role              agentRole
-	allowedTools      map[string]bool
-	maxToolIterations int
+	sessionID          string
+	depth              int
+	role               agentRole
+	allowedTools       map[string]bool
+	maxToolIterations  int
+	onMaxIterations    string // "continue" (default) or "error"
 }
 
 type subagentStatus string
@@ -212,7 +214,11 @@ func (m *subagentManager) create(parent *agentRuntime, args createSubagentArgs) 
 		done:          make(chan struct{}),
 	}
 	if session.ExecutionMode == "" {
-		session.ExecutionMode = "sequential"
+		if m.cfg.MaxParallel > 1 {
+			session.ExecutionMode = "parallel"
+		} else {
+			session.ExecutionMode = "sequential"
+		}
 	}
 	if session.ExecutionMode != "sequential" && session.ExecutionMode != "parallel" {
 		return nil, fmt.Errorf("invalid execution_mode %q", session.ExecutionMode)
@@ -319,6 +325,7 @@ func (m *subagentManager) execute(session *subagentSession) {
 		role:              session.Role,
 		allowedTools:      cloneAllowedTools(session.AllowedTools),
 		maxToolIterations: m.cfg.MaxToolIterations,
+		onMaxIterations:   m.cfg.OnMaxIterations,
 	}
 	output, runErr := m.runner(execCtx, runtime, cloneSession(session))
 	cancel()
