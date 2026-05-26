@@ -4,27 +4,28 @@
 
 ## Features
 
-- one-shot task execution (no interactive mode)
+- one-shot task execution
+- **interactive mode** (`-i` / `--interactive`): multi-turn REPL sharing a single conversation history
 - model loop with tool calling (`/chat/completions`)
 - Claude-style skill discovery from:
   - `.agents/skills` (project-local)
   - `~/.agents/skills` (user-level)
 - web tools: `web_search`, `fetch_page`
 - file tools: `list_files`, `read_file`
-- opt-in mutating/risky tools:
-  - `write_file`, `append_file`
-  - `execute_program`, `execute_skill`
-- opt-in multi-agent orchestration tools:
+- always-on multi-agent orchestration tools:
   - `create_subagent`, `run_subagent`, `await_subagent`
   - `list_subagents`, `read_subagent`, `cancel_subagent`
+- opt-in mutating/risky tools:
+  - `write_file`, `edit_file`, `append_file`
+  - `execute_program`, `execute_skill`
 
 ## Tool safety model
 
-- `write_file`, `append_file`, `execute_program`, and `execute_skill` are **disabled by default**
-- subagent orchestration tools are also **disabled by default**
+- `write_file`, `edit_file`, `append_file`, `execute_program`, and `execute_skill` are **disabled by default**
 - enable explicitly with repeatable `--allow-tool` flags
+- subagent orchestration tools are **always enabled** (no flag needed)
 - file and execution cwd are constrained to current working directory
-- dangerous command patterns are blocked even when execution is enabled
+- dangerous command patterns are blocked when execution is enabled (bypassed by `--yolo`)
 - fetch blocks localhost/private network targets
 - subagents inherit parent tool policy and can only further restrict allowed tools
 - subagents enforce depth/children/timeout limits and bounded parallel workers
@@ -48,29 +49,54 @@ make test
 ./capelin-go "summarize repository structure"
 ```
 
+Interactive mode (multi-turn REPL with shared conversation history):
+
+```bash
+# Start with an initial question, then follow up interactively
+./capelin-go -i "summarize this repo"
+
+# Or just open the REPL directly (no initial question required)
+./capelin-go -i
+```
+
+Type `exit` or `quit` (or press Ctrl+D) to end an interactive session.
+
+**Keybindings:**
+
+| Key                    | Action                                    |
+|------------------------|-------------------------------------------|
+| ↑ / ↓                 | Navigate history                          |
+| ← / →                 | Move cursor                               |
+| Home / Ctrl+A          | Jump to start of line                     |
+| End / Ctrl+E           | Jump to end of line                       |
+| Backspace / Delete     | Delete character                          |
+| Ctrl+W / Alt+Backspace | Delete previous word                      |
+| Ctrl+K                 | Delete to end of line                     |
+| Ctrl+U                 | Clear entire line                         |
+| Ctrl+J                 | Submit line (same as Enter)               |
+| Ctrl+C *(non-empty)*   | Clear current line and reprompt           |
+| Ctrl+C *(empty line)*  | Exit session                              |
+| Ctrl+D                 | Exit session (EOF)                        |
+| Ctrl+L                 | Clear screen                              |
+
+Command history is persisted to `~/.local/capelin-go/history`.
+
 Enable extra tools:
 
 ```bash
-./capelin-go --allow-tool write_file --allow-tool execute_program --allow-tool execute_skill "use vPass skill to share a secret"
+./capelin-go --allow-tool write_file --allow-tool edit_file --allow-tool execute_program --allow-tool execute_skill "use vPass skill to share a secret"
 ```
 
-Enable subagent orchestration:
+Subagent orchestration is enabled by default — no flags needed:
 
 ```bash
-./capelin-go \
-  --allow-tool create_subagent \
-  --allow-tool run_subagent \
-  --allow-tool await_subagent \
-  --allow-tool list_subagents \
-  --allow-tool read_subagent \
-  --allow-tool cancel_subagent \
-  "break this task into workers and aggregate results"
+./capelin-go "break this task into workers and aggregate results"
 ```
 
 Tune subagent limits (all have env var equivalents, see below):
 
 ```bash
-./capelin-go --allow-tool create_subagent --allow-tool run_subagent --allow-tool await_subagent \
+./capelin-go \
   --subagent-max-depth 1 --subagent-max-children 8 --subagent-max-parallel 4 --subagent-timeout-seconds 300 \
   "coordinate workers then combine outputs"
 ```
@@ -94,8 +120,7 @@ Enable everything (all tools + unrestricted paths):
 - `TOKEN` — optional API token
 - `REASONING_EFFORT` — passed through to the model backend; set to `none` to omit the field entirely from the request
 - `SYSTEM_PROMPT` (or `systemPrompt`) — prompt override
-- `MAX_ITERATIONS` — root agent tool-call iteration cap (default: 40; overridden by `--max-iterations`)
-- `ON_MAX_ITERATIONS` — behaviour when the cap is reached: `continue` (default, requests a final answer) or `error` (exits non-zero); overridden by `--on-max-iterations`
+- `MAX_ITERATIONS` — root agent tool-call iteration cap (default: 40; overridden by `--max-iterations`); always wraps up gracefully on limit
 - `SUBAGENT_MAX_DEPTH` — maximum subagent nesting depth (default: 1; overridden by `--subagent-max-depth`)
 - `SUBAGENT_MAX_CHILDREN` — maximum subagents a single parent can spawn (default: 8; overridden by `--subagent-max-children`)
 - `SUBAGENT_MAX_PARALLEL` — maximum concurrently running parallel subagents (default: 4; overridden by `--subagent-max-parallel`)
@@ -116,7 +141,6 @@ TOKEN =
 REASONING_EFFORT = medium
 SYSTEM_PROMPT =
 MAX_ITERATIONS = 40
-ON_MAX_ITERATIONS = continue
 
 # Subagent orchestration limits (env vars: SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN,
 # SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS; also settable via CLI flags)

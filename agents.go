@@ -45,7 +45,6 @@ type subagentRuntimeConfig struct {
 	MaxResultChars    int
 	MaxAggregateCount int
 	MaxAggregateChars int
-	OnMaxIterations   string // "continue" (default) or "error"
 }
 
 func defaultSubagentRuntimeConfig() subagentRuntimeConfig {
@@ -101,7 +100,6 @@ type agentRuntime struct {
 	role               agentRole
 	allowedTools       map[string]bool
 	maxToolIterations  int
-	onMaxIterations    string // "continue" (default) or "error"
 }
 
 type subagentStatus string
@@ -325,7 +323,6 @@ func (m *subagentManager) execute(session *subagentSession) {
 		role:              session.Role,
 		allowedTools:      cloneAllowedTools(session.AllowedTools),
 		maxToolIterations: m.cfg.MaxToolIterations,
-		onMaxIterations:   m.cfg.OnMaxIterations,
 	}
 	output, runErr := m.runner(execCtx, runtime, cloneSession(session))
 	cancel()

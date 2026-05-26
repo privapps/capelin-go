@@ -1,5 +1,5 @@
 APP     := capelin-go
-BUILD_DIR := build
+BUILD_DIR := dist
 GOOS    ?= $(shell go env GOOS)
 GOARCH  ?= $(shell go env GOARCH)
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -14,13 +14,13 @@ PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 
 all: dist
 
-# Build for the current GOOS/GOARCH into build/capelin-go-<os>-<arch>*
+# Build for the current GOOS/GOARCH into dist/capelin-go-<os>-<arch>*
 build:
 	@out=$(BUILD_DIR)/$(APP)-$(GOOS)-$(GOARCH); \
 	if [ "$(GOOS)" = "windows" ]; then out=$${out}.exe; fi; \
 	GOOS=$(GOOS) GOARCH=$(GOARCH) go build $(LDFLAGS) -o $$out .
 
-# Build for all platforms in PLATFORMS into build/capelin-go-<os>-<arch>*
+# Build for all platforms in PLATFORMS into dist/capelin-go-<os>-<arch>*
 dist:
 	@set -e; \
 	for p in $(PLATFORMS); do \
@@ -43,5 +43,4 @@ vet:
 lint: vet
 
 clean:
-	rm -f $(APP)
 	rm -rf $(BUILD_DIR)

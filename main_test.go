@@ -44,7 +44,10 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if !cfg.allowedTools[toolListFiles] || !cfg.allowedTools[toolReadFile] {
 		t.Fatal("expected safe default tools to be enabled")
 	}
-	if cfg.allowedTools[toolWriteFile] || cfg.allowedTools[toolExecuteProgram] {
+	if !cfg.allowedTools[toolCreateSubagent] || !cfg.allowedTools[toolRunSubagent] {
+		t.Fatal("expected subagent tools to be enabled by default")
+	}
+	if cfg.allowedTools[toolWriteFile] || cfg.allowedTools[toolExecuteProgram] || cfg.allowedTools[toolEditFile] {
 		t.Fatal("expected mutating/exec tools disabled by default")
 	}
 }
@@ -83,12 +86,45 @@ func TestLoadConfigRejectUnknownAllowTool(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRejectInteractiveFlag(t *testing.T) {
+func TestLoadConfigInteractiveFlag(t *testing.T) {
 	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
-	_, err := loadConfig([]string{"-i", "task"})
-	if err == nil {
-		t.Fatal("expected unknown flag error for interactive mode")
+	cfg, err := loadConfig([]string{"-i", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig returned error for -i flag: %v", err)
+	}
+	if !cfg.interactive {
+		t.Fatal("expected cfg.interactive to be true with -i flag")
+	}
+	if cfg.initialQuestion != "task" {
+		t.Fatalf("expected initialQuestion to be \"task\", got %q", cfg.initialQuestion)
+	}
+}
+
+func TestLoadConfigInteractiveLongFlag(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	cfg, err := loadConfig([]string{"--interactive", "hello world"})
+	if err != nil {
+		t.Fatalf("loadConfig returned error for --interactive flag: %v", err)
+	}
+	if !cfg.interactive {
+		t.Fatal("expected cfg.interactive to be true with --interactive flag")
+	}
+}
+
+func TestLoadConfigInteractiveFlagNoQuestion(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	cfg, err := loadConfig([]string{"-i"})
+	if err != nil {
+		t.Fatalf("loadConfig returned error for -i with no question: %v", err)
+	}
+	if !cfg.interactive {
+		t.Fatal("expected cfg.interactive to be true")
+	}
+	if cfg.initialQuestion != "" {
+		t.Fatalf("expected empty initialQuestion, got %q", cfg.initialQuestion)
 	}
 }
 
@@ -112,6 +148,43 @@ func TestRunWriteFileAndReadFile(t *testing.T) {
 	}
 	if !strings.Contains(out, "2. line2") {
 		t.Fatalf("unexpected read output: %q", out)
+	}
+}
+
+func TestRunEditFile(t *testing.T) {
+	root := t.TempDir()
+	_, err := runWriteFile(root, false, writeFileArgs{Path: "e.txt", Content: "hello world\ngoodbye"})
+	if err != nil {
+		t.Fatalf("runWriteFile: %v", err)
+	}
+
+	// Successful edit.
+	out, err := runEditFile(root, false, editFileArgs{Path: "e.txt", OldStr: "hello world", NewStr: "hi there"})
+	if err != nil {
+		t.Fatalf("runEditFile: %v", err)
+	}
+	if !strings.Contains(out, "e.txt") {
+		t.Fatalf("unexpected edit output: %q", out)
+	}
+	data, _ := os.ReadFile(filepath.Join(root, "e.txt"))
+	if string(data) != "hi there\ngoodbye" {
+		t.Fatalf("unexpected file content after edit: %q", string(data))
+	}
+
+	// Error: old_str not found.
+	_, err = runEditFile(root, false, editFileArgs{Path: "e.txt", OldStr: "not present", NewStr: "x"})
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected not-found error, got: %v", err)
+	}
+
+	// Error: old_str appears more than once.
+	_, err = runWriteFile(root, false, writeFileArgs{Path: "dup.txt", Content: "foo\nfoo\n"})
+	if err != nil {
+		t.Fatalf("runWriteFile dup: %v", err)
+	}
+	_, err = runEditFile(root, false, editFileArgs{Path: "dup.txt", OldStr: "foo", NewStr: "bar"})
+	if err == nil || !strings.Contains(err.Error(), "times") {
+		t.Fatalf("expected duplicate-match error, got: %v", err)
 	}
 }
 
@@ -161,6 +234,30 @@ func TestRunExecuteProgram(t *testing.T) {
 	}
 	if !strings.Contains(out, "\"exit_code\": 0") || !strings.Contains(out, "ok") {
 		t.Fatalf("unexpected execute output: %s", out)
+	}
+}
+
+func TestRunExecuteProgramYoloBypassesDangerousPattern(t *testing.T) {
+	root := t.TempDir()
+	// bash is blocked by the dangerous-pattern policy when yolo=false.
+	_, err := runExecuteProgram(context.Background(), root, false, executeProgramArgs{
+		Command: "bash",
+		Args:    []string{"-c", "echo hi"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "blocked by dangerous-pattern policy") {
+		t.Fatalf("expected dangerous-pattern error without yolo, got: %v", err)
+	}
+
+	// In yolo mode the policy check is skipped so bash can run.
+	out, err := runExecuteProgram(context.Background(), root, true, executeProgramArgs{
+		Command: "bash",
+		Args:    []string{"-c", "echo yolo"},
+	})
+	if err != nil {
+		t.Fatalf("runExecuteProgram yolo bash: %v", err)
+	}
+	if !strings.Contains(out, "yolo") {
+		t.Fatalf("expected 'yolo' in output, got: %s", out)
 	}
 }
 
@@ -321,12 +418,12 @@ func TestDisabledToolReturnsError(t *testing.T) {
 		ID:   "4",
 		Type: "function",
 		Function: apiFunctionCall{
-			Name:      toolCreateSubagent,
-			Arguments: `{"question":"hello"}`,
+			Name:      toolEditFile,
+			Arguments: `{"path":"x.txt","old_str":"hello","new_str":"world"}`,
 		},
 	})
 	if err == nil {
-		t.Fatal("expected disabled-tool error for create_subagent")
+		t.Fatal("expected disabled-tool error for edit_file")
 	}
 }
 
@@ -464,8 +561,6 @@ func TestLoadConfigSubagentFlags(t *testing.T) {
 	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	cfg, err := loadConfig([]string{
-		"--allow-tool", toolCreateSubagent,
-		"--allow-tool", toolRunSubagent,
 		"--subagent-max-depth", "2",
 		"--subagent-max-children", "5",
 		"--subagent-max-parallel", "3",
@@ -476,7 +571,7 @@ func TestLoadConfigSubagentFlags(t *testing.T) {
 		t.Fatalf("loadConfig returned error: %v", err)
 	}
 	if !cfg.allowedTools[toolCreateSubagent] || !cfg.allowedTools[toolRunSubagent] {
-		t.Fatal("expected subagent tools to be enabled")
+		t.Fatal("expected subagent tools to be enabled by default")
 	}
 	if cfg.subagents.MaxDepth != 2 || cfg.subagents.MaxChildren != 5 || cfg.subagents.MaxParallel != 3 || cfg.subagents.DefaultTimeoutSec != 45 {
 		t.Fatalf("unexpected subagent cfg: %+v", cfg.subagents)
@@ -486,15 +581,7 @@ func TestLoadConfigSubagentFlags(t *testing.T) {
 func TestSubagentLifecycleAndAggregation(t *testing.T) {
 	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
-	cfg, err := loadConfig([]string{
-		"--allow-tool", toolCreateSubagent,
-		"--allow-tool", toolRunSubagent,
-		"--allow-tool", toolAwaitSubagent,
-		"--allow-tool", toolListSubagents,
-		"--allow-tool", toolReadSubagent,
-		"--allow-tool", toolCancelSubagent,
-		"task",
-	})
+	cfg, err := loadConfig([]string{"task"})
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
@@ -1023,9 +1110,6 @@ func TestUpsertConfigFileKeys(t *testing.T) {
 	}
 	if cfg["SUBAGENT_MAX_DEPTH"] != "1" {
 		t.Fatalf("expected SUBAGENT_MAX_DEPTH=1 after upsert, got %q", cfg["SUBAGENT_MAX_DEPTH"])
-	}
-	if cfg["ON_MAX_ITERATIONS"] != "continue" {
-		t.Fatalf("expected ON_MAX_ITERATIONS=continue after upsert, got %q", cfg["ON_MAX_ITERATIONS"])
 	}
 
 	// Calling upsert again must be idempotent.

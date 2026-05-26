@@ -77,6 +77,12 @@ type appendFileArgs struct {
 	Content string `json:"content"`
 }
 
+type editFileArgs struct {
+	Path   string `json:"path"`
+	OldStr string `json:"old_str"`
+	NewStr string `json:"new_str"`
+}
+
 type executeProgramArgs struct {
 	Command        string   `json:"command"`
 	Args           []string `json:"args"`
@@ -237,6 +243,26 @@ func specAppendFile() apiTool {
 					"content": map[string]any{"type": "string", "description": "Content to append"},
 				},
 				"required":             []string{"path", "content"},
+				"additionalProperties": false,
+			},
+		},
+	}
+}
+
+func specEditFile() apiTool {
+	return apiTool{
+		Type: "function",
+		Function: apiToolSpec{
+			Name:        toolEditFile,
+			Description: "Replace an exact string in a file. Fails if old_str is not found or appears more than once.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path":    map[string]any{"type": "string", "description": "Relative file path"},
+					"old_str": map[string]any{"type": "string", "description": "Exact string to find (must appear exactly once)"},
+					"new_str": map[string]any{"type": "string", "description": "Replacement string"},
+				},
+				"required":             []string{"path", "old_str", "new_str"},
 				"additionalProperties": false,
 			},
 		},
@@ -949,6 +975,40 @@ func runAppendFile(workspaceRoot string, yolo bool, args appendFileArgs) (string
 	return fmt.Sprintf("appended %d bytes to %s", written, filepath.ToSlash(path)), nil
 }
 
+func runEditFile(workspaceRoot string, yolo bool, args editFileArgs) (string, error) {
+	path := strings.TrimSpace(args.Path)
+	if path == "" {
+		return "", errors.New("edit_file path is required")
+	}
+	if args.OldStr == "" {
+		return "", errors.New("edit_file old_str is required")
+	}
+	resolved, err := resolvePathForTool(workspaceRoot, path, yolo)
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		return "", fmt.Errorf("edit file: %w", err)
+	}
+	if len(data) > maxFileBytes {
+		return "", fmt.Errorf("edit file: file too large (%d bytes)", len(data))
+	}
+	content := string(data)
+	count := strings.Count(content, args.OldStr)
+	if count == 0 {
+		return "", fmt.Errorf("edit file: old_str not found in %s", filepath.ToSlash(path))
+	}
+	if count > 1 {
+		return "", fmt.Errorf("edit file: old_str found %d times in %s (must be unique)", count, filepath.ToSlash(path))
+	}
+	updated := strings.Replace(content, args.OldStr, args.NewStr, 1)
+	if err := os.WriteFile(resolved, []byte(updated), 0o644); err != nil {
+		return "", fmt.Errorf("edit file: %w", err)
+	}
+	return fmt.Sprintf("edited %s", filepath.ToSlash(path)), nil
+}
+
 type execResult struct {
 	Command   string   `json:"command"`
 	Args      []string `json:"args"`
@@ -967,7 +1027,7 @@ func runExecuteProgram(ctx context.Context, workspaceRoot string, yolo bool, arg
 	if command == "" {
 		return "", errors.New("execute_program command is required")
 	}
-	if containsDangerousPattern(command, args.Args) {
+	if !yolo && containsDangerousPattern(command, args.Args) {
 		return "", errors.New("execute_program blocked by dangerous-pattern policy")
 	}
 

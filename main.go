@@ -17,6 +17,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/chzyer/readline"
 )
 
 const (
@@ -86,6 +88,7 @@ const (
 	toolListFiles      = "list_files"
 	toolReadFile       = "read_file"
 	toolWriteFile      = "write_file"
+	toolEditFile       = "edit_file"
 	toolAppendFile     = "append_file"
 	toolExecuteProgram = "execute_program"
 	toolExecuteSkill   = "execute_skill"
@@ -106,19 +109,20 @@ var alwaysEnabledTools = []string{
 	toolReadFile,
 	toolListSkills,
 	toolReadSkill,
+	toolCreateSubagent,
+	toolRunSubagent,
+	toolAwaitSubagent,
+	toolListSubagents,
+	toolReadSubagent,
+	toolCancelSubagent,
 }
 
 var optInTools = map[string]struct{}{
 	toolWriteFile:      {},
 	toolAppendFile:     {},
+	toolEditFile:       {},
 	toolExecuteProgram: {},
 	toolExecuteSkill:   {},
-	toolCreateSubagent: {},
-	toolRunSubagent:    {},
-	toolAwaitSubagent:  {},
-	toolListSubagents:  {},
-	toolReadSubagent:   {},
-	toolCancelSubagent: {},
 }
 
 type config struct {
@@ -128,12 +132,12 @@ type config struct {
 	reasoning       string
 	systemPrompt    string
 	showVersion     bool
+	interactive     bool
 	initialQuestion string
 	workspaceRoot   string
 	allowedTools    map[string]bool
 	yolo            bool // enables all tools and unrestricted paths
 	maxIterations   int
-	onMaxIterations string // "continue" (default) or "error"
 	subagents       subagentRuntimeConfig
 }
 
@@ -223,7 +227,7 @@ func run() int {
 		fmt.Fprintf(os.Stdout, "%s %s\n", filepath.Base(os.Args[0]), version)
 		return 0
 	}
-	if cfg.initialQuestion == "" {
+	if !cfg.interactive && cfg.initialQuestion == "" {
 		printUsage(os.Stderr)
 		return 1
 	}
@@ -235,6 +239,14 @@ func run() int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
+	}
+
+	if cfg.interactive {
+		if err := app.runInteractive(ctx); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
 	}
 
 	if err := app.runQuestion(ctx, cfg.initialQuestion); err != nil {
@@ -263,7 +275,6 @@ func newApp(cfg config) (*app, error) {
 		toolset: buildAgentTools(cfg.allowedTools),
 	}
 	subagentCfg := cfg.subagents
-	subagentCfg.OnMaxIterations = cfg.onMaxIterations
 	instance.subagents = newSubagentManager(subagentCfg, instance.runSubagentSession)
 	return instance, nil
 }
@@ -283,8 +294,8 @@ func loadConfig(args []string) (config, error) {
 		allowedTools[name] = true
 	}
 	yolo := false
+	interactive := false
 	maxIter := 0
-	onMaxIter := ""
 	subagentCfg := subagentRuntimeConfig{} // zero = "not set by flag"; env/file/normalize fills gaps
 
 	for i := 0; i < len(args); i++ {
@@ -294,6 +305,8 @@ func loadConfig(args []string) (config, error) {
 			return config{}, errHelpRequested
 		case arg == "--version" || arg == "-version":
 			return config{showVersion: true}, nil
+		case arg == "-i" || arg == "--interactive":
+			interactive = true
 		case arg == "--yolo":
 			yolo = true
 			for name := range optInTools {
@@ -395,22 +408,6 @@ func loadConfig(args []string) (config, error) {
 				return config{}, err
 			}
 			maxIter = value
-		case arg == "--on-max-iterations":
-			if i+1 >= len(args) {
-				return config{}, errors.New("--on-max-iterations requires a value")
-			}
-			i++
-			v := strings.TrimSpace(args[i])
-			if v != "error" && v != "continue" {
-				return config{}, fmt.Errorf("--on-max-iterations expects \"error\" or \"continue\", got %q", v)
-			}
-			onMaxIter = v
-		case strings.HasPrefix(arg, "--on-max-iterations="):
-			v := strings.TrimSpace(strings.TrimPrefix(arg, "--on-max-iterations="))
-			if v != "error" && v != "continue" {
-				return config{}, fmt.Errorf("--on-max-iterations expects \"error\" or \"continue\", got %q", v)
-			}
-			onMaxIter = v
 		case strings.HasPrefix(arg, "-"):
 			return config{}, fmt.Errorf("unknown flag %q", arg)
 		default:
@@ -466,31 +463,18 @@ func loadConfig(args []string) (config, error) {
 		maxIter = defaultMaxIterations
 	}
 
-	// Resolve on-max-iterations: flag > env > file > default "continue"
-	if onMaxIter == "" {
-		if env := readCfg("ON_MAX_ITERATIONS", fileCfg, ""); env != "" {
-			v := strings.TrimSpace(env)
-			if v == "error" || v == "continue" {
-				onMaxIter = v
-			}
-		}
-	}
-	if onMaxIter == "" {
-		onMaxIter = "continue"
-	}
-
 	return config{
 		baseURL:         baseURL,
 		model:           readCfg("MODEL", fileCfg, defaultModel),
 		token:           readCfg("TOKEN", fileCfg, defaultToken),
 		reasoning:       reasoning,
 		systemPrompt:    readSystemPrompt(fileCfg),
+		interactive:     interactive,
 		initialQuestion: strings.TrimSpace(strings.Join(filtered, " ")),
 		workspaceRoot:   workspaceRoot,
 		allowedTools:    allowedTools,
 		yolo:            yolo,
 		maxIterations:   maxIter,
-		onMaxIterations: onMaxIter,
 		subagents:       subagentCfg,
 	}, nil
 }
@@ -582,7 +566,6 @@ TOKEN =
 REASONING_EFFORT = medium
 SYSTEM_PROMPT =
 MAX_ITERATIONS = 40
-ON_MAX_ITERATIONS = continue
 
 # Subagent orchestration limits (env vars: SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN,
 # SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS; also settable via CLI flags)
@@ -697,14 +680,11 @@ func readConfigFile(path string) (map[string]string, error) {
 
 func printUsage(w io.Writer) {
 	fmt.Fprintf(w, usageMessageTemplate, filepath.Base(os.Args[0]))
-	fmt.Fprintln(w, "One-shot mode only. No interactive mode.")
-	fmt.Fprintln(w, "Env: BASE_URL, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS, ON_MAX_ITERATIONS")
+	fmt.Fprintln(w, "Interactive mode: -i / --interactive  (keep session alive for follow-up turns; initial question is optional)")
+	fmt.Fprintln(w, "Env: BASE_URL, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
-	fmt.Fprintln(w, "Opt-in tools (repeatable): --allow-tool write_file --allow-tool append_file --allow-tool execute_program --allow-tool execute_skill --allow-tool create_subagent --allow-tool run_subagent --allow-tool await_subagent --allow-tool list_subagents --allow-tool read_subagent --allow-tool cancel_subagent")
-	fmt.Fprintln(w, "Iteration limit: --max-iterations N (default 40; env MAX_ITERATIONS)")
-	fmt.Fprintln(w, "On limit reached: --on-max-iterations continue|error (default continue; env ON_MAX_ITERATIONS)")
-	fmt.Fprintln(w, "  continue: inject a wrap-up prompt and request a final answer with no tools (default)")
-	fmt.Fprintln(w, "  error:    exit with a non-zero error (legacy behavior)")
+	fmt.Fprintln(w, "Opt-in tools (repeatable): --allow-tool write_file --allow-tool edit_file --allow-tool append_file --allow-tool execute_program --allow-tool execute_skill")
+	fmt.Fprintln(w, "Iteration limit: --max-iterations N (default 40; env MAX_ITERATIONS; always wraps up gracefully on limit)")
 	fmt.Fprintln(w, "Subagent limits (flags, env vars, or config file):")
 	fmt.Fprintln(w, "  --subagent-max-depth N        (default 1;   env SUBAGENT_MAX_DEPTH)")
 	fmt.Fprintln(w, "  --subagent-max-children N     (default 8;   env SUBAGENT_MAX_CHILDREN)")
@@ -715,22 +695,30 @@ func printUsage(w io.Writer) {
 
 func (a *app) runQuestion(ctx context.Context, question string) error {
 	fmt.Fprintf(os.Stderr, "[capelin-go] Task: %s\n\n", question)
-	_, err := a.runConversation(ctx, question, a.rootRuntime(), a.toolset, true)
+	messages := []apiMessage{
+		{Role: "system", Content: a.systemPromptWithSkills()},
+	}
+	_, _, err := a.runTurnLoop(ctx, messages, question, a.rootRuntime(), a.toolset, true)
 	return err
 }
 
 func (a *app) runConversation(ctx context.Context, question string, runtime *agentRuntime, toolset []apiTool, emitOutput bool) (string, error) {
 	messages := []apiMessage{
 		{Role: "system", Content: a.systemPromptWithSkills()},
-		{Role: "user", Content: question},
 	}
+	_, result, err := a.runTurnLoop(ctx, messages, question, runtime, toolset, emitOutput)
+	return result, err
+}
+
+// runTurnLoop appends a user message to messages and runs the tool-call loop for
+// one turn, returning the updated message slice and the last text content produced
+// by the model. It is the shared core used by one-shot, subagent, and interactive modes.
+func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question string, runtime *agentRuntime, toolset []apiTool, emitOutput bool) ([]apiMessage, string, error) {
+	messages = append(messages, apiMessage{Role: "user", Content: question})
+
 	maxIterations := defaultMaxIterations
 	if runtime != nil && runtime.maxToolIterations > 0 {
 		maxIterations = runtime.maxToolIterations
-	}
-	onMaxIter := "continue"
-	if runtime != nil && runtime.onMaxIterations != "" {
-		onMaxIter = runtime.onMaxIterations
 	}
 	lastContent := ""
 
@@ -745,7 +733,7 @@ func (a *app) runConversation(ctx context.Context, question string, runtime *age
 
 		resp, err := a.client.complete(ctx, messages, toolset)
 		if err != nil {
-			return "", err
+			return messages, "", err
 		}
 
 		if content := strings.TrimSpace(resp.Content()); content != "" {
@@ -760,7 +748,7 @@ func (a *app) runConversation(ctx context.Context, question string, runtime *age
 			if emitOutput {
 				fmt.Fprintln(os.Stdout)
 			}
-			return lastContent, nil
+			return messages, lastContent, nil
 		}
 
 		for _, call := range resp.ToolCalls() {
@@ -785,11 +773,7 @@ func (a *app) runConversation(ctx context.Context, question string, runtime *age
 		}
 	}
 
-	if onMaxIter == "error" {
-		return "", fmt.Errorf("exceeded maximum tool iterations (%d)", maxIterations)
-	}
-
-	// "continue" mode: force a final answer with no tools available.
+	// Maximum iterations reached: force a final answer with no tools available.
 	fmt.Fprintf(os.Stderr, "[capelin-go] Maximum tool iterations (%d) reached; requesting final answer.\n", maxIterations)
 	messages = append(messages, apiMessage{
 		Role:    "user",
@@ -800,18 +784,143 @@ func (a *app) runConversation(ctx context.Context, question string, runtime *age
 		// Fall back to whatever content we collected so far.
 		if lastContent != "" {
 			fmt.Fprintf(os.Stderr, "[capelin-go] Final-answer call failed (%v); returning partial result.\n", err)
-			return lastContent, nil
+			return messages, lastContent, nil
 		}
-		return "", fmt.Errorf("exceeded maximum tool iterations (%d) and final-answer call failed: %w", maxIterations, err)
+		return messages, "", fmt.Errorf("exceeded maximum tool iterations (%d) and final-answer call failed: %w", maxIterations, err)
 	}
 	if content := strings.TrimSpace(resp.Content()); content != "" {
 		if emitOutput {
 			fmt.Fprintln(os.Stdout, content)
 			fmt.Fprintln(os.Stdout)
 		}
-		return content, nil
+		messages = append(messages, resp.asMessage())
+		return messages, content, nil
 	}
-	return lastContent, nil
+	return messages, lastContent, nil
+}
+
+// runInteractive runs a REPL loop, maintaining conversation history across turns.
+// An optional initialQuestion is handled as the first turn before prompting stdin.
+func (a *app) runInteractive(ctx context.Context) error {
+	messages := []apiMessage{
+		{Role: "system", Content: a.systemPromptWithSkills()},
+	}
+	runtime := a.rootRuntime()
+
+	if a.cfg.initialQuestion != "" {
+		fmt.Fprintf(os.Stderr, "[capelin-go] Task: %s\n\n", a.cfg.initialQuestion)
+		var err error
+		messages, _, err = a.runTurnLoop(ctx, messages, a.cfg.initialQuestion, runtime, a.toolset, true)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			fmt.Fprintf(os.Stderr, "[capelin-go] error: %v\n", err)
+		}
+	}
+
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:          "> ",
+		HistoryFile:     historyFilePath(),
+		InterruptPrompt: "^C",
+		EOFPrompt:       "exit",
+		Stdin:           os.Stdin,
+		Stdout:          os.Stderr, // prompt goes to stderr so stdout stays clean
+	})
+	if err != nil {
+		// Fall back to a basic line reader if readline fails to initialise.
+		fmt.Fprintf(os.Stderr, "[capelin-go] warning: readline init failed (%v); falling back to basic input\n", err)
+		return a.runInteractiveFallback(ctx, messages, runtime)
+	}
+	defer rl.Close()
+
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		line, err := rl.Readline()
+		if err == readline.ErrInterrupt {
+			// Ctrl+C on a non-empty line clears it and reprompts.
+			// Ctrl+C on an empty line exits.
+			if strings.TrimSpace(line) == "" {
+				break
+			}
+			continue
+		}
+		if err == io.EOF {
+			// Ctrl+D — clean exit.
+			fmt.Fprintln(os.Stderr)
+			break
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[capelin-go] readline error: %v\n", err)
+			break
+		}
+
+		input := strings.TrimSpace(line)
+		if input == "" {
+			continue
+		}
+		if input == "exit" || input == "quit" {
+			break
+		}
+
+		preTurnLen := len(messages)
+		messages, _, err = a.runTurnLoop(ctx, messages, input, runtime, a.toolset, true)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			fmt.Fprintf(os.Stderr, "[capelin-go] error: %v\n", err)
+			messages = messages[:preTurnLen]
+		}
+	}
+	return nil
+}
+
+// runInteractiveFallback is a minimal line-reader used when readline cannot initialise
+// (e.g. on unsupported platforms or in restricted environments).
+func (a *app) runInteractiveFallback(ctx context.Context, messages []apiMessage, runtime *agentRuntime) error {
+	buf := make([]byte, 4096)
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		fmt.Fprint(os.Stderr, "\n> ")
+		n, err := os.Stdin.Read(buf)
+		if err != nil {
+			break
+		}
+		input := strings.TrimSpace(string(buf[:n]))
+		if input == "" {
+			continue
+		}
+		if input == "exit" || input == "quit" {
+			break
+		}
+		preTurnLen := len(messages)
+		var runErr error
+		messages, _, runErr = a.runTurnLoop(ctx, messages, input, runtime, a.toolset, true)
+		if runErr != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			fmt.Fprintf(os.Stderr, "[capelin-go] error: %v\n", runErr)
+			messages = messages[:preTurnLen]
+		}
+	}
+	return nil
+}
+
+// historyFilePath returns the path for the readline history file.
+// Returns an empty string if the home directory cannot be determined
+// (readline silently skips history persistence when the path is empty).
+func historyFilePath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".local", "capelin-go", "history")
 }
 
 func (a *app) systemPromptWithSkills() string {
@@ -881,6 +990,15 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 			return "", fmt.Errorf("invalid write_file arguments: %w", err)
 		}
 		return runWriteFile(a.cfg.workspaceRoot, a.cfg.yolo, args)
+	case toolEditFile:
+		if !a.isToolEnabled(runtime, toolEditFile) {
+			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolEditFile, toolEditFile)
+		}
+		var args editFileArgs
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+			return "", fmt.Errorf("invalid edit_file arguments: %w", err)
+		}
+		return runEditFile(a.cfg.workspaceRoot, a.cfg.yolo, args)
 	case toolAppendFile:
 		if !a.isToolEnabled(runtime, toolAppendFile) {
 			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolAppendFile, toolAppendFile)
@@ -1019,7 +1137,6 @@ func (a *app) rootRuntime() *agentRuntime {
 		role:              agentRoleCoordinator,
 		allowedTools:      cloneAllowedTools(a.cfg.allowedTools),
 		maxToolIterations: a.cfg.maxIterations,
-		onMaxIterations:   a.cfg.onMaxIterations,
 	}
 }
 
@@ -1134,6 +1251,9 @@ func buildAgentTools(enabled map[string]bool) []apiTool {
 	}
 	if enabled[toolWriteFile] {
 		tools = append(tools, specWriteFile())
+	}
+	if enabled[toolEditFile] {
+		tools = append(tools, specEditFile())
 	}
 	if enabled[toolAppendFile] {
 		tools = append(tools, specAppendFile())
