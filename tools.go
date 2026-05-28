@@ -38,8 +38,50 @@ var allowPrivateFetch = false
 
 var errListLimitReached = errors.New("list limit reached")
 
+// safeDialer resolves the target hostname and validates every resolved IP against
+// isBlockedAddr before opening the TCP connection. This prevents DNS-rebinding
+// attacks where a public IP is returned during the pre-flight validateFetchURL
+// check but a private IP is returned during the actual HTTP dial.
+var safeDialer = &net.Dialer{
+	Timeout:   30 * time.Second,
+	KeepAlive: 30 * time.Second,
+}
+
+func safeDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	if !allowPrivateFetch {
+		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range addrs {
+			if ip, ok := netip.AddrFromSlice(a.IP); ok && isBlockedAddr(ip.Unmap()) {
+				return nil, fmt.Errorf("fetch page: refusing private or local IP %q", a.IP)
+			}
+		}
+		if len(addrs) == 0 {
+			return nil, fmt.Errorf("fetch page: no addresses resolved for %q", host)
+		}
+		// Connect using the first resolved IP to pin the address and prevent rebinding.
+		resolvedAddr := net.JoinHostPort(addrs[0].IP.String(), port)
+		return safeDialer.DialContext(ctx, network, resolvedAddr)
+	}
+	return safeDialer.DialContext(ctx, network, addr)
+}
+
 var toolHTTPClient = &http.Client{
 	Timeout: toolTimeout,
+	Transport: &http.Transport{
+		DialContext:           safeDial,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 5 {
 			return fmt.Errorf("too many redirects")
@@ -99,11 +141,13 @@ type executeSkillArgs struct {
 }
 
 type createSubagentArgs struct {
-	Name           string   `json:"name"`
-	Question       string   `json:"question"`
-	AllowedTools   []string `json:"allowed_tools"`
-	TimeoutSeconds int      `json:"timeout_seconds"`
-	ExecutionMode  string   `json:"execution_mode"`
+	Name               string   `json:"name"`
+	Question           string   `json:"question"`
+	AllowedTools       []string `json:"allowed_tools"`
+	TimeoutSeconds     int      `json:"timeout_seconds"`
+	ExecutionMode      string   `json:"execution_mode"`
+	OverflowMode       string   `json:"overflow_mode"`
+	WaitTimeoutSeconds int      `json:"wait_timeout_seconds"`
 }
 
 type runSubagentArgs struct {
@@ -379,6 +423,14 @@ func specCreateSubagent() apiTool {
 					"execution_mode": map[string]any{
 						"type":        "string",
 						"description": `Execution mode: "sequential" (serialized, one at a time) or "parallel" (concurrent, respects --subagent-max-parallel limit). Use "parallel" when spawning multiple independent subagents.`,
+					},
+					"overflow_mode": map[string]any{
+						"type":        "string",
+						"description": `Behavior when parent is at --subagent-max-children: "wait_for_slot" (default, blocks until active child slot is free) or "fail_fast" (return error immediately).`,
+					},
+					"wait_timeout_seconds": map[string]any{
+						"type":        "integer",
+						"description": "Timeout for overflow_mode=wait_for_slot. Defaults to --subagent-timeout-seconds (300s unless configured).",
 					},
 				},
 				"required":             []string{"question"},

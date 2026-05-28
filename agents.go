@@ -11,9 +11,13 @@ import (
 	"time"
 )
 
-
 const (
 	rootAgentID = "root"
+)
+
+const (
+	createSubagentOverflowWaitForSlot = "wait_for_slot"
+	createSubagentOverflowFailFast    = "fail_fast"
 )
 
 const (
@@ -95,11 +99,11 @@ func (c *subagentRuntimeConfig) normalize() {
 }
 
 type agentRuntime struct {
-	sessionID          string
-	depth              int
-	role               agentRole
-	allowedTools       map[string]bool
-	maxToolIterations  int
+	sessionID         string
+	depth             int
+	role              agentRole
+	allowedTools      map[string]bool
+	maxToolIterations int
 }
 
 type subagentStatus string
@@ -148,6 +152,7 @@ type subagentManager struct {
 	runner subagentRunner
 
 	mu             sync.Mutex
+	slotCond       *sync.Cond
 	serialMu       sync.Mutex
 	nextID         atomic.Uint64
 	sessions       map[string]*subagentSession
@@ -157,18 +162,23 @@ type subagentManager struct {
 
 func newSubagentManager(cfg subagentRuntimeConfig, runner subagentRunner) *subagentManager {
 	cfg.normalize()
-	return &subagentManager{
+	m := &subagentManager{
 		cfg:            cfg,
 		runner:         runner,
 		sessions:       map[string]*subagentSession{},
 		childrenByNode: map[string][]string{},
 		parallelSem:    make(chan struct{}, cfg.MaxParallel),
 	}
+	m.slotCond = sync.NewCond(&m.mu)
+	return m
 }
 
-func (m *subagentManager) create(parent *agentRuntime, args createSubagentArgs) (*subagentSession, error) {
+func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args createSubagentArgs) (*subagentSession, error) {
 	if parent == nil {
 		return nil, errors.New("parent runtime is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	question := strings.TrimSpace(args.Question)
 	if question == "" {
@@ -182,6 +192,17 @@ func (m *subagentManager) create(parent *agentRuntime, args createSubagentArgs) 
 	if err != nil {
 		return nil, err
 	}
+	overflowMode, err := normalizeCreateSubagentOverflowMode(args.OverflowMode)
+	if err != nil {
+		return nil, err
+	}
+	waitTimeoutSec := 0
+	if overflowMode == createSubagentOverflowWaitForSlot {
+		waitTimeoutSec, err = m.resolveWaitTimeoutSeconds(args.WaitTimeoutSeconds)
+		if err != nil {
+			return nil, err
+		}
+	}
 	allowed, err := deriveChildAllowedTools(parent.allowedTools, args.AllowedTools, depth, m.cfg.MaxDepth)
 	if err != nil {
 		return nil, err
@@ -190,9 +211,13 @@ func (m *subagentManager) create(parent *agentRuntime, args createSubagentArgs) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	parentChildren := m.childrenByNode[parent.sessionID]
-	if len(parentChildren) >= m.cfg.MaxChildren {
-		return nil, fmt.Errorf("max children exceeded for parent %q (%d)", parent.sessionID, m.cfg.MaxChildren)
+	for m.activeChildrenLocked(parent.sessionID) >= m.cfg.MaxChildren {
+		if overflowMode == createSubagentOverflowFailFast {
+			return nil, fmt.Errorf("max children exceeded for parent %q (%d)", parent.sessionID, m.cfg.MaxChildren)
+		}
+		if err := m.waitForChildSlotLocked(ctx, parent.sessionID, waitTimeoutSec); err != nil {
+			return nil, err
+		}
 	}
 
 	id := fmt.Sprintf("subagent-%d", m.nextID.Add(1))
@@ -350,6 +375,7 @@ func (m *subagentManager) execute(session *subagentSession) {
 		session.Error = ""
 	}
 	session.closeDone()
+	m.slotCond.Broadcast()
 }
 
 func (m *subagentManager) await(ctx context.Context, parent *agentRuntime, args awaitSubagentArgs) (*subagentSession, error) {
@@ -417,6 +443,7 @@ func (m *subagentManager) cancel(parent *agentRuntime, args cancelSubagentArgs) 
 		session.Error = "subagent cancelled before execution"
 		session.FinishedAt = time.Now().UTC()
 		session.closeDone()
+		m.slotCond.Broadcast()
 	}
 	return cloneSession(session), nil
 }
@@ -569,6 +596,94 @@ func (m *subagentManager) resolveTimeoutSeconds(requested int) (int, error) {
 		return 0, fmt.Errorf("timeout_seconds exceeds %d", m.cfg.MaxTimeoutSec)
 	}
 	return requested, nil
+}
+
+func (m *subagentManager) resolveWaitTimeoutSeconds(requested int) (int, error) {
+	if requested <= 0 {
+		return m.cfg.DefaultTimeoutSec, nil
+	}
+	if requested > m.cfg.MaxTimeoutSec {
+		return 0, fmt.Errorf("wait_timeout_seconds exceeds %d", m.cfg.MaxTimeoutSec)
+	}
+	return requested, nil
+}
+
+func (m *subagentManager) activeChildrenLocked(parentID string) int {
+	ids := m.childrenByNode[parentID]
+	count := 0
+	for _, id := range ids {
+		session := m.sessions[id]
+		if session == nil || isTerminalSubagentStatus(session.Status) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func (m *subagentManager) waitForChildSlotLocked(ctx context.Context, parentID string, timeoutSec int) error {
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+	cancelledByContext := false
+	stopCtxWatch := make(chan struct{})
+	if ctx != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				m.mu.Lock()
+				cancelledByContext = true
+				m.slotCond.Broadcast()
+				m.mu.Unlock()
+			case <-stopCtxWatch:
+			}
+		}()
+	}
+	defer close(stopCtxWatch)
+
+	for m.activeChildrenLocked(parentID) >= m.cfg.MaxChildren {
+		if cancelledByContext {
+			return fmt.Errorf("wait_for_slot: %w", ctx.Err())
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("wait_for_slot timed out after %ds for parent %q (%d)", timeoutSec, parentID, m.cfg.MaxChildren)
+		}
+		timedOut := false
+		timer := time.AfterFunc(remaining, func() {
+			m.mu.Lock()
+			timedOut = true
+			m.slotCond.Broadcast()
+			m.mu.Unlock()
+		})
+		m.slotCond.Wait()
+		if cancelledByContext {
+			_ = timer.Stop()
+			return fmt.Errorf("wait_for_slot: %w", ctx.Err())
+		}
+		if !timer.Stop() && timedOut && m.activeChildrenLocked(parentID) >= m.cfg.MaxChildren {
+			return fmt.Errorf("wait_for_slot timed out after %ds for parent %q (%d)", timeoutSec, parentID, m.cfg.MaxChildren)
+		}
+	}
+	return nil
+}
+
+func isTerminalSubagentStatus(status subagentStatus) bool {
+	switch status {
+	case subagentStatusCompleted, subagentStatusFailed, subagentStatusCancelled, subagentStatusTimedOut:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeCreateSubagentOverflowMode(raw string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	if mode == "" {
+		return createSubagentOverflowWaitForSlot, nil
+	}
+	if mode != createSubagentOverflowWaitForSlot && mode != createSubagentOverflowFailFast {
+		return "", fmt.Errorf("invalid overflow_mode %q", raw)
+	}
+	return mode, nil
 }
 
 type subagentEnvelope struct {

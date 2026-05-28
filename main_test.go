@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -681,11 +682,11 @@ func TestSubagentMaxDepthAndChildren(t *testing.T) {
 		allowedTools:      map[string]bool{toolCreateSubagent: true},
 		maxToolIterations: 5,
 	}
-	_, err := m.create(root, createSubagentArgs{Question: "a"})
+	_, err := m.create(context.Background(), root, createSubagentArgs{Question: "a"})
 	if err != nil {
 		t.Fatalf("first create failed: %v", err)
 	}
-	_, err = m.create(root, createSubagentArgs{Question: "b"})
+	_, err = m.create(context.Background(), root, createSubagentArgs{Question: "b", OverflowMode: "fail_fast"})
 	if err == nil {
 		t.Fatal("expected max-children rejection")
 	}
@@ -696,9 +697,128 @@ func TestSubagentMaxDepthAndChildren(t *testing.T) {
 		allowedTools:      map[string]bool{toolCreateSubagent: true},
 		maxToolIterations: 5,
 	}
-	_, err = m.create(childRuntime, createSubagentArgs{Question: "nested"})
+	_, err = m.create(context.Background(), childRuntime, createSubagentArgs{Question: "nested"})
 	if err == nil {
 		t.Fatal("expected max-depth rejection")
+	}
+}
+
+func TestSubagentCreateWaitsForChildSlotByDefault(t *testing.T) {
+	cfg := defaultSubagentRuntimeConfig()
+	cfg.MaxDepth = 1
+	cfg.MaxChildren = 1
+	cfg.DefaultTimeoutSec = 2
+	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+		time.Sleep(120 * time.Millisecond)
+		return "ok", nil
+	})
+	root := &agentRuntime{
+		sessionID:         rootAgentID,
+		depth:             0,
+		allowedTools:      map[string]bool{toolCreateSubagent: true, toolRunSubagent: true, toolAwaitSubagent: true},
+		maxToolIterations: 5,
+	}
+
+	first, err := m.create(context.Background(), root, createSubagentArgs{Question: "a"})
+	if err != nil {
+		t.Fatalf("first create failed: %v", err)
+	}
+	if _, err := m.run(context.Background(), root, runSubagentArgs{ID: first.ID}); err != nil {
+		t.Fatalf("run first: %v", err)
+	}
+
+	start := time.Now()
+	second, err := m.create(context.Background(), root, createSubagentArgs{Question: "b"})
+	if err != nil {
+		t.Fatalf("second create failed: %v", err)
+	}
+	if second.ID == "" {
+		t.Fatal("expected second child to be created")
+	}
+	if time.Since(start) < 80*time.Millisecond {
+		t.Fatal("expected create to wait for a free child slot")
+	}
+}
+
+func TestSubagentCreateWaitForSlotTimeout(t *testing.T) {
+	cfg := defaultSubagentRuntimeConfig()
+	cfg.MaxDepth = 1
+	cfg.MaxChildren = 1
+	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+		return "ok", nil
+	})
+	root := &agentRuntime{
+		sessionID:         rootAgentID,
+		depth:             0,
+		allowedTools:      map[string]bool{toolCreateSubagent: true},
+		maxToolIterations: 5,
+	}
+
+	if _, err := m.create(context.Background(), root, createSubagentArgs{Question: "a"}); err != nil {
+		t.Fatalf("first create failed: %v", err)
+	}
+	_, err := m.create(context.Background(), root, createSubagentArgs{Question: "b", WaitTimeoutSeconds: 1})
+	if err == nil {
+		t.Fatal("expected wait_for_slot timeout")
+	}
+	if !strings.Contains(err.Error(), "wait_for_slot timed out") {
+		t.Fatalf("expected wait timeout error, got %v", err)
+	}
+}
+
+func TestSubagentCreateWaitForSlotRespectsContextCancellation(t *testing.T) {
+	cfg := defaultSubagentRuntimeConfig()
+	cfg.MaxDepth = 1
+	cfg.MaxChildren = 1
+	cfg.DefaultTimeoutSec = 300
+	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+		return "ok", nil
+	})
+	root := &agentRuntime{
+		sessionID:         rootAgentID,
+		depth:             0,
+		allowedTools:      map[string]bool{toolCreateSubagent: true},
+		maxToolIterations: 5,
+	}
+
+	if _, err := m.create(context.Background(), root, createSubagentArgs{Question: "a"}); err != nil {
+		t.Fatalf("first create failed: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	_, err := m.create(waitCtx, root, createSubagentArgs{Question: "b", WaitTimeoutSeconds: 300})
+	if err == nil {
+		t.Fatal("expected create to stop waiting when context is cancelled")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context deadline exceeded, got %v", err)
+	}
+}
+
+func TestSubagentCreateFailFastOverflowMode(t *testing.T) {
+	cfg := defaultSubagentRuntimeConfig()
+	cfg.MaxDepth = 1
+	cfg.MaxChildren = 1
+	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+		return "ok", nil
+	})
+	root := &agentRuntime{
+		sessionID:         rootAgentID,
+		depth:             0,
+		allowedTools:      map[string]bool{toolCreateSubagent: true},
+		maxToolIterations: 5,
+	}
+
+	if _, err := m.create(context.Background(), root, createSubagentArgs{Question: "a"}); err != nil {
+		t.Fatalf("first create failed: %v", err)
+	}
+	_, err := m.create(context.Background(), root, createSubagentArgs{Question: "b", OverflowMode: "fail_fast"})
+	if err == nil {
+		t.Fatal("expected fail_fast overflow rejection")
+	}
+	if !strings.Contains(err.Error(), "max children exceeded") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -731,7 +851,7 @@ func TestSubagentParallelBoundedWorkerPool(t *testing.T) {
 	}
 	ids := make([]string, 0, 3)
 	for i := 0; i < 3; i++ {
-		session, err := m.create(root, createSubagentArgs{Question: fmt.Sprintf("q-%d", i), ExecutionMode: "parallel"})
+		session, err := m.create(context.Background(), root, createSubagentArgs{Question: fmt.Sprintf("q-%d", i), ExecutionMode: "parallel"})
 		if err != nil {
 			t.Fatalf("create %d: %v", i, err)
 		}
@@ -767,7 +887,7 @@ func TestRunSubagentPreservesCreatedExecutionMode(t *testing.T) {
 		maxToolIterations: 5,
 	}
 
-	created, err := m.create(root, createSubagentArgs{Question: "q", ExecutionMode: "parallel"})
+	created, err := m.create(context.Background(), root, createSubagentArgs{Question: "q", ExecutionMode: "parallel"})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -925,6 +1045,7 @@ func TestConfigFileCreatedWithDefaults(t *testing.T) {
 	cfg, err := readConfigFile(path)
 	if err == nil && len(cfg) > 0 {
 		// file existed somehow - ok, skip creation test
+		t.Skip("config file already existed; skipping creation test")
 	}
 
 	// Write the default content and parse it.

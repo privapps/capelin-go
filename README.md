@@ -29,6 +29,7 @@
 - fetch blocks localhost/private network targets
 - subagents inherit parent tool policy and can only further restrict allowed tools
 - subagents enforce depth/children/timeout limits and bounded parallel workers
+- when a parent is at `MaxChildren`, `create_subagent` defaults to `overflow_mode="wait_for_slot"` (bounded by timeout, default 300s); use `overflow_mode="fail_fast"` for immediate rejection
 - **`--yolo`**: enables all opt-in tools and removes path confinement (shorthand for enabling everything)
 
 ## Build
@@ -122,9 +123,12 @@ Enable everything (all tools + unrestricted paths):
 - `SYSTEM_PROMPT` (or `systemPrompt`) — prompt override
 - `MAX_ITERATIONS` — root agent tool-call iteration cap (default: 40; overridden by `--max-iterations`); always wraps up gracefully on limit
 - `SUBAGENT_MAX_DEPTH` — maximum subagent nesting depth (default: 1; overridden by `--subagent-max-depth`)
-- `SUBAGENT_MAX_CHILDREN` — maximum subagents a single parent can spawn (default: 8; overridden by `--subagent-max-children`)
+- `SUBAGENT_MAX_CHILDREN` — maximum active subagents (pending/queued/running) a single parent can hold at once (default: 8; overridden by `--subagent-max-children`)
 - `SUBAGENT_MAX_PARALLEL` — maximum concurrently running parallel subagents (default: 4; overridden by `--subagent-max-parallel`)
 - `SUBAGENT_TIMEOUT_SECONDS` — default subagent execution timeout in seconds (default: 300; overridden by `--subagent-timeout-seconds`)
+- `SUBAGENT_MAX_RESULT_CHARS` — maximum characters returned per subagent result (default: 8000; overridden by `--subagent-max-result-chars`)
+- `SUBAGENT_MAX_AGGREGATE_CHARS` — maximum total characters across all subagent results in a single turn (default: 12000; overridden by `--subagent-max-aggregate-chars`)
+- `SUBAGENT_MAX_ITERATIONS` — maximum tool-call iterations per subagent (default: 20; overridden by `--subagent-max-iterations`)
 
 ## Config file
 
@@ -143,11 +147,15 @@ SYSTEM_PROMPT =
 MAX_ITERATIONS = 40
 
 # Subagent orchestration limits (env vars: SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN,
-# SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS; also settable via CLI flags)
+# SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS, SUBAGENT_MAX_RESULT_CHARS,
+# SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS; also settable via CLI flags)
 SUBAGENT_MAX_DEPTH = 1
 SUBAGENT_MAX_CHILDREN = 8
 SUBAGENT_MAX_PARALLEL = 4
 SUBAGENT_TIMEOUT_SECONDS = 300
+SUBAGENT_MAX_RESULT_CHARS = 8000
+SUBAGENT_MAX_AGGREGATE_CHARS = 12000
+SUBAGENT_MAX_ITERATIONS = 20
 ```
 
 Edit that file to set your preferred model, server URL, or other defaults without needing environment variables every time. Environment variables and CLI flags still take priority over config file values.

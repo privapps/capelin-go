@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -392,6 +393,54 @@ func loadConfig(args []string) (config, error) {
 				return config{}, err
 			}
 			subagentCfg.DefaultTimeoutSec = value
+		case arg == "--subagent-max-result-chars":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--subagent-max-result-chars requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--subagent-max-result-chars")
+			if err != nil {
+				return config{}, err
+			}
+			subagentCfg.MaxResultChars = value
+		case strings.HasPrefix(arg, "--subagent-max-result-chars="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--subagent-max-result-chars="), "--subagent-max-result-chars")
+			if err != nil {
+				return config{}, err
+			}
+			subagentCfg.MaxResultChars = value
+		case arg == "--subagent-max-aggregate-chars":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--subagent-max-aggregate-chars requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--subagent-max-aggregate-chars")
+			if err != nil {
+				return config{}, err
+			}
+			subagentCfg.MaxAggregateChars = value
+		case strings.HasPrefix(arg, "--subagent-max-aggregate-chars="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--subagent-max-aggregate-chars="), "--subagent-max-aggregate-chars")
+			if err != nil {
+				return config{}, err
+			}
+			subagentCfg.MaxAggregateChars = value
+		case arg == "--subagent-max-iterations":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--subagent-max-iterations requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--subagent-max-iterations")
+			if err != nil {
+				return config{}, err
+			}
+			subagentCfg.MaxToolIterations = value
+		case strings.HasPrefix(arg, "--subagent-max-iterations="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--subagent-max-iterations="), "--subagent-max-iterations")
+			if err != nil {
+				return config{}, err
+			}
+			subagentCfg.MaxToolIterations = value
 		case arg == "--max-iterations":
 			if i+1 >= len(args) {
 				return config{}, errors.New("--max-iterations requires a value")
@@ -447,6 +496,21 @@ func loadConfig(args []string) (config, error) {
 	if subagentCfg.DefaultTimeoutSec == 0 {
 		if v, err := parsePositiveInt(readCfg("SUBAGENT_TIMEOUT_SECONDS", fileCfg, ""), "SUBAGENT_TIMEOUT_SECONDS"); err == nil {
 			subagentCfg.DefaultTimeoutSec = v
+		}
+	}
+	if subagentCfg.MaxResultChars == 0 {
+		if v, err := parsePositiveInt(readCfg("SUBAGENT_MAX_RESULT_CHARS", fileCfg, ""), "SUBAGENT_MAX_RESULT_CHARS"); err == nil {
+			subagentCfg.MaxResultChars = v
+		}
+	}
+	if subagentCfg.MaxAggregateChars == 0 {
+		if v, err := parsePositiveInt(readCfg("SUBAGENT_MAX_AGGREGATE_CHARS", fileCfg, ""), "SUBAGENT_MAX_AGGREGATE_CHARS"); err == nil {
+			subagentCfg.MaxAggregateChars = v
+		}
+	}
+	if subagentCfg.MaxToolIterations == 0 {
+		if v, err := parsePositiveInt(readCfg("SUBAGENT_MAX_ITERATIONS", fileCfg, ""), "SUBAGENT_MAX_ITERATIONS"); err == nil {
+			subagentCfg.MaxToolIterations = v
 		}
 	}
 	subagentCfg.normalize() // fills any remaining zeros with built-in defaults
@@ -568,11 +632,15 @@ SYSTEM_PROMPT =
 MAX_ITERATIONS = 40
 
 # Subagent orchestration limits (env vars: SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN,
-# SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS; also settable via CLI flags)
+# SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS, SUBAGENT_MAX_RESULT_CHARS,
+# SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS; also settable via CLI flags)
 SUBAGENT_MAX_DEPTH = 1
 SUBAGENT_MAX_CHILDREN = 8
 SUBAGENT_MAX_PARALLEL = 4
 SUBAGENT_TIMEOUT_SECONDS = 300
+SUBAGENT_MAX_RESULT_CHARS = 8000
+SUBAGENT_MAX_AGGREGATE_CHARS = 12000
+SUBAGENT_MAX_ITERATIONS = 20
 `
 
 // ensureConfigFile creates the config file with defaults if it does not exist,
@@ -683,13 +751,17 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Interactive mode: -i / --interactive  (keep session alive for follow-up turns; initial question is optional)")
 	fmt.Fprintln(w, "Env: BASE_URL, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
+	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")
 	fmt.Fprintln(w, "Opt-in tools (repeatable): --allow-tool write_file --allow-tool edit_file --allow-tool append_file --allow-tool execute_program --allow-tool execute_skill")
 	fmt.Fprintln(w, "Iteration limit: --max-iterations N (default 40; env MAX_ITERATIONS; always wraps up gracefully on limit)")
 	fmt.Fprintln(w, "Subagent limits (flags, env vars, or config file):")
-	fmt.Fprintln(w, "  --subagent-max-depth N        (default 1;   env SUBAGENT_MAX_DEPTH)")
-	fmt.Fprintln(w, "  --subagent-max-children N     (default 8;   env SUBAGENT_MAX_CHILDREN)")
-	fmt.Fprintln(w, "  --subagent-max-parallel N     (default 4;   env SUBAGENT_MAX_PARALLEL)")
-	fmt.Fprintln(w, "  --subagent-timeout-seconds N  (default 300; env SUBAGENT_TIMEOUT_SECONDS)")
+	fmt.Fprintln(w, "  --subagent-max-depth N              (default 1;     env SUBAGENT_MAX_DEPTH)")
+	fmt.Fprintln(w, "  --subagent-max-children N           (default 8 active children; env SUBAGENT_MAX_CHILDREN)")
+	fmt.Fprintln(w, "  --subagent-max-parallel N           (default 4;     env SUBAGENT_MAX_PARALLEL)")
+	fmt.Fprintln(w, "  --subagent-timeout-seconds N        (default 300;   env SUBAGENT_TIMEOUT_SECONDS)")
+	fmt.Fprintln(w, "  --subagent-max-result-chars N       (default 8000;  env SUBAGENT_MAX_RESULT_CHARS)")
+	fmt.Fprintln(w, "  --subagent-max-aggregate-chars N    (default 12000; env SUBAGENT_MAX_AGGREGATE_CHARS)")
+	fmt.Fprintln(w, "  --subagent-max-iterations N         (default 20;    env SUBAGENT_MAX_ITERATIONS)")
 	fmt.Fprintln(w, "All tools + unrestricted paths:  --yolo")
 }
 
@@ -881,17 +953,17 @@ func (a *app) runInteractive(ctx context.Context) error {
 // runInteractiveFallback is a minimal line-reader used when readline cannot initialise
 // (e.g. on unsupported platforms or in restricted environments).
 func (a *app) runInteractiveFallback(ctx context.Context, messages []apiMessage, runtime *agentRuntime) error {
-	buf := make([]byte, 4096)
+	reader := bufio.NewReader(os.Stdin)
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 		fmt.Fprint(os.Stderr, "\n> ")
-		n, err := os.Stdin.Read(buf)
+		line, err := reader.ReadString('\n')
 		if err != nil {
 			break
 		}
-		input := strings.TrimSpace(string(buf[:n]))
+		input := strings.TrimSpace(line)
 		if input == "" {
 			continue
 		}
@@ -1042,20 +1114,20 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 		return runReadSkill(a.skills, args)
 	case toolCreateSubagent:
 		if !a.isToolEnabled(runtime, toolCreateSubagent) {
-			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolCreateSubagent, toolCreateSubagent)
+			return "", fmt.Errorf("%s is disabled by current policy", toolCreateSubagent)
 		}
 		var args createSubagentArgs
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
 			return "", fmt.Errorf("invalid create_subagent arguments: %w", err)
 		}
-		session, err := a.subagents.create(runtime, args)
+		session, err := a.subagents.create(ctx, runtime, args)
 		if err != nil {
 			return "", err
 		}
 		return marshalToolResult(a.subagents.snapshotLocked(session, false))
 	case toolRunSubagent:
 		if !a.isToolEnabled(runtime, toolRunSubagent) {
-			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolRunSubagent, toolRunSubagent)
+			return "", fmt.Errorf("%s is disabled by current policy", toolRunSubagent)
 		}
 		var args runSubagentArgs
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
@@ -1068,7 +1140,7 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 		return marshalToolResult(a.subagents.snapshotLocked(session, true))
 	case toolAwaitSubagent:
 		if !a.isToolEnabled(runtime, toolAwaitSubagent) {
-			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolAwaitSubagent, toolAwaitSubagent)
+			return "", fmt.Errorf("%s is disabled by current policy", toolAwaitSubagent)
 		}
 		var args awaitSubagentArgs
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
@@ -1081,7 +1153,7 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 		return marshalToolResult(a.subagents.snapshotLocked(session, true))
 	case toolListSubagents:
 		if !a.isToolEnabled(runtime, toolListSubagents) {
-			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolListSubagents, toolListSubagents)
+			return "", fmt.Errorf("%s is disabled by current policy", toolListSubagents)
 		}
 		var args listSubagentsArgs
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
@@ -1094,7 +1166,7 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 		return marshalToolResult(items)
 	case toolReadSubagent:
 		if !a.isToolEnabled(runtime, toolReadSubagent) {
-			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolReadSubagent, toolReadSubagent)
+			return "", fmt.Errorf("%s is disabled by current policy", toolReadSubagent)
 		}
 		var args readSubagentArgs
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
@@ -1107,7 +1179,7 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 		return marshalToolResult(payload)
 	case toolCancelSubagent:
 		if !a.isToolEnabled(runtime, toolCancelSubagent) {
-			return "", fmt.Errorf("%s is disabled; enable with --allow-tool %s", toolCancelSubagent, toolCancelSubagent)
+			return "", fmt.Errorf("%s is disabled by current policy", toolCancelSubagent)
 		}
 		var args cancelSubagentArgs
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
@@ -1160,6 +1232,17 @@ func marshalToolResult(value any) (string, error) {
 	return string(raw), nil
 }
 
+const (
+	completeMaxAttempts = 3
+	completeRetryBase   = time.Second
+)
+
+// isRetryableStatus reports whether an HTTP status code is worth retrying.
+// 429 (rate limit) and 5xx (server errors) are transient; other 4xx are not.
+func isRetryableStatus(code int) bool {
+	return code == 429 || code >= 500
+}
+
 func (c *client) complete(ctx context.Context, messages []apiMessage, tools []apiTool) (*completionMessage, error) {
 	reqBody := apiRequest{
 		Model:           c.model,
@@ -1176,34 +1259,55 @@ func (c *client) complete(ctx context.Context, messages []apiMessage, tools []ap
 	}
 
 	endpoint := c.baseURL + "/chat/completions"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for attempt := 0; attempt < completeMaxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := completeRetryBase * time.Duration(1<<(attempt-1))
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("model request failed: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
-	}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if c.token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+		}
 
-	var decoded apiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
-		return nil, err
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			raw, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("model request failed: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+			if isRetryableStatus(resp.StatusCode) {
+				continue
+			}
+			return nil, lastErr
+		}
+
+		var decoded apiResponse
+		if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+		resp.Body.Close()
+		if len(decoded.Choices) == 0 {
+			return nil, errors.New("model returned no choices")
+		}
+		return &completionMessage{message: decoded.Choices[0].Message}, nil
 	}
-	if len(decoded.Choices) == 0 {
-		return nil, errors.New("model returned no choices")
-	}
-	return &completionMessage{message: decoded.Choices[0].Message}, nil
+	return nil, lastErr
 }
 
 type completionMessage struct {
