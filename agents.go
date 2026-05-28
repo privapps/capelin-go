@@ -49,6 +49,8 @@ type subagentRuntimeConfig struct {
 	MaxResultChars    int
 	MaxAggregateCount int
 	MaxAggregateChars int
+	Model             string
+	ReasoningEffort   string
 }
 
 func defaultSubagentRuntimeConfig() subagentRuntimeConfig {
@@ -104,6 +106,8 @@ type agentRuntime struct {
 	role              agentRole
 	allowedTools      map[string]bool
 	maxToolIterations int
+	model             string
+	reasoning         string
 }
 
 type subagentStatus string
@@ -348,6 +352,8 @@ func (m *subagentManager) execute(session *subagentSession) {
 		role:              session.Role,
 		allowedTools:      cloneAllowedTools(session.AllowedTools),
 		maxToolIterations: m.cfg.MaxToolIterations,
+		model:             m.cfg.Model,
+		reasoning:         m.cfg.ReasoningEffort,
 	}
 	output, runErr := m.runner(execCtx, runtime, cloneSession(session))
 	cancel()

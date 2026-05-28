@@ -1245,3 +1245,305 @@ func TestUpsertConfigFileKeys(t *testing.T) {
 		t.Fatal("upsert is not idempotent")
 	}
 }
+
+func TestLoadConfigSubagentModelFlag(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	cfg, err := loadConfig([]string{"--subagent-model", "gpt-4o", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.subagents.Model != "gpt-4o" {
+		t.Fatalf("expected subagent model gpt-4o, got %q", cfg.subagents.Model)
+	}
+}
+
+func TestLoadConfigSubagentModelFlagEqualForm(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	cfg, err := loadConfig([]string{"--subagent-model=claude-3-sonnet", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.subagents.Model != "claude-3-sonnet" {
+		t.Fatalf("expected claude-3-sonnet, got %q", cfg.subagents.Model)
+	}
+}
+
+func TestLoadConfigSubagentReasoningEffortFlag(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	cfg, err := loadConfig([]string{"--subagent-reasoning-effort", "high", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.subagents.ReasoningEffort != "high" {
+		t.Fatalf("expected subagent reasoning effort high, got %q", cfg.subagents.ReasoningEffort)
+	}
+}
+
+func TestLoadConfigSubagentReasoningEffortNone(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	// "none" must be converted to "" so the field is omitted from API requests.
+	cfg, err := loadConfig([]string{"--subagent-reasoning-effort", "none", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.subagents.ReasoningEffort != "" {
+		t.Fatalf("expected empty (none→omit) for subagent reasoning, got %q", cfg.subagents.ReasoningEffort)
+	}
+}
+
+func TestLoadConfigSubagentReasoningEffortNoneCaseInsensitive(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	for _, val := range []string{"none", "None", "NONE"} {
+		cfg, err := loadConfig([]string{"--subagent-reasoning-effort", val, "task"})
+		if err != nil {
+			t.Fatalf("loadConfig(%q): %v", val, err)
+		}
+		if cfg.subagents.ReasoningEffort != "" {
+			t.Fatalf("--subagent-reasoning-effort=%q expected empty, got %q", val, cfg.subagents.ReasoningEffort)
+		}
+	}
+}
+
+func TestLoadConfigSubagentModelInheritsRoot(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	t.Setenv("MODEL", "root-model")
+	defer t.Setenv("MODEL", "")
+
+	cfg, err := loadConfig([]string{"task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	// No --subagent-model or SUBAGENT_MODEL set → must inherit root model.
+	if cfg.subagents.Model != "root-model" {
+		t.Fatalf("expected subagent model to inherit root-model, got %q", cfg.subagents.Model)
+	}
+}
+
+func TestLoadConfigSubagentReasoningInheritsRoot(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	t.Setenv("REASONING_EFFORT", "low")
+	defer t.Setenv("REASONING_EFFORT", "")
+
+	cfg, err := loadConfig([]string{"task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	// No --subagent-reasoning-effort set → must inherit root reasoning.
+	if cfg.subagents.ReasoningEffort != "low" {
+		t.Fatalf("expected subagent reasoning to inherit low, got %q", cfg.subagents.ReasoningEffort)
+	}
+}
+
+func TestLoadConfigSubagentModelEnvVar(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	t.Setenv("SUBAGENT_MODEL", "env-subagent-model")
+	defer t.Setenv("SUBAGENT_MODEL", "")
+
+	cfg, err := loadConfig([]string{"task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.subagents.Model != "env-subagent-model" {
+		t.Fatalf("expected env SUBAGENT_MODEL, got %q", cfg.subagents.Model)
+	}
+}
+
+func TestLoadConfigSubagentReasoningEnvVar(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	t.Setenv("SUBAGENT_REASONING_EFFORT", "medium")
+	defer t.Setenv("SUBAGENT_REASONING_EFFORT", "")
+
+	cfg, err := loadConfig([]string{"task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.subagents.ReasoningEffort != "medium" {
+		t.Fatalf("expected SUBAGENT_REASONING_EFFORT=medium, got %q", cfg.subagents.ReasoningEffort)
+	}
+}
+
+func TestLoadConfigSubagentModelFlagOverridesEnv(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	t.Setenv("SUBAGENT_MODEL", "env-model")
+	defer t.Setenv("SUBAGENT_MODEL", "")
+
+	cfg, err := loadConfig([]string{"--subagent-model", "flag-model", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.subagents.Model != "flag-model" {
+		t.Fatalf("expected CLI flag to override env, got %q", cfg.subagents.Model)
+	}
+}
+
+func TestLoadConfigSubagentReasoningFlagOverridesEnv(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	t.Setenv("SUBAGENT_REASONING_EFFORT", "high")
+	defer t.Setenv("SUBAGENT_REASONING_EFFORT", "")
+
+	cfg, err := loadConfig([]string{"--subagent-reasoning-effort", "low", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.subagents.ReasoningEffort != "low" {
+		t.Fatalf("expected CLI flag (low) to override env (high), got %q", cfg.subagents.ReasoningEffort)
+	}
+}
+
+func TestUpsertConfigFileKeysIncludesSubagentModelKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.ini")
+
+	// Write an older config without the new subagent model keys.
+	existing := "BASE_URL = http://localhost:8235/v1\nMODEL = gpt-5-mini\nSUBAGENT_MAX_DEPTH = 1\n"
+	if err := os.WriteFile(path, []byte(existing), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if err := upsertConfigFileKeys(path); err != nil {
+		t.Fatalf("upsertConfigFileKeys: %v", err)
+	}
+
+	cfg, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("readConfigFile after upsert: %v", err)
+	}
+
+	// New keys must be present (with empty default values).
+	if _, ok := cfg["SUBAGENT_MODEL"]; !ok {
+		t.Fatal("expected SUBAGENT_MODEL to be present after upsert")
+	}
+	if _, ok := cfg["SUBAGENT_REASONING_EFFORT"]; !ok {
+		t.Fatal("expected SUBAGENT_REASONING_EFFORT to be present after upsert")
+	}
+	// Pre-existing values must be unchanged.
+	if cfg["BASE_URL"] != "http://localhost:8235/v1" {
+		t.Fatalf("upsert changed existing BASE_URL: %q", cfg["BASE_URL"])
+	}
+}
+
+func TestSubagentExecutionUsesConfiguredModelAndReasoning(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+
+	cfg, err := loadConfig([]string{
+		"--subagent-model", "gpt-4o",
+		"--subagent-reasoning-effort", "high",
+		"task",
+	})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	a, err := newApp(cfg)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+
+	var capturedModel, capturedReasoning string
+	a.subagents.runner = func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+		capturedModel = runtime.model
+		capturedReasoning = runtime.reasoning
+		return "ok", nil
+	}
+
+	root := a.rootRuntime()
+	session, err := a.subagents.create(context.Background(), root, createSubagentArgs{
+		Question:      "do work",
+		ExecutionMode: "sequential",
+	})
+	if err != nil {
+		t.Fatalf("create_subagent: %v", err)
+	}
+	_, err = a.subagents.run(context.Background(), root, runSubagentArgs{
+		ID:   session.ID,
+		Wait: true,
+	})
+	if err != nil {
+		t.Fatalf("run_subagent: %v", err)
+	}
+	if capturedModel != "gpt-4o" {
+		t.Fatalf("expected subagent runtime.model=gpt-4o, got %q", capturedModel)
+	}
+	if capturedReasoning != "high" {
+		t.Fatalf("expected subagent runtime.reasoning=high, got %q", capturedReasoning)
+	}
+}
+
+func TestSubagentExecutionInheritsRootModelWhenNotConfigured(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	t.Setenv("MODEL", "root-model-x")
+	defer t.Setenv("MODEL", "")
+
+	cfg, err := loadConfig([]string{"task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	a, err := newApp(cfg)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+
+	var capturedModel string
+	a.subagents.runner = func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+		capturedModel = runtime.model
+		return "ok", nil
+	}
+
+	root := a.rootRuntime()
+	session, err := a.subagents.create(context.Background(), root, createSubagentArgs{
+		Question:      "do work",
+		ExecutionMode: "sequential",
+	})
+	if err != nil {
+		t.Fatalf("create_subagent: %v", err)
+	}
+	_, err = a.subagents.run(context.Background(), root, runSubagentArgs{
+		ID:   session.ID,
+		Wait: true,
+	})
+	if err != nil {
+		t.Fatalf("run_subagent: %v", err)
+	}
+	if capturedModel != "root-model-x" {
+		t.Fatalf("expected subagent to inherit root model root-model-x, got %q", capturedModel)
+	}
+}
+
+func TestRootRuntimeCarriesModelAndReasoning(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	t.Setenv("MODEL", "my-root-model")
+	t.Setenv("REASONING_EFFORT", "low")
+	defer func() {
+		t.Setenv("MODEL", "")
+		t.Setenv("REASONING_EFFORT", "")
+	}()
+
+	cfg, err := loadConfig([]string{"task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	a, err := newApp(cfg)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	rt := a.rootRuntime()
+	if rt.model != "my-root-model" {
+		t.Fatalf("expected rootRuntime.model=my-root-model, got %q", rt.model)
+	}
+	if rt.reasoning != "low" {
+		t.Fatalf("expected rootRuntime.reasoning=low, got %q", rt.reasoning)
+	}
+}

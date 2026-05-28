@@ -441,6 +441,22 @@ func loadConfig(args []string) (config, error) {
 				return config{}, err
 			}
 			subagentCfg.MaxToolIterations = value
+		case arg == "--subagent-model":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--subagent-model requires a value")
+			}
+			i++
+			subagentCfg.Model = strings.TrimSpace(args[i])
+		case strings.HasPrefix(arg, "--subagent-model="):
+			subagentCfg.Model = strings.TrimSpace(strings.TrimPrefix(arg, "--subagent-model="))
+		case arg == "--subagent-reasoning-effort":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--subagent-reasoning-effort requires a value")
+			}
+			i++
+			subagentCfg.ReasoningEffort = strings.TrimSpace(args[i])
+		case strings.HasPrefix(arg, "--subagent-reasoning-effort="):
+			subagentCfg.ReasoningEffort = strings.TrimSpace(strings.TrimPrefix(arg, "--subagent-reasoning-effort="))
 		case arg == "--max-iterations":
 			if i+1 >= len(args) {
 				return config{}, errors.New("--max-iterations requires a value")
@@ -515,6 +531,30 @@ func loadConfig(args []string) (config, error) {
 	}
 	subagentCfg.normalize() // fills any remaining zeros with built-in defaults
 
+	// Resolve subagent model: flag > env > file > inherit root model.
+	// Empty string means "not explicitly set"; fall through to next source.
+	if subagentCfg.Model == "" {
+		subagentCfg.Model = readCfg("SUBAGENT_MODEL", fileCfg, "")
+	}
+	rootModel := readCfg("MODEL", fileCfg, defaultModel)
+	if subagentCfg.Model == "" {
+		subagentCfg.Model = rootModel
+	}
+
+	// Resolve subagent reasoning effort: flag > env > file > inherit root reasoning.
+	// "none" is converted to "" so it is omitted from API requests (same as root reasoning).
+	rawSubagentReasoning := subagentCfg.ReasoningEffort
+	if rawSubagentReasoning == "" {
+		rawSubagentReasoning = readCfg("SUBAGENT_REASONING_EFFORT", fileCfg, "")
+	}
+	if rawSubagentReasoning == "" {
+		subagentCfg.ReasoningEffort = reasoning // inherit already-resolved root reasoning
+	} else if strings.EqualFold(rawSubagentReasoning, "none") {
+		subagentCfg.ReasoningEffort = ""
+	} else {
+		subagentCfg.ReasoningEffort = rawSubagentReasoning
+	}
+
 	// Resolve max iterations: flag > env > file > default
 	if maxIter == 0 {
 		if env := readCfg("MAX_ITERATIONS", fileCfg, ""); env != "" {
@@ -529,7 +569,7 @@ func loadConfig(args []string) (config, error) {
 
 	return config{
 		baseURL:         baseURL,
-		model:           readCfg("MODEL", fileCfg, defaultModel),
+		model:           rootModel,
 		token:           readCfg("TOKEN", fileCfg, defaultToken),
 		reasoning:       reasoning,
 		systemPrompt:    readSystemPrompt(fileCfg),
@@ -641,6 +681,11 @@ SUBAGENT_TIMEOUT_SECONDS = 300
 SUBAGENT_MAX_RESULT_CHARS = 8000
 SUBAGENT_MAX_AGGREGATE_CHARS = 12000
 SUBAGENT_MAX_ITERATIONS = 20
+
+# Subagent model and reasoning effort (leave blank to inherit root MODEL and REASONING_EFFORT)
+# env vars: SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT; also settable via CLI flags
+SUBAGENT_MODEL =
+SUBAGENT_REASONING_EFFORT =
 `
 
 // ensureConfigFile creates the config file with defaults if it does not exist,
@@ -752,6 +797,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Env: BASE_URL, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")
+	fmt.Fprintln(w, "     SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT")
 	fmt.Fprintln(w, "Opt-in tools (repeatable): --allow-tool write_file --allow-tool edit_file --allow-tool append_file --allow-tool execute_program --allow-tool execute_skill")
 	fmt.Fprintln(w, "Iteration limit: --max-iterations N (default 40; env MAX_ITERATIONS; always wraps up gracefully on limit)")
 	fmt.Fprintln(w, "Subagent limits (flags, env vars, or config file):")
@@ -762,6 +808,9 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  --subagent-max-result-chars N       (default 8000;  env SUBAGENT_MAX_RESULT_CHARS)")
 	fmt.Fprintln(w, "  --subagent-max-aggregate-chars N    (default 12000; env SUBAGENT_MAX_AGGREGATE_CHARS)")
 	fmt.Fprintln(w, "  --subagent-max-iterations N         (default 20;    env SUBAGENT_MAX_ITERATIONS)")
+	fmt.Fprintln(w, "Subagent model (defaults to root MODEL if not set):")
+	fmt.Fprintln(w, "  --subagent-model MODEL              (env SUBAGENT_MODEL)")
+	fmt.Fprintln(w, "  --subagent-reasoning-effort VALUE   (env SUBAGENT_REASONING_EFFORT; set to 'none' to omit)")
 	fmt.Fprintln(w, "All tools + unrestricted paths:  --yolo")
 }
 
@@ -792,6 +841,12 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 	if runtime != nil && runtime.maxToolIterations > 0 {
 		maxIterations = runtime.maxToolIterations
 	}
+	runtimeModel := a.client.model
+	runtimeReasoning := a.client.reasoning
+	if runtime != nil && runtime.model != "" {
+		runtimeModel = runtime.model
+		runtimeReasoning = runtime.reasoning
+	}
 	lastContent := ""
 
 	for iter := 0; iter < maxIterations; iter++ {
@@ -803,7 +858,7 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 			})
 		}
 
-		resp, err := a.client.complete(ctx, messages, toolset)
+		resp, err := a.client.complete(ctx, messages, toolset, runtimeModel, runtimeReasoning)
 		if err != nil {
 			return messages, "", err
 		}
@@ -851,7 +906,7 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 		Role:    "user",
 		Content: "[SYSTEM] Maximum tool iterations reached. Based on everything you have gathered so far, provide your best final answer now. Do not request any more tools.",
 	})
-	resp, err := a.client.complete(ctx, messages, nil)
+	resp, err := a.client.complete(ctx, messages, nil, runtimeModel, runtimeReasoning)
 	if err != nil {
 		// Fall back to whatever content we collected so far.
 		if lastContent != "" {
@@ -1209,6 +1264,8 @@ func (a *app) rootRuntime() *agentRuntime {
 		role:              agentRoleCoordinator,
 		allowedTools:      cloneAllowedTools(a.cfg.allowedTools),
 		maxToolIterations: a.cfg.maxIterations,
+		model:             a.cfg.model,
+		reasoning:         a.cfg.reasoning,
 	}
 }
 
@@ -1243,12 +1300,15 @@ func isRetryableStatus(code int) bool {
 	return code == 429 || code >= 500
 }
 
-func (c *client) complete(ctx context.Context, messages []apiMessage, tools []apiTool) (*completionMessage, error) {
+func (c *client) complete(ctx context.Context, messages []apiMessage, tools []apiTool, model, reasoning string) (*completionMessage, error) {
+	if model == "" {
+		model = c.model
+	}
 	reqBody := apiRequest{
-		Model:           c.model,
+		Model:           model,
 		Messages:        messages,
 		Tools:           tools,
-		ReasoningEffort: c.reasoning,
+		ReasoningEffort: reasoning,
 	}
 	if len(tools) > 0 {
 		reqBody.ToolChoice = "auto"

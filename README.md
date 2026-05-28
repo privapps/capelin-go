@@ -102,6 +102,14 @@ Tune subagent limits (all have env var equivalents, see below):
   "coordinate workers then combine outputs"
 ```
 
+Use a different model and reasoning effort for subagents (leave unset to inherit root values):
+
+```bash
+./capelin-go \
+  --subagent-model gpt-4o --subagent-reasoning-effort high \
+  "break this task into workers and aggregate results"
+```
+
 Tune iteration cap (useful for complex research tasks):
 
 ```bash
@@ -129,6 +137,8 @@ Enable everything (all tools + unrestricted paths):
 - `SUBAGENT_MAX_RESULT_CHARS` — maximum characters returned per subagent result (default: 8000; overridden by `--subagent-max-result-chars`)
 - `SUBAGENT_MAX_AGGREGATE_CHARS` — maximum total characters across all subagent results in a single turn (default: 12000; overridden by `--subagent-max-aggregate-chars`)
 - `SUBAGENT_MAX_ITERATIONS` — maximum tool-call iterations per subagent (default: 20; overridden by `--subagent-max-iterations`)
+- `SUBAGENT_MODEL` — model ID used for subagents (default: inherits `MODEL`; overridden by `--subagent-model`)
+- `SUBAGENT_REASONING_EFFORT` — reasoning effort for subagents (default: inherits `REASONING_EFFORT`; set to `none` to omit; overridden by `--subagent-reasoning-effort`)
 
 ## Config file
 
@@ -156,6 +166,11 @@ SUBAGENT_TIMEOUT_SECONDS = 300
 SUBAGENT_MAX_RESULT_CHARS = 8000
 SUBAGENT_MAX_AGGREGATE_CHARS = 12000
 SUBAGENT_MAX_ITERATIONS = 20
+
+# Subagent model and reasoning effort (leave blank to inherit root MODEL and REASONING_EFFORT)
+# env vars: SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT; also settable via CLI flags
+SUBAGENT_MODEL =
+SUBAGENT_REASONING_EFFORT =
 ```
 
 Edit that file to set your preferred model, server URL, or other defaults without needing environment variables every time. Environment variables and CLI flags still take priority over config file values.
