@@ -16,6 +16,14 @@ import (
 	"time"
 )
 
+type sessionLogEvent struct {
+	Type      string         `json:"type"`
+	ID        string         `json:"id"`
+	Timestamp string         `json:"timestamp"`
+	ParentID  *string        `json:"parentId"`
+	Data      map[string]any `json:"data"`
+}
+
 // isolateConfigFile points CAPELIN_CONFIG_FILE to a fresh temp path so tests
 // are not affected by the developer's real ~/.local/capelin-go/config.ini.
 func isolateConfigFile(t *testing.T) {
@@ -127,6 +135,147 @@ func TestLoadConfigInteractiveFlagNoQuestion(t *testing.T) {
 	if cfg.initialQuestion != "" {
 		t.Fatalf("expected empty initialQuestion, got %q", cfg.initialQuestion)
 	}
+}
+
+func TestSessionLoggerWritesEvents(t *testing.T) {
+	dir := t.TempDir()
+
+	logger, err := newSessionLogger(dir)
+	if err != nil {
+		t.Fatalf("newSessionLogger: %v", err)
+	}
+	logger.emit("session.start", map[string]any{
+		"sessionId": logger.sessionID,
+		"startTime": logger.startTime,
+	})
+	firstUser := logger.emit("user.message", map[string]any{
+		"content": "hello",
+	})
+	if firstUser == "" {
+		t.Fatal("expected user.message event id")
+	}
+	if err := logger.close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	events := readSessionEvents(t, dir)
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+	if events[0].Type != "session.start" || events[1].Type != "user.message" || events[2].Type != "session.end" {
+		t.Fatalf("unexpected event types: %#v", []string{events[0].Type, events[1].Type, events[2].Type})
+	}
+	if events[0].ParentID != nil {
+		t.Fatal("expected first event parentId to be null")
+	}
+	if events[1].ParentID == nil || *events[1].ParentID != events[0].ID {
+		t.Fatal("expected second event parentId to chain from first event")
+	}
+	if events[2].ParentID == nil || *events[2].ParentID != events[1].ID {
+		t.Fatal("expected session.end parentId to chain from previous event")
+	}
+	if got := events[2].Data["exitReason"]; got != "complete" {
+		t.Fatalf("unexpected exitReason: %#v", got)
+	}
+}
+
+func TestNewSessionLoggerReturnsErrorForBadDir(t *testing.T) {
+	dir := t.TempDir()
+	badDir := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(badDir, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := newSessionLogger(badDir); err == nil {
+		t.Fatal("expected newSessionLogger to fail when log directory cannot be created")
+	}
+}
+
+func TestRunLogsSessionAndUserMessage(t *testing.T) {
+	isolateConfigFile(t)
+	dir := t.TempDir()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("unexpected method: %s", r.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(oldWD)
+	})
+
+	oldArgs := os.Args
+	os.Args = []string{"capelin-go", "hello"}
+	t.Cleanup(func() {
+		os.Args = oldArgs
+	})
+
+	t.Setenv("BASE_URL", server.URL)
+
+	if got := run(); got != 0 {
+		t.Fatalf("run returned exit code %d", got)
+	}
+
+	events := readSessionEvents(t, dir)
+	if len(events) < 4 {
+		t.Fatalf("expected at least 4 events, got %d", len(events))
+	}
+	if events[0].Type != "session.start" {
+		t.Fatalf("unexpected first event: %s", events[0].Type)
+	}
+	if events[1].Type != "user.message" {
+		t.Fatalf("unexpected second event: %s", events[1].Type)
+	}
+	for i := 1; i < len(events); i++ {
+		if events[i].ParentID == nil {
+			t.Fatalf("event %d missing parentId", i)
+		}
+		if *events[i].ParentID != events[i-1].ID {
+			t.Fatalf("event %d parentId does not chain from previous event", i)
+		}
+	}
+	if events[len(events)-1].Type != "session.end" {
+		t.Fatalf("unexpected last event: %s", events[len(events)-1].Type)
+	}
+}
+
+func readSessionEvents(t *testing.T, dir string) []sessionLogEvent {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, ".capelin-go", "logs", "*.jsonl"))
+	if err != nil {
+		t.Fatalf("Glob: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected 1 log file, got %d", len(matches))
+	}
+	data, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	events := make([]sessionLogEvent, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var event sessionLogEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("unmarshal event: %v", err)
+		}
+		events = append(events, event)
+	}
+	return events
 }
 
 func TestResolveWorkspacePathRejectTraversal(t *testing.T) {

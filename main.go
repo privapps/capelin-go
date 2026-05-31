@@ -143,11 +143,13 @@ type config struct {
 }
 
 type app struct {
-	cfg       config
-	client    *client
-	skills    map[string]skill
-	toolset   []apiTool
-	subagents *subagentManager
+	cfg        config
+	client     *client
+	skills     map[string]skill
+	toolset    []apiTool
+	subagents  *subagentManager
+	logger     *sessionLogger
+	exitReason string
 }
 
 type client struct {
@@ -242,8 +244,31 @@ func run() int {
 		return 1
 	}
 
+	app.exitReason = "complete"
+	if app.logger, err = newSessionLogger("."); err != nil {
+		fmt.Fprintf(os.Stderr, "[capelin-go] warning: session logging disabled: %v\n", err)
+		app.logger = nil
+	} else {
+		defer func() {
+			if app.logger == nil {
+				return
+			}
+			if err := app.logger.close(); err != nil {
+				fmt.Fprintf(os.Stderr, "[capelin-go] warning: closing session log: %v\n", err)
+			}
+		}()
+		app.logger.emit("session.start", map[string]any{
+			"sessionId": app.logger.sessionID,
+			"startTime": app.logger.startTime,
+			"cwd":       cfg.workspaceRoot,
+			"model":     cfg.model,
+			"mode":      map[bool]string{true: "interactive", false: "one-shot"}[cfg.interactive],
+		})
+	}
+
 	if cfg.interactive {
 		if err := app.runInteractive(ctx); err != nil {
+			app.exitReason = "error"
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
@@ -251,6 +276,7 @@ func run() int {
 	}
 
 	if err := app.runQuestion(ctx, cfg.initialQuestion); err != nil {
+		app.exitReason = "error"
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
@@ -819,6 +845,11 @@ func (a *app) runQuestion(ctx context.Context, question string) error {
 	messages := []apiMessage{
 		{Role: "system", Content: a.systemPromptWithSkills()},
 	}
+	if a.logger != nil {
+		a.logger.emit("user.message", map[string]any{
+			"content": question,
+		})
+	}
 	_, _, err := a.runTurnLoop(ctx, messages, question, a.rootRuntime(), a.toolset, true)
 	return err
 }
@@ -850,6 +881,12 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 	lastContent := ""
 
 	for iter := 0; iter < maxIterations; iter++ {
+		if a.logger != nil {
+			a.logger.emit("assistant.turn_start", map[string]any{
+				"turnIndex": iter,
+			})
+		}
+
 		// Warn the model when it's 3 iterations from the cap so it can wrap up gracefully.
 		if iter == maxIterations-3 && maxIterations > 3 {
 			messages = append(messages, apiMessage{
@@ -871,6 +908,13 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 		}
 
 		messages = append(messages, resp.asMessage())
+		if a.logger != nil {
+			a.logger.emit("assistant.turn_end", map[string]any{
+				"turnIndex":     iter,
+				"content":       strings.TrimSpace(resp.Content()),
+				"toolCallCount": len(resp.ToolCalls()),
+			})
+		}
 		if len(resp.ToolCalls()) == 0 {
 			if emitOutput {
 				fmt.Fprintln(os.Stdout)
@@ -881,6 +925,12 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 		for _, call := range resp.ToolCalls() {
 			if emitOutput {
 				fmt.Fprintf(os.Stderr, "[tool] %s(%s)\n", call.Function.Name, call.Function.Arguments)
+			}
+			if a.logger != nil {
+				a.logger.emit("tool.call", map[string]any{
+					"toolName":  call.Function.Name,
+					"arguments": call.Function.Arguments,
+				})
 			}
 			out, err := a.runToolForRuntime(ctx, runtime, call)
 			if err != nil {
@@ -897,11 +947,22 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 				ToolCallID: call.ID,
 				Content:    out,
 			})
+			if a.logger != nil {
+				a.logger.emit("tool.result", map[string]any{
+					"toolName": call.Function.Name,
+					"isError":  err != nil,
+				})
+			}
 		}
 	}
 
 	// Maximum iterations reached: force a final answer with no tools available.
 	fmt.Fprintf(os.Stderr, "[capelin-go] Maximum tool iterations (%d) reached; requesting final answer.\n", maxIterations)
+	if a.logger != nil {
+		a.logger.emit("assistant.turn_start", map[string]any{
+			"turnIndex": maxIterations,
+		})
+	}
 	messages = append(messages, apiMessage{
 		Role:    "user",
 		Content: "[SYSTEM] Maximum tool iterations reached. Based on everything you have gathered so far, provide your best final answer now. Do not request any more tools.",
@@ -921,6 +982,13 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 			fmt.Fprintln(os.Stdout)
 		}
 		messages = append(messages, resp.asMessage())
+		if a.logger != nil {
+			a.logger.emit("assistant.turn_end", map[string]any{
+				"turnIndex":     maxIterations,
+				"content":       content,
+				"toolCallCount": 0,
+			})
+		}
 		return messages, content, nil
 	}
 	return messages, lastContent, nil
@@ -937,6 +1005,11 @@ func (a *app) runInteractive(ctx context.Context) error {
 	if a.cfg.initialQuestion != "" {
 		fmt.Fprintf(os.Stderr, "[capelin-go] Task: %s\n\n", a.cfg.initialQuestion)
 		var err error
+		if a.logger != nil {
+			a.logger.emit("user.message", map[string]any{
+				"content": a.cfg.initialQuestion,
+			})
+		}
 		messages, _, err = a.runTurnLoop(ctx, messages, a.cfg.initialQuestion, runtime, a.toolset, true)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -993,6 +1066,11 @@ func (a *app) runInteractive(ctx context.Context) error {
 		}
 
 		preTurnLen := len(messages)
+		if a.logger != nil {
+			a.logger.emit("user.message", map[string]any{
+				"content": input,
+			})
+		}
 		messages, _, err = a.runTurnLoop(ctx, messages, input, runtime, a.toolset, true)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -1027,6 +1105,11 @@ func (a *app) runInteractiveFallback(ctx context.Context, messages []apiMessage,
 		}
 		preTurnLen := len(messages)
 		var runErr error
+		if a.logger != nil {
+			a.logger.emit("user.message", map[string]any{
+				"content": input,
+			})
+		}
 		messages, _, runErr = a.runTurnLoop(ctx, messages, input, runtime, a.toolset, true)
 		if runErr != nil {
 			if ctx.Err() != nil {
