@@ -413,7 +413,7 @@ func specCreateSubagent() apiTool {
 					},
 					"allowed_tools": map[string]any{
 						"type":        "array",
-						"description": "Optional restricted tool allowlist (must be subset of parent allowed tools)",
+						"description": "Optional restricted tool allowlist (must be subset of parent allowed tools). Use exact tool names as listed in tool specs (e.g. \"web_search\", not \"functions.web_search\").",
 						"items":       map[string]any{"type": "string"},
 					},
 					"timeout_seconds": map[string]any{
@@ -1157,12 +1157,27 @@ func runExecuteSkill(ctx context.Context, workspaceRoot string, yolo bool, skill
 	if command == "" {
 		return "", errors.New("execute_skill command is required")
 	}
-	if !slices.Contains(sk.Commands, command) {
+	// Check if the command is declared by the skill. Accept an exact match or a
+	// basename match (e.g. the LLM passes "exec-cli" for "/home/user/bin/exec-cli").
+	// On a basename match, resolve to the full declared path so the correct binary
+	// is executed even if it is not on PATH.
+	resolvedCommand := ""
+	cmdBase := filepath.Base(command)
+	for _, declared := range sk.Commands {
+		if declared == command {
+			resolvedCommand = command
+			break
+		}
+		if filepath.Base(declared) == cmdBase {
+			resolvedCommand = declared // prefer the full declared path
+		}
+	}
+	if resolvedCommand == "" {
 		return "", fmt.Errorf("execute_skill: command %q is not declared by skill %q", command, name)
 	}
 
 	return runExecuteProgram(ctx, workspaceRoot, yolo, executeProgramArgs{
-		Command:        command,
+		Command:        resolvedCommand,
 		Args:           args.Args,
 		Cwd:            args.Cwd,
 		TimeoutSeconds: args.TimeoutSeconds,

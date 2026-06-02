@@ -133,13 +133,25 @@ func extractExecutableCommands(content, runs string) []string {
 		if line == "" || strings.HasPrefix(line, "#") {
 			return
 		}
-		token := strings.Fields(line)
-		if len(token) == 0 {
+		// Expand environment variables ($HOME, $USER, etc.) so that paths like
+		// "$HOME/bin/exec-cli" become "/Users/jing/.../exec-cli" and are accepted.
+		expanded := os.ExpandEnv(line)
+		tokens := strings.Fields(expanded)
+		if len(tokens) == 0 {
 			return
 		}
-		cmd := token[0]
+		cmd := tokens[0]
+		// Skip lines that start with a flag (e.g. "--api-path") — those are CLI
+		// options, not executable names.
+		if strings.HasPrefix(cmd, "-") {
+			return
+		}
 		if isSimpleCommandToken(cmd) {
 			commands[cmd] = struct{}{}
+			// Also register the basename so the LLM can use the short form.
+			if base := filepath.Base(cmd); base != cmd && isSimpleCommandToken(base) {
+				commands[base] = struct{}{}
+			}
 		}
 	}
 

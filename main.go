@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+	"golang.org/x/term"
 )
 
 const (
@@ -149,7 +150,39 @@ type app struct {
 	toolset    []apiTool
 	subagents  *subagentManager
 	logger     *sessionLogger
+	sink       outputSink
 	exitReason string
+}
+
+// outputSink receives structured output events from runTurnLoop.
+// All methods must be safe to call from any goroutine.
+type outputSink interface {
+	WriteContent(agentID, content string)
+	WriteToolCall(agentID, toolName, args string)
+	WriteToolResult(agentID, toolName string, isError bool, detail string)
+	WriteSystem(agentID, msg string)
+}
+
+type stdioSink struct{}
+
+func (s *stdioSink) WriteContent(_ string, content string) {
+	fmt.Fprintln(os.Stdout, content)
+}
+
+func (s *stdioSink) WriteToolCall(_ string, toolName, args string) {
+	fmt.Fprintf(os.Stderr, "[tool] %s(%s)\n", toolName, args)
+}
+
+func (s *stdioSink) WriteToolResult(_ string, toolName string, isError bool, detail string) {
+	if isError {
+		fmt.Fprintf(os.Stderr, "[tool] %s error: %s\n", toolName, detail)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[tool] %s done\n", toolName)
+}
+
+func (s *stdioSink) WriteSystem(_ string, msg string) {
+	fmt.Fprintln(os.Stderr, msg)
 }
 
 type client struct {
@@ -245,26 +278,6 @@ func run() int {
 	}
 
 	app.exitReason = "complete"
-	if app.logger, err = newSessionLogger("."); err != nil {
-		fmt.Fprintf(os.Stderr, "[capelin-go] warning: session logging disabled: %v\n", err)
-		app.logger = nil
-	} else {
-		defer func() {
-			if app.logger == nil {
-				return
-			}
-			if err := app.logger.close(); err != nil {
-				fmt.Fprintf(os.Stderr, "[capelin-go] warning: closing session log: %v\n", err)
-			}
-		}()
-		app.logger.emit("session.start", map[string]any{
-			"sessionId": app.logger.sessionID,
-			"startTime": app.logger.startTime,
-			"cwd":       cfg.workspaceRoot,
-			"model":     cfg.model,
-			"mode":      map[bool]string{true: "interactive", false: "one-shot"}[cfg.interactive],
-		})
-	}
 
 	if cfg.interactive {
 		if err := app.runInteractive(ctx); err != nil {
@@ -300,6 +313,7 @@ func newApp(cfg config) (*app, error) {
 		},
 		skills:  skills,
 		toolset: buildAgentTools(cfg.allowedTools),
+		sink:    &stdioSink{},
 	}
 	subagentCfg := cfg.subagents
 	instance.subagents = newSubagentManager(subagentCfg, instance.runSubagentSession)
@@ -879,6 +893,14 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 		runtimeReasoning = runtime.reasoning
 	}
 	lastContent := ""
+	agentID := rootAgentID
+	if runtime != nil && strings.TrimSpace(runtime.sessionID) != "" {
+		agentID = runtime.sessionID
+	}
+	sink := a.sink
+	if sink == nil {
+		sink = &stdioSink{}
+	}
 
 	for iter := 0; iter < maxIterations; iter++ {
 		if a.logger != nil {
@@ -903,7 +925,7 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 		if content := strings.TrimSpace(resp.Content()); content != "" {
 			lastContent = content
 			if emitOutput {
-				fmt.Fprintln(os.Stdout, content)
+				sink.WriteContent(agentID, content)
 			}
 		}
 
@@ -917,14 +939,14 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 		}
 		if len(resp.ToolCalls()) == 0 {
 			if emitOutput {
-				fmt.Fprintln(os.Stdout)
+				sink.WriteSystem(agentID, "")
 			}
 			return messages, lastContent, nil
 		}
 
 		for _, call := range resp.ToolCalls() {
 			if emitOutput {
-				fmt.Fprintf(os.Stderr, "[tool] %s(%s)\n", call.Function.Name, call.Function.Arguments)
+				sink.WriteToolCall(agentID, call.Function.Name, call.Function.Arguments)
 			}
 			if a.logger != nil {
 				a.logger.emit("tool.call", map[string]any{
@@ -935,11 +957,11 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 			out, err := a.runToolForRuntime(ctx, runtime, call)
 			if err != nil {
 				if emitOutput {
-					fmt.Fprintf(os.Stderr, "[tool] %s error: %v\n", call.Function.Name, err)
+					sink.WriteToolResult(agentID, call.Function.Name, true, err.Error())
 				}
 				out = fmt.Sprintf("Tool error: %v", err)
 			} else if emitOutput {
-				fmt.Fprintf(os.Stderr, "[tool] %s done\n", call.Function.Name)
+				sink.WriteToolResult(agentID, call.Function.Name, false, "")
 			}
 
 			messages = append(messages, apiMessage{
@@ -978,8 +1000,8 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 	}
 	if content := strings.TrimSpace(resp.Content()); content != "" {
 		if emitOutput {
-			fmt.Fprintln(os.Stdout, content)
-			fmt.Fprintln(os.Stdout)
+			sink.WriteContent(agentID, content)
+			sink.WriteSystem(agentID, "")
 		}
 		messages = append(messages, resp.asMessage())
 		if a.logger != nil {
@@ -996,7 +1018,20 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 
 // runInteractive runs a REPL loop, maintaining conversation history across turns.
 // An optional initialQuestion is handled as the first turn before prompting stdin.
+func isatty(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	return term.IsTerminal(int(f.Fd()))
+}
+
+// runInteractive runs a REPL loop, maintaining conversation history across turns.
+// An optional initialQuestion is handled as the first turn before prompting stdin.
 func (a *app) runInteractive(ctx context.Context) error {
+	if isatty(os.Stdin) && isatty(os.Stderr) {
+		return a.runTUI(ctx)
+	}
+
 	messages := []apiMessage{
 		{Role: "system", Content: a.systemPromptWithSkills()},
 	}
@@ -1040,15 +1075,12 @@ func (a *app) runInteractive(ctx context.Context) error {
 		}
 		line, err := rl.Readline()
 		if err == readline.ErrInterrupt {
-			// Ctrl+C on a non-empty line clears it and reprompts.
-			// Ctrl+C on an empty line exits.
 			if strings.TrimSpace(line) == "" {
 				break
 			}
 			continue
 		}
 		if err == io.EOF {
-			// Ctrl+D — clean exit.
 			fmt.Fprintln(os.Stderr)
 			break
 		}
@@ -1341,8 +1373,14 @@ func (a *app) isToolEnabled(runtime *agentRuntime, name string) bool {
 }
 
 func (a *app) rootRuntime() *agentRuntime {
+	return a.namedRuntime(rootAgentID)
+}
+
+// namedRuntime creates an agentRuntime with the given sessionID. Used by TUI
+// to give each top-level agent its own conversation namespace.
+func (a *app) namedRuntime(sessionID string) *agentRuntime {
 	return &agentRuntime{
-		sessionID:         rootAgentID,
+		sessionID:         sessionID,
 		depth:             0,
 		role:              agentRoleCoordinator,
 		allowedTools:      cloneAllowedTools(a.cfg.allowedTools),
@@ -1361,7 +1399,7 @@ func (a *app) runSubagentSession(ctx context.Context, runtime *agentRuntime, ses
 	if question == "" {
 		return "", errors.New("subagent question is empty")
 	}
-	return a.runConversation(ctx, question, runtime, toolset, false)
+	return a.runConversation(ctx, question, runtime, toolset, true)
 }
 
 func marshalToolResult(value any) (string, error) {

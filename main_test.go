@@ -191,7 +191,10 @@ func TestNewSessionLoggerReturnsErrorForBadDir(t *testing.T) {
 	}
 }
 
-func TestRunLogsSessionAndUserMessage(t *testing.T) {
+// TestRunCompletesSuccessfully verifies that run() exits with code 0 for a
+// simple one-shot query. (JSONL session logging was removed as redundant with
+// sessions.json persistence.)
+func TestRunCompletesSuccessfully(t *testing.T) {
 	isolateConfigFile(t)
 	dir := t.TempDir()
 
@@ -227,26 +230,10 @@ func TestRunLogsSessionAndUserMessage(t *testing.T) {
 		t.Fatalf("run returned exit code %d", got)
 	}
 
-	events := readSessionEvents(t, dir)
-	if len(events) < 4 {
-		t.Fatalf("expected at least 4 events, got %d", len(events))
-	}
-	if events[0].Type != "session.start" {
-		t.Fatalf("unexpected first event: %s", events[0].Type)
-	}
-	if events[1].Type != "user.message" {
-		t.Fatalf("unexpected second event: %s", events[1].Type)
-	}
-	for i := 1; i < len(events); i++ {
-		if events[i].ParentID == nil {
-			t.Fatalf("event %d missing parentId", i)
-		}
-		if *events[i].ParentID != events[i-1].ID {
-			t.Fatalf("event %d parentId does not chain from previous event", i)
-		}
-	}
-	if events[len(events)-1].Type != "session.end" {
-		t.Fatalf("unexpected last event: %s", events[len(events)-1].Type)
+	// No .capelin-go/logs/ directory should be created.
+	logsDir := filepath.Join(dir, ".capelin-go", "logs")
+	if _, err := os.Stat(logsDir); !os.IsNotExist(err) {
+		t.Errorf("expected no logs directory, but it exists at %s", logsDir)
 	}
 }
 
@@ -704,6 +691,72 @@ func TestRunExecuteSkillRejectsUndeclaredCommand(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected undeclared command to be rejected")
+	}
+}
+
+// TestExtractExecutableCommandsEnvVar verifies that $HOME-prefixed commands in
+// shell code blocks are extracted correctly: both the expanded full path and the
+// basename must appear in the Commands list.
+func TestExtractExecutableCommandsEnvVar(t *testing.T) {
+	// Point $HOME at a known temp dir so the expanded path is deterministic.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	content := "---\nname: mytool\ndescription: test\n---\n\n## Usage\n```sh\n$HOME/bin/mytool do-thing\n```\n"
+	cmds := extractExecutableCommands(content, "")
+
+	fullPath := home + "/bin/mytool"
+	if !slices.Contains(cmds, fullPath) {
+		t.Errorf("expected full expanded path %q in Commands, got: %v", fullPath, cmds)
+	}
+	if !slices.Contains(cmds, "mytool") {
+		t.Errorf("expected basename %q in Commands, got: %v", "mytool", cmds)
+	}
+}
+
+// TestExtractExecutableCommandsSkipFlags verifies that CLI flags like --api-path
+// are not registered as executable commands.
+func TestExtractExecutableCommandsSkipFlags(t *testing.T) {
+	content := "---\nname: test\ndescription: d\n---\n\n```sh\n--api-path /foo\nmycli --flag value\n```\n"
+	cmds := extractExecutableCommands(content, "")
+	for _, c := range cmds {
+		if strings.HasPrefix(c, "-") {
+			t.Errorf("flag %q should not be in Commands list", c)
+		}
+	}
+	if !slices.Contains(cmds, "mycli") {
+		t.Errorf("expected mycli in Commands, got: %v", cmds)
+	}
+}
+
+// TestRunExecuteSkillBasenameMatch verifies that passing a basename (e.g. "exec-cli")
+// resolves to the full declared path (e.g. "/path/to/exec-cli") for execution.
+func TestRunExecuteSkillBasenameMatch(t *testing.T) {
+	root := t.TempDir()
+	// Create a real executable at a full path so runExecuteProgram can actually run it.
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(binDir, "mytool")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\necho ok"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	skills := map[string]skill{
+		"demo": {Name: "demo", Commands: []string{scriptPath}},
+	}
+	// LLM passes only the basename "mytool" — should resolve to scriptPath.
+	out, err := runExecuteSkill(context.Background(), root, false, skills, executeSkillArgs{
+		Name:    "demo",
+		Command: "mytool",
+		Args:    []string{},
+	})
+	if err != nil {
+		t.Fatalf("runExecuteSkill basename match: %v", err)
+	}
+	if !strings.Contains(out, "\"exit_code\": 0") || !strings.Contains(out, "ok") {
+		t.Errorf("unexpected output: %s", out)
 	}
 }
 
@@ -1695,4 +1748,43 @@ func TestRootRuntimeCarriesModelAndReasoning(t *testing.T) {
 	if rt.reasoning != "low" {
 		t.Fatalf("expected rootRuntime.reasoning=low, got %q", rt.reasoning)
 	}
+}
+
+// TestDeriveChildAllowedToolsFunctionsPrefix verifies that tool names with the
+// "functions." prefix (emitted by some models in legacy OpenAI format) are
+// normalized before validation so they don't produce a spurious error.
+func TestDeriveChildAllowedToolsFunctionsPrefix(t *testing.T) {
+parent := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+
+// "functions.web_search" should be accepted and normalized to "web_search".
+child, err := deriveChildAllowedTools(parent, []string{"functions.web_search"}, 0, 2)
+if err != nil {
+t.Fatalf("unexpected error with functions. prefix: %v", err)
+}
+if !child[toolWebSearch] {
+t.Fatalf("expected web_search to be enabled, got %v", child)
+}
+if child["functions.web_search"] {
+t.Fatalf("normalized key should not appear verbatim in child map")
+}
+
+// Unknown name even after stripping prefix should still fail.
+_, err = deriveChildAllowedTools(parent, []string{"functions.not_a_tool"}, 0, 2)
+if err == nil {
+t.Fatal("expected error for unknown tool after prefix strip")
+}
+}
+
+// TestDeriveChildAllowedToolsMixedPrefixes verifies that a mix of plain and
+// prefixed tool names in allowed_tools all normalize correctly.
+func TestDeriveChildAllowedToolsMixedPrefixes(t *testing.T) {
+parent := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+
+child, err := deriveChildAllowedTools(parent, []string{"functions.web_search", "fetch_page"}, 0, 2)
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+if !child[toolWebSearch] || !child[toolFetchPage] {
+t.Fatalf("expected both tools enabled, got %v", child)
+}
 }

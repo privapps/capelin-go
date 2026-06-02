@@ -66,10 +66,10 @@ Type `exit` or `quit` (or press Ctrl+D) to end an interactive session.
 
 | Key                    | Action                                    |
 |------------------------|-------------------------------------------|
-| ↑ / ↓                 | Navigate history                          |
-| ← / →                 | Move cursor                               |
+| ↑ / ↓                 | Navigate history *(readline fallback)* or TUI focus mode navigation |
+| ← / →                 | Move cursor *(readline fallback)* or TUI panel switch after `F12` |
 | Home / Ctrl+A          | Jump to start of line                     |
-| End / Ctrl+E           | Jump to end of line                       |
+| End / Ctrl+E           | Jump to end of line *(readline fallback only; in TUI mode `Ctrl+E` toggles copy mode)* |
 | Backspace / Delete     | Delete character                          |
 | Ctrl+W / Alt+Backspace | Delete previous word                      |
 | Ctrl+K                 | Delete to end of line                     |
@@ -79,8 +79,123 @@ Type `exit` or `quit` (or press Ctrl+D) to end an interactive session.
 | Ctrl+C *(empty line)*  | Exit session                              |
 | Ctrl+D                 | Exit session (EOF)                        |
 | Ctrl+L                 | Clear screen                              |
+| F1/F2                 | Focus agents / input panel *(TUI)*        |
+| F3                     | Hide / show agents panel *(TUI)*          |
+| F4                     | Open / close log search *(TUI)*           |
+| F12                    | Enter TUI panel-navigation focus mode     |
 
 Command history is persisted to `~/.local/capelin-go/history`.
+
+## TUI Interactive Mode
+
+When running on an interactive terminal, `-i` launches a full TUI with three panels.
+
+```
+┌────────────────┬──────────────────────────────────────────────┐
+│  Agents (2)    │  Agent 1                                     │
+│                │                                              │
+│ ▶ ⠹ Agent 1   │  [System Prompt]                             │
+│   └ ⠹ search… │  You are a helpful assistant…                │
+│   ◌ Agent 2   │                                              │
+│                │  [tool] web_search(...)       ← dim text     │
+│                │  assistant response text...                  │
+│                │                     ▼ more messages ▼        │
+├────────────────┴──────────────────────────────────────────────┤
+│  > input text here (type / for commands, %% for skill picker)  │
+├───────────────────────────────────────────────────────────────┤
+│  F1: agents | F2: input | F3: hide menu | F4: search | /quit  ~/workspace │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### Multi-agent architecture
+
+The TUI uses a **Root → Agents → Subagents** model:
+
+- **Root** is a non-agent container shown at the top of the tree. Selecting root and sending a message auto-creates a new top-level agent.
+- **Top-level Agents** each have an independent conversation history. Labels auto-generate after the first turn (e.g. `1::research deepseek costs`). Create new ones with `/new`.
+- **Subagents** are spawned by top-level agents using the `create_subagent` / `run_subagent` tools and appear as children in the tree.
+
+The **input panel** routes messages to the currently selected top-level agent. When a subagent is selected, only `/save` is available; use `/save <file>` to export its log.
+
+### Panels
+
+- **Agents panel (left, 1/5 width):** live tree of agents and subagents. Top-level agents show auto-generated names (`N::short title`) after their first turn.
+- **Log panel (right, 4/5 width):** shows the selected agent's transcript starting with the system prompt. Tool calls appear dimmed. Panel title shows the agent name; a spinner (`⠋⠙⠹…`) and **bold** text appear when the agent is busy.
+- **Input panel (bottom):** send messages to the selected top-level agent. Type `/` to see available commands. Type `%%` anywhere to open the **skill picker** (see below).
+- **Status bar (bottom row):** hotkey hints on the left; current working directory on the right.
+
+**Hotkeys**
+
+| Input | Action |
+|-------|--------|
+| `F1` | Focus agents panel (un-hides it if hidden) |
+| `F2` | Focus input panel |
+| `F3` | Hide / show agents panel |
+| `F4` | Open / close log search (type to search, `Enter`/`n`=next, `N`=prev, `Esc`=close) |
+| `F12` | Enter panel-focus mode (advanced navigation) |
+| `←` / `→` *(in focus mode)* | Switch to agents / log panel |
+| `↑` / `↓` *(in focus mode)* | Cycle focus between panels (exits focus mode) |
+| `Tab` / `Shift+Tab` *(in focus mode)* | Cycle panels while staying in focus mode |
+| `M` *(in focus mode)* | Maximize or restore the focused panel |
+| `C` *(in focus mode)* | Cancel the selected agent/subagent |
+| `Esc` | Cancel focus mode / close search; also restores a maximized panel |
+| `Ctrl+C` | Press twice within 2 s to exit (single press shows a warning) |
+| `Ctrl+E` | Toggle copy mode: releases mouse to terminal for text selection |
+| Mouse click | Switch focus to clicked panel; click tree node to switch agent |
+| `Enter` *(on tree node)* | Select agent and move keyboard focus to input panel |
+| `PgUp` / `PgDn` | Scroll log and control auto-follow |
+
+**Slash commands** (type `/` in input to show autocomplete; use `↑`/`↓` to navigate, `Enter`/`Tab` to accept)
+
+| Command | Action |
+|---------|--------|
+| `/quit` or `/exit` | Exit the TUI |
+| `/new` or `/session-new` | Create a new top-level agent and switch to it |
+| `/session-resume` | Typing `/session-resume ` opens the interactive (filterable) session picker of non-open sessions. Pressing `Enter` on bare `/session-resume` also opens it |
+| `/session-resume <uuid-prefix>` | Directly resume the session matching that UUID prefix (no popup) |
+| `/session-abandon` | Remove current top-level agent from the menu (session saved on disk, can be resumed later) |
+| `/session-destroy` | Remove current agent and permanently delete its session file from disk |
+| `/session-cancel` | Cancel the currently running agent |
+| `/session-fork [full\|last\|summary] [msg]` | Fork current agent. Typing `/session-fork ` opens the mode picker. No args → interactive mode selector. `full` (default) = copy full history; `last` = last assistant message only; `summary` = LLM-summarized. Optional `[msg]` queued as first input *(top-level only)* |
+| `/workspace` | Typing `/workspace ` opens the interactive workspace picker. Pressing `Enter` on bare `/workspace` also opens it |
+| `/workspace <name>` | Load a saved workspace by name (no popup) |
+| `/workspace-new` | Create a new empty workspace (clears all agents) |
+| `/workspace-save <name>` | Save current workspace under the given name |
+| `/reset` | Reset current agent's conversation to system-prompt only *(top-level only)* |
+| `/compact` | Summarize conversation to reduce context size *(top-level only)* |
+| `/save <filename>` | Save the current agent's log to a file (color tags stripped) |
+| `/append-to-agent [full\|last\|summary] <id> [extra text…]` | Copy context from this agent to another. Typing `/append-to-agent ` opens the mode + agent selector. No args → interactive mode + agent selector. Mode default = `last`: `last` = last assistant reply; `full` = full conversation; `summary` = LLM summary. Any text after `<id>` is appended to the message *(top-level only)* |
+| `/help` | Print available commands in the log panel |
+
+**`%%` skill picker**
+
+Type `%%` anywhere in the input field to open a skill selection popup. The list shows all skills loaded from `.agents/skills/` and `~/.agents/skills/` with their descriptions. Navigate with `↑`/`↓`, press `Enter` to select (inserts `%%<skillname>%%` in place of `%%`), or press `Esc` to cancel (removes `%%`). The `%%name%%` marker keeps subsequent keystrokes from re-opening the picker. You can have multiple skill references in one message, e.g. `please use %%jira-cli%% to create a ticket`.
+
+**Session persistence**
+
+Each top-level agent's conversation is automatically saved to `.capelin-go/sessions/<UUID>.json`
+after every turn. A short descriptive name (e.g. `1::research deepseek costs`) is generated
+by the LLM after the first turn and stored in the snapshot — it appears in both the agents panel
+and the `/session-resume` picker. The session UUID is shown at the top of the log panel when the
+agent starts or when a prior session is resumed. Type `/session-resume ` (with trailing space) from
+any agent to open the interactive (filterable) picker of non-open sessions, or use `/session-resume <uuid-prefix>`
+to resume directly without the popup. Use `/session-abandon` to remove an agent from the menu
+without deleting its session data, or `/session-destroy` to also delete the session file from disk.
+
+**Agent status legend**
+
+- `⠋⠙⠹…` busy/running = **bold** yellow (animated Braille spinner)
+- `✓` completed = green
+- `✗` failed/timed_out = red
+- `◌` idle = white/black
+- `○` pending (subagent) = gray
+- `—` cancelled = darkgray
+
+**Theme**
+
+Auto-detected from terminal background (`COLORFGBG`). Dark and light themes supported.
+
+Falls back to readline-based REPL on non-TTY environments.
 
 Enable extra tools:
 

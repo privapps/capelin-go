@@ -164,6 +164,38 @@ type subagentManager struct {
 	parallelSem    chan struct{}
 }
 
+// tuiAgentNode is a snapshot of one agent node for TUI display.
+type tuiAgentNode struct {
+	ID       string
+	Name     string
+	Question string
+	ParentID string
+	Status   subagentStatus
+	Depth    int
+}
+
+// ListAll returns a snapshot of all known subagent sessions (used by TUI agent tree panel).
+// Does NOT include the top-level agents — those are managed by tuiApp.topAgents.
+func (m *subagentManager) ListAll() []tuiAgentNode {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	nodes := make([]tuiAgentNode, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		nodes = append(nodes, tuiAgentNode{
+			ID:       s.ID,
+			Name:     s.Name,
+			Question: s.Question,
+			ParentID: s.ParentID,
+			Status:   s.Status,
+			Depth:    s.Depth,
+		})
+	}
+	slices.SortFunc(nodes, func(a, b tuiAgentNode) int {
+		return strings.Compare(a.ID, b.ID)
+	})
+	return nodes
+}
+
 func newSubagentManager(cfg subagentRuntimeConfig, runner subagentRunner) *subagentManager {
 	cfg.normalize()
 	m := &subagentManager{
@@ -452,6 +484,32 @@ func (m *subagentManager) cancel(parent *agentRuntime, args cancelSubagentArgs) 
 		m.slotCond.Broadcast()
 	}
 	return cloneSession(session), nil
+}
+
+// CancelSessionByID cancels a subagent session by ID regardless of visibility rules.
+// Used by the TUI F1+S and F1+K controls. Returns false if the session is not found
+// or is already finished.
+func (m *subagentManager) CancelSessionByID(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session, ok := m.sessions[id]
+	if !ok {
+		return false
+	}
+	switch session.Status {
+	case subagentStatusCompleted, subagentStatusFailed, subagentStatusTimedOut, subagentStatusCancelled:
+		return false
+	}
+	if session.cancel != nil {
+		session.cancel()
+	} else {
+		session.Status = subagentStatusCancelled
+		session.Error = "cancelled by user"
+		session.FinishedAt = time.Now().UTC()
+		session.closeDone()
+		m.slotCond.Broadcast()
+	}
+	return true
 }
 
 func (m *subagentManager) list(parent *agentRuntime, args listSubagentsArgs) ([]subagentEnvelope, error) {
@@ -771,7 +829,8 @@ func deriveChildAllowedTools(parentAllowed map[string]bool, requested []string, 
 		}
 	} else {
 		for _, raw := range requested {
-			name := strings.TrimSpace(raw)
+			// Normalize: strip "functions." prefix emitted by some models (legacy OpenAI format).
+			name := strings.TrimPrefix(strings.TrimSpace(raw), "functions.")
 			if name == "" {
 				continue
 			}
