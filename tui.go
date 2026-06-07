@@ -219,6 +219,16 @@ type tuiApp struct {
 	agentNames     map[string]string // ID -> display name (updated by rebuildAgentTree)
 	subagents      *subagentManager
 	hasNewMessages map[string]bool
+
+	// treeDirty signals that the agent tree needs to be rebuilt on the next
+	// ticker fire. Set when agents are created/removed or subagent state changes.
+	treeDirty    atomic.Bool
+	lastSubnodes atomic.Value // stores []tuiAgentNode for change detection
+
+	// input history for Up/Down navigation
+	inputHistory    []string
+	inputHistoryPos int    // -1 = not browsing, 0+ = offset from newest entry
+	inputDraft      string // current text saved when user starts browsing history
 }
 
 type tuiSink struct {
@@ -502,6 +512,46 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 			// Shift+Enter: insert newline via default handler
 			return event
 		}
+		// PgUp/PgDn while input is focused scrolls the log panel.
+		if event.Key() == tcell.KeyPgUp {
+			tui.setAgentAtBottom(tui.currentSelectedAgent(), false)
+			tui.updateMoreIndicator()
+			return nil
+		}
+		if event.Key() == tcell.KeyPgDn {
+			tui.setAgentAtBottom(tui.currentSelectedAgent(), true)
+			tui.updateMoreIndicator()
+			return nil
+		}
+		// Up/Down: navigate input history.
+		if event.Key() == tcell.KeyUp {
+			if len(tui.inputHistory) == 0 {
+				return nil
+			}
+			if tui.inputHistoryPos == -1 {
+				tui.inputDraft = tui.inputField.GetText()
+			}
+			if tui.inputHistoryPos < len(tui.inputHistory)-1 {
+				tui.inputHistoryPos++
+			}
+			txt := tui.inputHistory[len(tui.inputHistory)-1-tui.inputHistoryPos]
+			tui.inputField.SetText(txt, true)
+			return nil
+		}
+		if event.Key() == tcell.KeyDown {
+			if len(tui.inputHistory) == 0 || tui.inputHistoryPos == -1 {
+				return nil
+			}
+			if tui.inputHistoryPos > 0 {
+				tui.inputHistoryPos--
+				txt := tui.inputHistory[len(tui.inputHistory)-1-tui.inputHistoryPos]
+				tui.inputField.SetText(txt, true)
+			} else {
+				tui.inputHistoryPos = -1
+				tui.inputField.SetText(tui.inputDraft, true)
+			}
+			return nil
+		}
 		if event.Key() == tcell.KeyCtrlJ {
 			// Ctrl+J: insert newline via default handler
 			return event
@@ -594,6 +644,10 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 	// Enable paste detection so multi-line pastes are delivered as a single string
 	// (including newlines) via the paste handler, rather than line-by-line KeyEnter events.
 	tui.app.EnablePaste(true)
+
+	// Initialize input history.
+	tui.inputHistory = make([]string, 0, 500)
+	tui.inputHistoryPos = -1
 
 	// Set initial root/focus — do this LAST, after all widgets are configured.
 	tui.app.SetRoot(tui.normalLayout, true).SetFocus(tui.inputField)
@@ -692,6 +746,7 @@ func (t *tuiApp) run(ctx context.Context) error {
 	go func() {
 		ticker := time.NewTicker(150 * time.Millisecond)
 		defer ticker.Stop()
+		t.lastSubnodes.Store([]tuiAgentNode(nil))
 		for {
 			select {
 			case <-ctx.Done():
@@ -714,9 +769,24 @@ func (t *tuiApp) run(ctx context.Context) error {
 				if anyBusy {
 					t.spinnerFrame.Add(1)
 				}
+
+				// Check if subagent state has changed.
+				subNodesChanged := false
 				var subNodes []tuiAgentNode
 				if t.subagents != nil {
 					subNodes = t.subagents.ListAll()
+					prev, _ := t.lastSubnodes.Load().([]tuiAgentNode)
+					if !subagentNodesEqual(prev, subNodes) {
+						subNodesChanged = true
+						t.lastSubnodes.Store(subNodes)
+					}
+				}
+				treeDirty := t.treeDirty.Load()
+				if !anyBusy && !treeDirty && !subNodesChanged {
+					continue // nothing to update — skip the draw entirely
+				}
+				if treeDirty {
+					t.treeDirty.Store(false)
 				}
 				topLevel := t.snapshotTopLevelAgents()
 				t.app.QueueUpdateDraw(func() {
@@ -826,10 +896,33 @@ func (t *tuiApp) processQueueForAgent(agent *tuiAgent) {
 	})
 }
 
+// resolveSkills replaces %%skillname%% references in text with the
+// corresponding skill's full Content from the loaded skills map.
+// Unknown skills are left as-is.
+func (t *tuiApp) resolveSkills(text string) string {
+	return completedSkillRe.ReplaceAllStringFunc(text, func(match string) string {
+		name := match[2 : len(match)-2] // strip leading %% and trailing %%
+		if sk, ok := t.skills[name]; ok && sk.Content != "" {
+			return sk.Content
+		}
+		return match // leave unknown skills as-is
+	})
+}
+
 // submitInputText handles the common submission path: slash commands, agent routing,
 // queue management. Called from the event loop (SetDoneFunc) or paste handler,
 // so it can call tview methods directly.
 func (t *tuiApp) submitInputText(text string) {
+	// Save to input history (dedup against last entry).
+	if len(t.inputHistory) == 0 || t.inputHistory[len(t.inputHistory)-1] != text {
+		t.inputHistory = append(t.inputHistory, text)
+		const maxHistory = 500
+		if len(t.inputHistory) > maxHistory {
+			t.inputHistory = t.inputHistory[len(t.inputHistory)-maxHistory:]
+		}
+	}
+	t.inputHistoryPos = -1
+
 	if strings.HasPrefix(text, "/") {
 		go t.handleSlashCommand(text)
 		return
@@ -838,6 +931,8 @@ func (t *tuiApp) submitInputText(text string) {
 		t.app.Stop()
 		return
 	}
+	// Resolve %%skillname%% placeholders to actual skill content before sending.
+	text = t.resolveSkills(text)
 
 	selected := t.currentSelectedAgent()
 	agent := t.getTopLevelAgent(selected)
@@ -896,6 +991,7 @@ func (t *tuiApp) createTopLevelAgentWithMessages(messages []apiMessage, writeSys
 	}
 	t.topAgents[id] = agent
 	t.agentsMu.Unlock()
+	t.treeDirty.Store(true)
 
 	// Always show session UUID at the top of the log so the user can see it
 	// without needing a /session-id command.
@@ -1660,6 +1756,9 @@ func (t *tuiApp) appendLogEntry(agentID, text, color string, markdown bool) {
 	log.mu.Unlock()
 	t.logMu.Unlock()
 
+	f, _ := os.OpenFile("/tmp/capelin-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	fmt.Fprintf(f, "DEBUG appendLogEntry agentID=%q selected=%q atBottom=%v searchMode=%v\n", agentID, selected, atBottom, t.searchMode)
+	f.Close()
 	if selected == agentID && !t.searchMode {
 		t.app.QueueUpdateDraw(func() {
 			t.logView.SetText(t.getLogText(agentID))
@@ -1682,12 +1781,27 @@ func (t *tuiApp) selectAgent(id string) {
 	if id == "" {
 		return
 	}
+	t.logMu.Lock()
+	if id == t.selectedAgent {
+		t.logMu.Unlock()
+		return
+	}
+	t.logMu.Unlock()
+	f, _ := os.OpenFile("/tmp/capelin-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	fmt.Fprintf(f, "DEBUG selectAgent id=%q selected=%q\n", id, t.selectedAgent)
+	f.Close()
 	// Allow selecting the root container — it acts as a "create new agent" target.
 	if id == tuiRootRef {
 		t.logMu.Lock()
 		t.selectedAgent = tuiRootRef
 		t.logMu.Unlock()
-		t.logView.SetText("[gray]Select an agent from the panel, or type a message here to start a new Agent.[-]")
+		text := t.getLogText(tuiRootRef)
+		if text == "" {
+			t.logView.SetText("[gray]Select an agent from the panel, or type a message here to start a new Agent.[-]")
+		} else {
+			t.logView.SetText(text)
+			t.logView.ScrollToEnd()
+		}
 		t.updateInputLabel(nil)
 		t.updateMoreIndicator()
 		return
@@ -2175,15 +2289,14 @@ func (t *tuiApp) saveLog(agentID, filename string) {
 	t.appendLog(agentID, fmt.Sprintf("[capelin-go] log saved to %s\n", filename), t.theme.LogSystem)
 }
 
-// showSkillPicker opens a modal overlay listing available skills.
-// The user can navigate the list and press Enter to select a skill; a bare
-// %% in the current input text is replaced with %%<skillname>.
-// Pressing Esc dismisses the picker and removes the %% trigger.
+// showSkillPicker opens a modal overlay with a filter input above a skill list.
+// The user can type to filter by name or description, arrow keys to navigate,
+// Enter to select (replaces bare %% with %%<skillname>), and Esc to dismiss.
 // Must be called from the tview event loop (not via QueueUpdateDraw).
 func (t *tuiApp) showSkillPicker() {
 	t.skillPickerActive = true
 
-	// Build sorted skill list.
+	// Build sorted skill entries.
 	names := make([]string, 0, len(t.skills))
 	for name := range t.skills {
 		names = append(names, name)
@@ -2191,7 +2304,6 @@ func (t *tuiApp) showSkillPicker() {
 	sort.Strings(names)
 
 	if len(names) == 0 {
-		// No skills loaded — remove %% and inform.
 		cur := t.inputField.GetText()
 		t.inputField.SetText(strings.Replace(cur, "%%", "", 1), false)
 		t.skillPickerActive = false
@@ -2200,18 +2312,45 @@ func (t *tuiApp) showSkillPicker() {
 	}
 
 	list := tview.NewList()
-	list.ShowSecondaryText(true)
-	for _, name := range names {
-		sk := t.skills[name]
-		desc := sk.Description
-		if len([]rune(desc)) > 70 {
-			desc = string([]rune(desc)[:70]) + "…"
-		}
-		list.AddItem(name, desc, 0, nil)
+	list.SetBorder(true).SetTitle(" Select Skill (Enter to select, Esc to cancel) ")
+
+	type skillEntry struct {
+		name string
+		desc string
 	}
-	list.SetBorder(true)
-	list.SetTitle(" Select Skill  [Esc] cancel ")
-	list.SetBorderColor(t.theme.ActiveBorder)
+	var selectedIdx int
+	var filtered []skillEntry
+
+	populateList := func(filter string) {
+		list.Clear()
+		lower := strings.ToLower(filter)
+		filtered = nil
+		for _, name := range names {
+			sk := t.skills[name]
+			if lower == "" ||
+				strings.Contains(strings.ToLower(name), lower) ||
+				strings.Contains(strings.ToLower(sk.Description), lower) {
+				desc := sk.Description
+				if len([]rune(desc)) > 70 {
+					desc = string([]rune(desc)[:70]) + "…"
+				}
+				list.AddItem(name, desc, 0, nil)
+				filtered = append(filtered, skillEntry{name, desc})
+			}
+		}
+		n := len(filtered)
+		if selectedIdx >= n {
+			selectedIdx = n - 1
+		}
+		if selectedIdx < 0 && n > 0 {
+			selectedIdx = 0
+		}
+		if n > 0 {
+			list.SetCurrentItem(selectedIdx)
+		}
+	}
+
+	populateList("")
 
 	dismiss := func() {
 		cur := t.inputField.GetText()
@@ -2221,17 +2360,62 @@ func (t *tuiApp) showSkillPicker() {
 		t.setFocus(panelInput)
 	}
 
-	list.SetSelectedFunc(func(_ int, name, _ string, _ rune) {
-		cur := t.inputField.GetText()
-		t.inputField.SetText(replaceFirstBareSkillTrigger(cur, "%%"+name+"%%"), false)
-		t.app.SetRoot(t.normalLayout, true)
-		t.skillPickerActive = false
-		t.setFocus(panelInput)
-	})
-	list.SetDoneFunc(func() { dismiss() })
+	selectCurrent := func() {
+		if selectedIdx >= 0 && selectedIdx < len(filtered) {
+			entry := filtered[selectedIdx]
+			cur := t.inputField.GetText()
+			t.inputField.SetText(replaceFirstBareSkillTrigger(cur, "%%"+entry.name+"%%"), true)
+			t.app.SetRoot(t.normalLayout, true)
+			t.skillPickerActive = false
+			t.setFocus(panelInput)
+		}
+	}
 
-	// Height: list items + border rows, minimum 14 (≥10 visible), maximum 24.
-	h := len(names) + 4
+	filterInput := tview.NewInputField()
+	filterInput.SetPlaceholder("Type to filter by name or description...")
+	filterInput.SetLabel("/")
+	filterInput.SetChangedFunc(func(text string) {
+		selectedIdx = 0
+		populateList(text)
+	})
+	filterInput.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyDown:
+			if selectedIdx < len(filtered)-1 {
+				selectedIdx++
+				list.SetCurrentItem(selectedIdx)
+			}
+			return nil
+		case tcell.KeyUp:
+			if selectedIdx > 0 {
+				selectedIdx--
+				list.SetCurrentItem(selectedIdx)
+			}
+			return nil
+		case tcell.KeyEnter:
+			selectCurrent()
+			return nil
+		case tcell.KeyEscape:
+			dismiss()
+			return nil
+		}
+		return event
+	})
+
+	list.SetDoneFunc(func() { dismiss() })
+	list.SetSelectedFunc(func(index int, _ string, _ string, _ rune) {
+		if index >= 0 && index < len(filtered) {
+			entry := filtered[index]
+			cur := t.inputField.GetText()
+			t.inputField.SetText(replaceFirstBareSkillTrigger(cur, "%%"+entry.name+"%%"), true)
+			t.app.SetRoot(t.normalLayout, true)
+			t.skillPickerActive = false
+			t.setFocus(panelInput)
+		}
+	})
+
+	// Height: 1 for filter input + 2 per item + 2 border rows.
+	h := len(names)*2 + 4 + 1
 	if h < 14 {
 		h = 14
 	}
@@ -2242,11 +2426,12 @@ func (t *tuiApp) showSkillPicker() {
 		AddItem(nil, 0, 1, false).
 		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
 			AddItem(nil, 0, 1, false).
-			AddItem(list, h, 0, true).
+			AddItem(filterInput, 1, 0, true).
+			AddItem(list, h, 0, false).
 			AddItem(nil, 0, 1, false), 60, 0, true).
 		AddItem(nil, 0, 1, false)
 
-	t.app.SetRoot(overlay, true).SetFocus(list)
+	t.app.SetRoot(overlay, true).SetFocus(filterInput)
 }
 
 // showCommandPicker opens a dropdown-style list anchored below the input field,
@@ -2982,6 +3167,7 @@ func (t *tuiApp) handleSessionAbandon(agentID string) {
 	t.agentsMu.Lock()
 	delete(t.topAgents, agentID)
 	t.agentsMu.Unlock()
+	t.treeDirty.Store(true)
 
 	t.logMu.Lock()
 	delete(t.logs, agentID)
@@ -3046,6 +3232,7 @@ func (t *tuiApp) doHandleSessionDestroy(agentID string) {
 	t.agentsMu.Lock()
 	delete(t.topAgents, agentID)
 	t.agentsMu.Unlock()
+	t.treeDirty.Store(true)
 
 	t.logMu.Lock()
 	delete(t.logs, agentID)
@@ -3133,6 +3320,7 @@ func (t *tuiApp) doHandleWorkspaceNew(callerAgentID string) {
 		delete(t.hasNewMessages, id)
 		t.logMu.Unlock()
 	}
+	t.treeDirty.Store(true)
 
 	// Reset workspace file to empty.
 	if t.owner.cfg.workspaceRoot != "" {
@@ -3195,6 +3383,7 @@ func (t *tuiApp) handleWorkspaceLoad(callerAgentID, name string) {
 		delete(t.hasNewMessages, id)
 		t.logMu.Unlock()
 	}
+	t.treeDirty.Store(true)
 
 	// Load sessions from the named workspace.
 	loaded := 0
@@ -3250,6 +3439,9 @@ func (t *tuiApp) handleWorkspacePicker(callerAgentID string) {
 		return
 	}
 	if len(names) == 0 {
+		f, _ := os.OpenFile("/tmp/capelin-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		fmt.Fprintf(f, "DEBUG handleWorkspacePicker: no workspaces, callerAgentID=%q\n", callerAgentID)
+		f.Close()
 		t.appendLog(callerAgentID, "[capelin-go] /workspace: no saved workspaces found (use /workspace-save <name> to create one)\n", t.theme.LogSystem)
 		return
 	}
@@ -4350,6 +4542,20 @@ func isExactSlashMatch(text string) bool {
 		}
 	}
 	return lower == "/quit" || lower == "/exit"
+}
+
+// subagentNodesEqual compares two subagent node slices for deep equality.
+func subagentNodesEqual(a, b []tuiAgentNode) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].ID != b[i].ID || a[i].Status != b[i].Status ||
+			a[i].Name != b[i].Name || a[i].ParentID != b[i].ParentID {
+			return false
+		}
+	}
+	return true
 }
 
 func colorName(c tcell.Color) string {

@@ -413,7 +413,7 @@ func specCreateSubagent() apiTool {
 					},
 					"allowed_tools": map[string]any{
 						"type":        "array",
-						"description": "Optional restricted tool allowlist (must be subset of parent allowed tools). Use exact tool names as listed in tool specs (e.g. \"web_search\", not \"functions.web_search\").",
+						"description": `Optional tool restriction: when set, the subagent is limited to only these tools for non-opt-in tools (read-only tools like web_search, read_file). Opt-in tools (write_file, execute_program, etc.) are always inherited from the parent because they require explicit user consent. If omitted the subagent inherits all parent tools. Use exact tool names as listed in tool specs (e.g. "web_search", not "functions.web_search").`,
 						"items":       map[string]any{"type": "string"},
 					},
 					"timeout_seconds": map[string]any{

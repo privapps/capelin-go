@@ -820,16 +820,19 @@ func deriveChildAllowedTools(parentAllowed map[string]bool, requested []string, 
 	if len(parentAllowed) == 0 {
 		return nil, errors.New("parent has no allowed tools")
 	}
+	// Always start with all parent-enabled tools as the baseline.
 	child := map[string]bool{}
-	if len(requested) == 0 {
-		for name, enabled := range parentAllowed {
-			if enabled {
-				child[name] = true
-			}
+	for name, enabled := range parentAllowed {
+		if enabled {
+			child[name] = true
 		}
-	} else {
+	}
+	// If the caller provided an explicit allowlist, restrict always-enabled tools
+	// to that list.  Opt-in tools (write_file, execute_program, etc.) are always
+	// inherited because they represent explicit user consent (--yolo / --allow-tool).
+	if len(requested) > 0 {
+		// First validate every requested name.
 		for _, raw := range requested {
-			// Normalize: strip "functions." prefix emitted by some models (legacy OpenAI format).
 			name := strings.TrimPrefix(strings.TrimSpace(raw), "functions.")
 			if name == "" {
 				continue
@@ -840,7 +843,22 @@ func deriveChildAllowedTools(parentAllowed map[string]bool, requested []string, 
 			if !parentAllowed[name] {
 				return nil, fmt.Errorf("tool %q is not allowed by parent policy", name)
 			}
-			child[name] = true
+		}
+		// Remove always-enabled tools that were not explicitly requested.
+		for name := range child {
+			if _, isOptIn := optInTools[name]; isOptIn {
+				continue
+			}
+			found := false
+			for _, raw := range requested {
+				if strings.TrimPrefix(strings.TrimSpace(raw), "functions.") == name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				delete(child, name)
+			}
 		}
 	}
 	if depth >= maxDepth {

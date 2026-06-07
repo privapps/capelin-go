@@ -1405,8 +1405,8 @@ func (a *app) systemPromptWithSkills() string {
 	b.WriteString("When user asks to use a skill, execute the relevant skill command instead of only summarizing.\n")
 	b.WriteString("Prefer execute_skill for skill-driven actions.\n")
 	b.WriteString("Follow loaded skill instructions when relevant to the user task.\n")
-	b.WriteString("Write and execute tools are disabled by default unless explicitly enabled.\n")
-	b.WriteString("Subagent tools are opt-in and enforce inherited limits/policies.\n")
+	b.WriteString("Write, edit, and execute tools require explicit --allow-tool or --yolo to be enabled.\n")
+	b.WriteString("Subagents inherit all tools the parent has. Use allowed_tools on create_subagent to restrict a subagent's always-enabled tools if needed.\n")
 	return b.String()
 }
 
