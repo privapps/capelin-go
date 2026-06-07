@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -135,6 +136,8 @@ type config struct {
 	systemPrompt    string
 	showVersion     bool
 	interactive     bool
+	tui             bool
+	finalOnly       bool
 	initialQuestion string
 	workspaceRoot   string
 	allowedTools    map[string]bool
@@ -163,17 +166,25 @@ type outputSink interface {
 	WriteSystem(agentID, msg string)
 }
 
-type stdioSink struct{}
+type stdioSink struct {
+	mu sync.Mutex
+}
 
 func (s *stdioSink) WriteContent(_ string, content string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	fmt.Fprintln(os.Stdout, content)
 }
 
 func (s *stdioSink) WriteToolCall(_ string, toolName, args string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	fmt.Fprintf(os.Stderr, "[tool] %s(%s)\n", toolName, args)
 }
 
 func (s *stdioSink) WriteToolResult(_ string, toolName string, isError bool, detail string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if isError {
 		fmt.Fprintf(os.Stderr, "[tool] %s error: %s\n", toolName, detail)
 		return
@@ -182,7 +193,43 @@ func (s *stdioSink) WriteToolResult(_ string, toolName string, isError bool, det
 }
 
 func (s *stdioSink) WriteSystem(_ string, msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	fmt.Fprintln(os.Stderr, msg)
+}
+
+// finalOnlySink wraps another sink and suppresses all output except the
+// last content message. It is used for --final-only one-shot mode.
+type finalOnlySink struct {
+	wrapped     outputSink
+	mu          sync.Mutex
+	lastContent string
+}
+
+func (s *finalOnlySink) WriteContent(agentID string, content string) {
+	if agentID != rootAgentID && agentID != "" {
+		return
+	}
+	s.mu.Lock()
+	s.lastContent = content
+	s.mu.Unlock()
+}
+
+func (s *finalOnlySink) WriteToolCall(_, _, _ string) {}
+
+func (s *finalOnlySink) WriteToolResult(_, _ string, _ bool, _ string) {}
+
+func (s *finalOnlySink) WriteSystem(_, _ string) {}
+
+// FlushContent writes the last buffered content, if any, through the wrapped sink.
+func (s *finalOnlySink) FlushContent() {
+	s.mu.Lock()
+	content := s.lastContent
+	s.lastContent = ""
+	s.mu.Unlock()
+	if content != "" {
+		s.wrapped.WriteContent("", content)
+	}
 }
 
 type client struct {
@@ -263,7 +310,7 @@ func run() int {
 		fmt.Fprintf(os.Stdout, "%s %s\n", filepath.Base(os.Args[0]), version)
 		return 0
 	}
-	if !cfg.interactive && cfg.initialQuestion == "" {
+	if !cfg.interactive && !cfg.tui && cfg.initialQuestion == "" {
 		printUsage(os.Stderr)
 		return 1
 	}
@@ -279,6 +326,14 @@ func run() int {
 
 	app.exitReason = "complete"
 
+	if cfg.tui {
+		if err := app.runTUIInteractive(ctx); err != nil {
+			app.exitReason = "error"
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	}
 	if cfg.interactive {
 		if err := app.runInteractive(ctx); err != nil {
 			app.exitReason = "error"
@@ -302,6 +357,10 @@ func newApp(cfg config) (*app, error) {
 		return nil, err
 	}
 
+	var sink outputSink = &stdioSink{}
+	if cfg.finalOnly {
+		sink = &finalOnlySink{wrapped: &stdioSink{}}
+	}
 	instance := &app{
 		cfg: cfg,
 		client: &client{
@@ -313,7 +372,7 @@ func newApp(cfg config) (*app, error) {
 		},
 		skills:  skills,
 		toolset: buildAgentTools(cfg.allowedTools),
-		sink:    &stdioSink{},
+		sink:    sink,
 	}
 	subagentCfg := cfg.subagents
 	instance.subagents = newSubagentManager(subagentCfg, instance.runSubagentSession)
@@ -336,6 +395,8 @@ func loadConfig(args []string) (config, error) {
 	}
 	yolo := false
 	interactive := false
+	tui := false
+	finalOnly := false
 	maxIter := 0
 	subagentCfg := subagentRuntimeConfig{} // zero = "not set by flag"; env/file/normalize fills gaps
 
@@ -348,6 +409,10 @@ func loadConfig(args []string) (config, error) {
 			return config{showVersion: true}, nil
 		case arg == "-i" || arg == "--interactive":
 			interactive = true
+		case arg == "-tui" || arg == "--tui":
+			tui = true
+		case arg == "--final-only":
+			finalOnly = true
 		case arg == "--yolo":
 			yolo = true
 			for name := range optInTools {
@@ -607,6 +672,11 @@ func loadConfig(args []string) (config, error) {
 		maxIter = defaultMaxIterations
 	}
 
+	// --final-only only applies to one-shot mode; disable when -i or -tui is set
+	if interactive || tui {
+		finalOnly = false
+	}
+
 	return config{
 		baseURL:         baseURL,
 		model:           rootModel,
@@ -614,6 +684,8 @@ func loadConfig(args []string) (config, error) {
 		reasoning:       reasoning,
 		systemPrompt:    readSystemPrompt(fileCfg),
 		interactive:     interactive,
+		tui:             tui,
+		finalOnly:       finalOnly,
 		initialQuestion: strings.TrimSpace(strings.Join(filtered, " ")),
 		workspaceRoot:   workspaceRoot,
 		allowedTools:    allowedTools,
@@ -833,7 +905,10 @@ func readConfigFile(path string) (map[string]string, error) {
 
 func printUsage(w io.Writer) {
 	fmt.Fprintf(w, usageMessageTemplate, filepath.Base(os.Args[0]))
-	fmt.Fprintln(w, "Interactive mode: -i / --interactive  (keep session alive for follow-up turns; initial question is optional)")
+	fmt.Fprintln(w, "Modes:")
+	fmt.Fprintln(w, "  -i / --interactive         readline REPL (multi-turn; initial question is optional)")
+	fmt.Fprintln(w, "  -tui / --tui               TUI (auto-falls back to REPL on non-TTY)")
+	fmt.Fprintln(w, "  --final-only               one-shot mode: suppress intermediate tool output, show only the final answer")
 	fmt.Fprintln(w, "Env: BASE_URL, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")
@@ -855,7 +930,9 @@ func printUsage(w io.Writer) {
 }
 
 func (a *app) runQuestion(ctx context.Context, question string) error {
-	fmt.Fprintf(os.Stderr, "[capelin-go] Task: %s\n\n", question)
+	if !a.cfg.finalOnly {
+		fmt.Fprintf(os.Stderr, "[capelin-go] Task: %s\n\n", question)
+	}
 	messages := []apiMessage{
 		{Role: "system", Content: a.systemPromptWithSkills()},
 	}
@@ -865,6 +942,9 @@ func (a *app) runQuestion(ctx context.Context, question string) error {
 		})
 	}
 	_, _, err := a.runTurnLoop(ctx, messages, question, a.rootRuntime(), a.toolset, true)
+	if fs, ok := a.sink.(*finalOnlySink); ok {
+		fs.FlushContent()
+	}
 	return err
 }
 
@@ -979,7 +1059,9 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 	}
 
 	// Maximum iterations reached: force a final answer with no tools available.
-	fmt.Fprintf(os.Stderr, "[capelin-go] Maximum tool iterations (%d) reached; requesting final answer.\n", maxIterations)
+	if !a.cfg.finalOnly {
+		fmt.Fprintf(os.Stderr, "[capelin-go] Maximum tool iterations (%d) reached; requesting final answer.\n", maxIterations)
+	}
 	if a.logger != nil {
 		a.logger.emit("assistant.turn_start", map[string]any{
 			"turnIndex": maxIterations,
@@ -993,7 +1075,9 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 	if err != nil {
 		// Fall back to whatever content we collected so far.
 		if lastContent != "" {
-			fmt.Fprintf(os.Stderr, "[capelin-go] Final-answer call failed (%v); returning partial result.\n", err)
+			if !a.cfg.finalOnly {
+				fmt.Fprintf(os.Stderr, "[capelin-go] Final-answer call failed (%v); returning partial result.\n", err)
+			}
 			return messages, lastContent, nil
 		}
 		return messages, "", fmt.Errorf("exceeded maximum tool iterations (%d) and final-answer call failed: %w", maxIterations, err)
@@ -1025,13 +1109,18 @@ func isatty(f *os.File) bool {
 	return term.IsTerminal(int(f.Fd()))
 }
 
-// runInteractive runs a REPL loop, maintaining conversation history across turns.
-// An optional initialQuestion is handled as the first turn before prompting stdin.
-func (a *app) runInteractive(ctx context.Context) error {
+// runTUIInteractive runs the TUI when both stdin and stderr are terminals,
+// falling back to the readline REPL otherwise. This is the behavior of the -tui flag.
+func (a *app) runTUIInteractive(ctx context.Context) error {
 	if isatty(os.Stdin) && isatty(os.Stderr) {
 		return a.runTUI(ctx)
 	}
+	return a.runInteractive(ctx)
+}
 
+// runInteractive runs a REPL loop, maintaining conversation history across turns.
+// An optional initialQuestion is handled as the first turn before prompting stdin.
+func (a *app) runInteractive(ctx context.Context) error {
 	messages := []apiMessage{
 		{Role: "system", Content: a.systemPromptWithSkills()},
 	}
@@ -1054,6 +1143,7 @@ func (a *app) runInteractive(ctx context.Context) error {
 		}
 	}
 
+	lastEscAt := time.Time{}
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:          "> ",
 		HistoryFile:     historyFilePath(),
@@ -1061,6 +1151,19 @@ func (a *app) runInteractive(ctx context.Context) error {
 		EOFPrompt:       "exit",
 		Stdin:           os.Stdin,
 		Stdout:          os.Stderr, // prompt goes to stderr so stdout stays clean
+		FuncFilterInputRune: func(r rune) (rune, bool) {
+			if r == 27 { // Escape
+				now := time.Now()
+				if !lastEscAt.IsZero() && now.Sub(lastEscAt) < 500*time.Millisecond {
+					lastEscAt = time.Time{}
+					return 21, true // Ctrl+U — clear current line
+				}
+				lastEscAt = now
+				return 0, false // silently consume single Esc
+			}
+			lastEscAt = time.Time{}
+			return r, true
+		},
 	})
 	if err != nil {
 		// Fall back to a basic line reader if readline fails to initialise.
@@ -1069,89 +1172,218 @@ func (a *app) runInteractive(ctx context.Context) error {
 	}
 	defer rl.Close()
 
-	for {
-		if ctx.Err() != nil {
+	// Async line reader with paste-aware accumulator.
+	// Lines arriving within pasteTimeout of each other are joined and sent as one message.
+	type lineResult struct {
+		line string
+		err  error
+	}
+
+	lineCh := make(chan lineResult)
+	readerCtx, cancelReader := context.WithCancel(ctx)
+	defer cancelReader()
+
+	go func() {
+		for {
+			line, err := rl.Readline()
+			select {
+			case lineCh <- lineResult{line, err}:
+			case <-readerCtx.Done():
+				return
+			}
+			if err == io.EOF {
+				return
+			}
+		}
+	}()
+
+	var acc []string
+	flushTimer := time.NewTimer(0)
+	stopTimer := func() {
+		if !flushTimer.Stop() {
+			select {
+			case <-flushTimer.C:
+			default:
+			}
+		}
+	}
+	stopTimer()
+	const pasteTimeout = 30 * time.Millisecond
+
+	flushAcc := func() error {
+		stopTimer()
+		if len(acc) == 0 {
 			return nil
 		}
-		line, err := rl.Readline()
-		if err == readline.ErrInterrupt {
-			if strings.TrimSpace(line) == "" {
-				break
-			}
-			continue
-		}
-		if err == io.EOF {
-			fmt.Fprintln(os.Stderr)
-			break
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[capelin-go] readline error: %v\n", err)
-			break
-		}
-
-		input := strings.TrimSpace(line)
-		if input == "" {
-			continue
-		}
-		if input == "exit" || input == "quit" {
-			break
-		}
-
+		input := strings.Join(acc, "\n")
+		acc = nil
 		preTurnLen := len(messages)
 		if a.logger != nil {
 			a.logger.emit("user.message", map[string]any{
 				"content": input,
 			})
 		}
-		messages, _, err = a.runTurnLoop(ctx, messages, input, runtime, a.toolset, true)
-		if err != nil {
+		var turnErr error
+		messages, _, turnErr = a.runTurnLoop(ctx, messages, input, runtime, a.toolset, true)
+		if turnErr != nil {
 			if ctx.Err() != nil {
-				return nil
+				return ctx.Err()
 			}
-			fmt.Fprintf(os.Stderr, "[capelin-go] error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[capelin-go] error: %v\n", turnErr)
 			messages = messages[:preTurnLen]
 		}
+		return nil
 	}
-	return nil
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+
+		case result := <-lineCh:
+			if result.err == readline.ErrInterrupt {
+				if strings.TrimSpace(result.line) == "" {
+					flushAcc()
+					return nil
+				}
+				continue
+			}
+			if result.err == io.EOF {
+				fmt.Fprintln(os.Stderr)
+				flushAcc()
+				return nil
+			}
+			if result.err != nil {
+				fmt.Fprintf(os.Stderr, "[capelin-go] readline error: %v\n", result.err)
+				return nil
+			}
+
+			line := strings.TrimSpace(result.line)
+			if line == "" {
+				continue
+			}
+
+			// Immediate exit for single-line exit commands.
+			if len(acc) == 0 && (line == "exit" || line == "quit" || line == "/exit" || line == "/quit") {
+				return nil
+			}
+
+			acc = append(acc, line)
+			stopTimer()
+			flushTimer.Reset(pasteTimeout)
+
+		case <-flushTimer.C:
+			if err := flushAcc(); err != nil {
+				return nil
+			}
+		}
+	}
 }
 
 // runInteractiveFallback is a minimal line-reader used when readline cannot initialise
 // (e.g. on unsupported platforms or in restricted environments).
 func (a *app) runInteractiveFallback(ctx context.Context, messages []apiMessage, runtime *agentRuntime) error {
 	reader := bufio.NewReader(os.Stdin)
-	for {
-		if ctx.Err() != nil {
-			return nil
-		}
-		fmt.Fprint(os.Stderr, "\n> ")
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			break
-		}
-		input := strings.TrimSpace(line)
-		if input == "" {
-			continue
-		}
-		if input == "exit" || input == "quit" {
-			break
-		}
-		preTurnLen := len(messages)
-		var runErr error
-		if a.logger != nil {
-			a.logger.emit("user.message", map[string]any{
-				"content": input,
-			})
-		}
-		messages, _, runErr = a.runTurnLoop(ctx, messages, input, runtime, a.toolset, true)
-		if runErr != nil {
-			if ctx.Err() != nil {
-				return nil
+	fmt.Fprint(os.Stderr, "\n> ")
+
+	type lineResult struct {
+		line string
+		err  error
+	}
+
+	lineCh := make(chan lineResult)
+	readerCtx, cancelReader := context.WithCancel(ctx)
+	defer cancelReader()
+
+	go func() {
+		for {
+			line, err := reader.ReadString('\n')
+			select {
+			case lineCh <- lineResult{line, err}:
+			case <-readerCtx.Done():
+				return
 			}
-			fmt.Fprintf(os.Stderr, "[capelin-go] error: %v\n", runErr)
-			messages = messages[:preTurnLen]
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	var acc []string
+	flushTimer := time.NewTimer(0)
+	stopTimer := func() {
+		if !flushTimer.Stop() {
+			select {
+			case <-flushTimer.C:
+			default:
+			}
 		}
 	}
-	return nil
+	stopTimer()
+	const pasteTimeout = 30 * time.Millisecond
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+
+		case result := <-lineCh:
+			if result.err != nil {
+				fmt.Fprint(os.Stderr, "\n")
+				if len(acc) > 0 {
+					input := strings.Join(acc, "\n")
+					acc = nil
+					preTurnLen := len(messages)
+					if a.logger != nil {
+						a.logger.emit("user.message", map[string]any{"content": input})
+					}
+					var turnErr error
+					messages, _, turnErr = a.runTurnLoop(ctx, messages, input, runtime, a.toolset, true)
+					if turnErr != nil && ctx.Err() == nil {
+						fmt.Fprintf(os.Stderr, "[capelin-go] error: %v\n", turnErr)
+						messages = messages[:preTurnLen]
+					}
+				}
+				return nil
+			}
+
+			line := strings.TrimSpace(result.line)
+			if line == "" {
+				fmt.Fprint(os.Stderr, "\n> ")
+				continue
+			}
+
+			// Immediate exit for single-line exit commands.
+			if len(acc) == 0 && (line == "exit" || line == "quit" || line == "/exit" || line == "/quit") {
+				return nil
+			}
+
+			acc = append(acc, line)
+			stopTimer()
+			flushTimer.Reset(pasteTimeout)
+
+		case <-flushTimer.C:
+			if len(acc) == 0 {
+				continue
+			}
+			input := strings.Join(acc, "\n")
+			acc = nil
+			preTurnLen := len(messages)
+			if a.logger != nil {
+				a.logger.emit("user.message", map[string]any{"content": input})
+			}
+			var turnErr error
+			messages, _, turnErr = a.runTurnLoop(ctx, messages, input, runtime, a.toolset, true)
+			if turnErr != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				fmt.Fprintf(os.Stderr, "[capelin-go] error: %v\n", turnErr)
+				messages = messages[:preTurnLen]
+			}
+			fmt.Fprint(os.Stderr, "\n> ")
+		}
+	}
 }
 
 // historyFilePath returns the path for the readline history file.

@@ -242,8 +242,33 @@ func TestRenderSearchLogText(t *testing.T) {
 	if !strings.Contains(got, "ALPHA") {
 		t.Fatalf("expected original text to be preserved, got %q", got)
 	}
-	if renderSearchLogText(entries, "") != "[white]alpha beta ALPHA\n[-::-]" {
-		t.Fatal("empty query should preserve the original rendering")
+	if got := renderSearchLogText(entries, ""); !strings.Contains(got, "alpha beta ALPHA") || strings.Contains(got, "**") {
+		t.Fatalf("empty query should render plain (non-markdown) content, got %q", got)
+	}
+}
+
+func TestRenderMarkdownText(t *testing.T) {
+	styled := renderMarkdownText("## Title\n\n- one\n- two\n\n`code`\n\n```go\nfmt.Println(\"hi\")\n```\n\n| A | B |\n| --- | --- |\n| 1 | 2 |", "white", false)
+	for _, want := range []string{"Title", "one", "two", "code", "```go", "fmt.Println", "│ A │ B │", "│ 1 │ 2 │"} {
+		if !strings.Contains(styled, want) {
+			t.Fatalf("styled render missing %q: %q", want, styled)
+		}
+	}
+	if !strings.Contains(styled, "[white::b]Title[-:-:-][white]") {
+		t.Fatalf("expected bold heading markup, got %q", styled)
+	}
+	if strings.Contains(styled, "[white::r]") {
+		t.Fatalf("code rendering should not invert colors, got %q", styled)
+	}
+
+	plain := renderMarkdownText("## Title\n\n- one\n- two\n\n`code`\n\n```go\nfmt.Println(\"hi\")\n```\n\n| A | B |\n| --- | --- |\n| 1 | 2 |", "", true)
+	for _, want := range []string{"Title", "one", "two", "code", "fmt.Println", "A", "B", "1", "2"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("plain render missing %q: %q", want, plain)
+		}
+	}
+	if strings.Contains(plain, "**") || strings.Contains(plain, "`") {
+		t.Fatalf("plain render should strip markdown syntax, got %q", plain)
 	}
 }
 
@@ -611,11 +636,11 @@ func TestSkillPickerNilSkillsNoOp(t *testing.T) {
 	tui := newTuiApp(a, newDarkTheme())
 	tui.skills = map[string]skill{} // empty — no skills available
 
-	tui.inputField.SetText("hello %% world")
+	tui.inputField.SetText("hello %% world", false)
 	// Simulate what showSkillPicker does in the no-skills branch.
 	if len(tui.skills) == 0 {
 		cur := tui.inputField.GetText()
-		tui.inputField.SetText(strings.Replace(cur, "%%", "", 1))
+		tui.inputField.SetText(strings.Replace(cur, "%%", "", 1), false)
 	}
 	got := tui.inputField.GetText()
 	if strings.Contains(got, "%%") {
@@ -775,6 +800,7 @@ func TestListWorkspacesExcludesLast(t *testing.T) {
 		t.Errorf("unexpected names: %v", names)
 	}
 }
+
 // mode is optional (default "last"), extra text is captured after the id.
 func TestAppendToAgentParsing(t *testing.T) {
 	cases := []struct {

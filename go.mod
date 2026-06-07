@@ -6,6 +6,7 @@ require (
 	github.com/chzyer/readline v1.5.1
 	github.com/gdamore/tcell/v2 v2.13.10
 	github.com/rivo/tview v0.42.0
+	github.com/yuin/goldmark v1.4.13
 	golang.org/x/net v0.50.0
 	golang.org/x/term v0.43.0
 	gopkg.in/yaml.v3 v3.0.1

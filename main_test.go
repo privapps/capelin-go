@@ -137,6 +137,51 @@ func TestLoadConfigInteractiveFlagNoQuestion(t *testing.T) {
 	}
 }
 
+func TestLoadConfigTUIFlag(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	cfg, err := loadConfig([]string{"-tui", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig returned error for -tui flag: %v", err)
+	}
+	if !cfg.tui {
+		t.Fatal("expected cfg.tui to be true with -tui flag")
+	}
+	if cfg.interactive {
+		t.Fatal("expected cfg.interactive to be false with -tui flag")
+	}
+	if cfg.initialQuestion != "task" {
+		t.Fatalf("expected initialQuestion to be \"task\", got %q", cfg.initialQuestion)
+	}
+}
+
+func TestLoadConfigTUILongFlag(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	cfg, err := loadConfig([]string{"--tui", "hello world"})
+	if err != nil {
+		t.Fatalf("loadConfig returned error for --tui flag: %v", err)
+	}
+	if !cfg.tui {
+		t.Fatal("expected cfg.tui to be true with --tui flag")
+	}
+}
+
+func TestLoadConfigTUIFlagNoQuestion(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	cfg, err := loadConfig([]string{"-tui"})
+	if err != nil {
+		t.Fatalf("loadConfig returned error for -tui with no question: %v", err)
+	}
+	if !cfg.tui {
+		t.Fatal("expected cfg.tui to be true")
+	}
+	if cfg.initialQuestion != "" {
+		t.Fatalf("expected empty initialQuestion, got %q", cfg.initialQuestion)
+	}
+}
+
 func TestSessionLoggerWritesEvents(t *testing.T) {
 	dir := t.TempDir()
 

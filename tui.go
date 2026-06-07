@@ -16,10 +16,23 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/extension"
+	extast "github.com/yuin/goldmark/extension/ast"
+	"github.com/yuin/goldmark/text"
+	"golang.org/x/net/html"
 )
 
 // spinnerFrames are cycled per-frame while a top-level agent is busy.
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+var markdownParser = goldmark.New(
+	goldmark.WithExtensions(extension.GFM),
+)
+
+// commandPickerHeight is the fixed height of the command autocomplete dropdown.
+const commandPickerHeight = 12
 
 type agentLog struct {
 	mu       sync.Mutex
@@ -29,8 +42,9 @@ type agentLog struct {
 }
 
 type logEntry struct {
-	color string
-	text  string
+	color    string
+	text     string
+	markdown bool // true only for assistant content; renders markdown markup
 }
 
 // tuiAgent holds all per-agent state for a top-level TUI agent.
@@ -160,10 +174,11 @@ type tuiApp struct {
 	topFlex      *tview.Flex // top row (agents + log); stored for hide/show
 	agentTree    *tview.TreeView
 	logView      *tview.TextView
-	inputField   *tview.InputField
+	inputField   *tview.TextArea
 	searchField  *tview.InputField // search input (shown in place of inputField during search)
 	searchBar    *tview.Flex       // flex row containing search label + searchField
 	statusBar    *tview.TextView
+	statusModel  *tview.TextView // current LLM model name (right-aligned, beside CWD)
 	statusCWD    *tview.TextView // right-aligned current working directory
 	focusMode    bool
 	menuHidden   bool // true when agents panel is hidden
@@ -177,11 +192,17 @@ type tuiApp struct {
 	searchCurrentMatch int
 
 	// Skills loaded at startup, used for the %% inline skill picker.
-	skills            map[string]skill
-	skillPickerActive bool // true while the skill picker overlay is visible
+	skills              map[string]skill
+	skillPickerActive   bool // true while the skill picker overlay is visible
+	commandPickerActive bool // true while the slash-command picker dropdown is visible
+	commandList         *tview.List
+	commandDropdown     *tview.Flex
 
 	// lastCtrlCAt is used to require two Ctrl+C presses within 2 s to exit.
 	lastCtrlCAt time.Time
+
+	// lastEscAt is used for double-Esc to clear the input field.
+	lastEscAt time.Time
 
 	// spinnerFrame is incremented every 150 ms while any agent is busy,
 	// driving the Braille spinner icon in the agents panel.
@@ -205,7 +226,7 @@ type tuiSink struct {
 }
 
 func (s *tuiSink) WriteContent(agentID, content string) {
-	s.tui.appendLog(agentID, content+"\n", s.tui.theme.LogContent)
+	s.tui.appendMarkdownLog(agentID, content+"\n", s.tui.theme.LogContent)
 }
 
 func (s *tuiSink) WriteToolCall(agentID, toolName, args string) {
@@ -264,12 +285,56 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 	tui.logView.SetBackgroundColor(theme.LogBg)
 
 	// --- Input panel (full width, bottom) ---
-	tui.inputField = tview.NewInputField()
+	tui.inputField = tview.NewTextArea()
 	tui.inputField.SetLabel("> ")
-	tui.inputField.SetFieldBackgroundColor(theme.InputBg)
+	tui.inputField.SetBackgroundColor(theme.InputBg)
 	tui.inputField.SetBorder(true)
 	tui.inputField.SetTitle(" Input -> Agent 1 ")
 	tui.inputField.SetBorderColor(theme.ActiveBorder) // starts focused
+
+	// --- Command autocomplete list (hidden until auto-triggered by /<partial>) ---
+	tui.commandList = tview.NewList()
+	tui.commandList.ShowSecondaryText(true)
+	tui.commandList.SetBorder(true)
+	tui.commandList.SetTitle(" Commands  [Esc] cancel ")
+	tui.commandList.SetBorderColor(theme.ActiveBorder)
+	tui.commandList.SetSelectedFunc(func(_ int, name, _ string, _ rune) {
+		tui.inputField.SetText(name, true)
+		tui.dismissCommandPicker()
+	})
+	tui.commandList.SetDoneFunc(func() { tui.dismissCommandPicker() })
+	tui.commandList.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyUp, tcell.KeyDown:
+			return event
+		case tcell.KeyEnter, tcell.KeyTab:
+			if tui.commandList.GetItemCount() > 0 {
+				name, _ := tui.commandList.GetItemText(tui.commandList.GetCurrentItem())
+				tui.inputField.SetText(name, true)
+				tui.dismissCommandPicker()
+			}
+			return nil
+		case tcell.KeyEscape:
+			tui.dismissCommandPicker()
+			return nil
+		case tcell.KeyBackspace, tcell.KeyBackspace2:
+			cur := tui.inputField.GetText()
+			if len(cur) > 0 {
+				cur = string([]rune(cur[:len(cur)-1]))
+				tui.inputField.SetText(cur, true)
+			}
+			tui.updateCommandPicker(tui.inputField.GetText())
+			return nil
+		default:
+			if r := event.Rune(); r != 0 {
+				cur := tui.inputField.GetText()
+				tui.inputField.SetText(cur+string(r), true)
+				tui.updateCommandPicker(tui.inputField.GetText())
+				return nil
+			}
+			return event
+		}
+	})
 
 	// --- Status bar (1 row, no border) ---
 	tui.statusBar = tview.NewTextView()
@@ -294,6 +359,14 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 	}
 	cwdDisplay := cwd + " "
 	tui.statusCWD.SetText(cwdDisplay)
+
+	// --- Model display (right side of status bar row, beside CWD) ---
+	tui.statusModel = tview.NewTextView()
+	tui.statusModel.SetDynamicColors(true)
+	tui.statusModel.SetBackgroundColor(theme.StatusBarBg)
+	tui.statusModel.SetTextAlign(tview.AlignRight)
+	modelDisplay := " " + a.cfg.model + " "
+	tui.statusModel.SetText(modelDisplay)
 
 	// --- Wire agent tree callbacks ---
 	tui.agentTree.SetSelectedFunc(func(node *tview.TreeNode) {
@@ -367,43 +440,28 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 		return event
 	})
 
-	// --- Slash command autocomplete ---
-	tui.inputField.SetAutocompleteFunc(func(currentText string) []string {
-		if !strings.HasPrefix(currentText, "/") {
-			return nil
-		}
-		entries := []string{}
-		for _, cmd := range slashCommands {
-			if cmd.topLevelOnly && !tui.isTopLevelAgent(tui.currentSelectedAgent()) {
-				continue
-			}
-			label := cmd.name + " — " + cmd.description
-			if strings.HasPrefix(label, currentText) || strings.HasPrefix(cmd.name, currentText) {
-				entries = append(entries, label)
-			}
-		}
-		return entries
-	})
-	tui.inputField.SetAutocompletedFunc(func(text string, index int, source int) bool {
-		// When the user is just navigating (arrow keys), don't accept — let them keep browsing.
-		if source == tview.AutocompletedNavigate {
-			return false
-		}
-		// Strip the description suffix so only the command is placed in the input.
-		if idx := strings.Index(text, " — "); idx != -1 {
-			text = text[:idx]
-		}
-		// For commands that need arguments, keep trailing space for easy typing.
-		if text == "/save" || text == "/session-resume" || text == "/workspace" || text == "/workspace-save" {
-			text = text + " "
-		}
-		tui.inputField.SetText(text)
-		return true // close drop-down
-	})
-
 	// --- %% trigger: show skill picker ---
-	// When the user types %% anywhere in the input, pop up the skill selector.
-	tui.inputField.SetChangedFunc(func(text string) {
+	tui.inputField.SetChangedFunc(func() {
+		text := tui.inputField.GetText()
+
+		// Slash-command autocomplete: show dropdown when typing /<partial> (no space).
+		// Only show if the text isn't already an exact command match (user already typed it fully).
+		if strings.HasPrefix(text, "/") && !strings.Contains(text, " ") && len(text) > 1 {
+			if !isExactSlashMatch(text) {
+				if tui.commandPickerActive {
+					tui.updateCommandPicker(text)
+				} else {
+					tui.showCommandPicker(text)
+				}
+				return
+			}
+		}
+		// Dismiss if picker is active but conditions no longer met
+		// (e.g. user deleted back to just "/" or added a space).
+		if tui.commandPickerActive {
+			tui.dismissCommandPicker()
+		}
+
 		if hasBareSkillTrigger(text) && !tui.skillPickerActive {
 			tui.showSkillPicker()
 			return
@@ -416,14 +474,12 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 			case "/workspace":
 				go tui.handleWorkspacePicker(tui.currentSelectedAgent())
 			case "/session-fork":
-				// Keep the command in the input so the user can continue typing args.
-				tui.inputField.SetText(strings.TrimSpace(cmd))
+				tui.inputField.SetText(strings.TrimSpace(cmd), false)
 				if agent := tui.getTopLevelAgent(tui.currentSelectedAgent()); agent != nil {
 					tui.showSessionForkCascade(agent)
 				}
 			case "/append-to-agent":
-				// Keep the command in the input so the user can continue typing args.
-				tui.inputField.SetText(strings.TrimSpace(cmd))
+				tui.inputField.SetText(strings.TrimSpace(cmd), false)
 				if agent := tui.getTopLevelAgent(tui.currentSelectedAgent()); agent != nil {
 					tui.showAppendToAgentCascade(agent)
 				}
@@ -431,67 +487,46 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 		}
 	})
 
-	// --- Input submission ---
-	tui.inputField.SetDoneFunc(func(key tcell.Key) {
-		if key != tcell.KeyEnter {
-			return
-		}
-		text := strings.TrimSpace(tui.inputField.GetText())
-		if text == "" {
-			return
-		}
-		// Handle slash commands first — must use goroutine since appendLog calls QueueUpdateDraw.
-		if strings.HasPrefix(text, "/") {
-			tui.inputField.SetText("")
-			go tui.handleSlashCommand(text) // goroutine: appendLog inside calls QueueUpdateDraw
-			return
-		}
-		// Legacy bare keywords — also treat as exit.
-		if text == "exit" || text == "quit" {
-			tui.app.Stop()
-			return
-		}
-		tui.inputField.SetText("")
-
-		selected := tui.currentSelectedAgent()
-		agent := tui.getTopLevelAgent(selected)
-		if agent == nil {
-			// Root container — auto-create a new top-level agent and send to it.
-			if selected == tuiRootRef {
-				newAgent := tui.createTopLevelAgent(tui.sysPrompt)
-				tui.selectAgent(newAgent.id)
-				agent = newAgent
-			} else {
-				// Subagent — read-only.
-				go tui.appendLog(selected, "[capelin-go] Cannot send messages to a subagent directly. Use /save to save logs.\n", tui.theme.LogError)
-				return
-			}
-		}
-
-		// Route to the selected top-level agent. SetDoneFunc is called by the event loop
-		// so we call tview methods directly (no QueueUpdateDraw).
-		agent.queueMu.Lock()
-		if !agent.busy {
-			agent.busy = true
-			agent.queueMu.Unlock()
-			tui.inputField.SetLabel("> [busy] ")
-			go tui.submitInputForAgent(agent, text)
-		} else {
-			agent.inputQueue = append(agent.inputQueue, text)
-			n := len(agent.inputQueue)
-			agent.queueMu.Unlock()
-			tui.inputField.SetLabel(fmt.Sprintf("> [%d queued] ", n))
-		}
-	})
-
-	// --- Input field keyboard: Esc unmaximizes when input panel is maximized ---
+	// --- Input field keyboard: Enter submits; Esc unmaximizes; double-Esc clears ---
 	tui.inputField.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEscape && tui.maximized == panelInput {
-			tui.maximized = panelNone
-			tui.applyLayout()
-			tui.updateStatusBar()
+		if event.Key() == tcell.KeyEnter && event.Modifiers() == tcell.ModNone {
+			// Submit
+			text := strings.TrimSpace(tui.inputField.GetText())
+			tui.inputField.SetText("", false)
+			if text != "" {
+				tui.submitInputText(text)
+			}
 			return nil
 		}
+		if event.Key() == tcell.KeyEnter && event.Modifiers() == tcell.ModShift {
+			// Shift+Enter: insert newline via default handler
+			return event
+		}
+		if event.Key() == tcell.KeyCtrlJ {
+			// Ctrl+J: insert newline via default handler
+			return event
+		}
+		if event.Key() == tcell.KeyEscape {
+			if tui.commandPickerActive {
+				tui.dismissCommandPicker()
+				return nil
+			}
+			if tui.maximized == panelInput {
+				tui.maximized = panelNone
+				tui.applyLayout()
+				tui.updateStatusBar()
+				return nil
+			}
+			now := time.Now()
+			if !tui.lastEscAt.IsZero() && now.Sub(tui.lastEscAt) < 500*time.Millisecond {
+				tui.inputField.SetText("", false)
+				tui.lastEscAt = time.Time{}
+				return nil
+			}
+			tui.lastEscAt = now
+			return event
+		}
+		tui.lastEscAt = time.Time{}
 		return event
 	})
 
@@ -507,9 +542,11 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 		AddItem(tui.logView, 0, 4, false)
 	tui.topFlex = topFlex
 	cwdWidth := len([]rune(cwd)) + 2 // +1 for trailing space, +1 margin
+	modelWidth := len([]rune(a.cfg.model)) + 2
 	statusFlex := tview.NewFlex().
 		SetDirection(tview.FlexColumn).
 		AddItem(tui.statusBar, 0, 1, false).
+		AddItem(tui.statusModel, modelWidth, 0, false).
 		AddItem(tui.statusCWD, cwdWidth, 0, false)
 	tui.normalLayout = tview.NewFlex().
 		SetDirection(tview.FlexRow).
@@ -553,6 +590,10 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 		}
 		return event
 	})
+
+	// Enable paste detection so multi-line pastes are delivered as a single string
+	// (including newlines) via the paste handler, rather than line-by-line KeyEnter events.
+	tui.app.EnablePaste(true)
 
 	// Set initial root/focus — do this LAST, after all widgets are configured.
 	tui.app.SetRoot(tui.normalLayout, true).SetFocus(tui.inputField)
@@ -785,6 +826,46 @@ func (t *tuiApp) processQueueForAgent(agent *tuiAgent) {
 	})
 }
 
+// submitInputText handles the common submission path: slash commands, agent routing,
+// queue management. Called from the event loop (SetDoneFunc) or paste handler,
+// so it can call tview methods directly.
+func (t *tuiApp) submitInputText(text string) {
+	if strings.HasPrefix(text, "/") {
+		go t.handleSlashCommand(text)
+		return
+	}
+	if text == "exit" || text == "quit" {
+		t.app.Stop()
+		return
+	}
+
+	selected := t.currentSelectedAgent()
+	agent := t.getTopLevelAgent(selected)
+	if agent == nil {
+		if selected == tuiRootRef {
+			newAgent := t.createTopLevelAgent(t.sysPrompt)
+			t.selectAgent(newAgent.id)
+			agent = newAgent
+		} else {
+			go t.appendLog(selected, "[capelin-go] Cannot send messages to a subagent directly. Use /save to save logs.\n", t.theme.LogError)
+			return
+		}
+	}
+
+	agent.queueMu.Lock()
+	if !agent.busy {
+		agent.busy = true
+		agent.queueMu.Unlock()
+		t.inputField.SetLabel("> [busy] ")
+		go t.submitInputForAgent(agent, text)
+	} else {
+		agent.inputQueue = append(agent.inputQueue, text)
+		n := len(agent.inputQueue)
+		agent.queueMu.Unlock()
+		t.inputField.SetLabel(fmt.Sprintf("> [%d queued] ", n))
+	}
+}
+
 // createTopLevelAgent creates a new top-level agent with the given system prompt,
 // initializes its conversation, pre-populates its log, and selects it.
 // Safe to call before or after app.Run() (uses writeLogBuf, not appendLog).
@@ -875,7 +956,7 @@ func (t *tuiApp) replayMessagesToLogBuf(agentID string, msgs []apiMessage) {
 			t.writeLogBuf(agentID, "▶ "+m.Content+"\n", t.theme.LogUserInput)
 		case "assistant":
 			if strings.TrimSpace(m.Content) != "" {
-				t.writeLogBuf(agentID, m.Content+"\n", t.theme.LogContent)
+				t.writeMarkdownLogBuf(agentID, m.Content+"\n", t.theme.LogContent)
 			}
 			for _, tc := range m.ToolCalls {
 				t.writeLogBuf(agentID,
@@ -989,7 +1070,7 @@ func (t *tuiApp) handleGlobalKeys(event *tcell.EventKey) *tcell.EventKey {
 		return nil
 	}
 
-	// F1: focus agents panel (un-hide menu if hidden, unmaximize if maximized).
+	// F1: cycle panels (agents -> log -> input -> ...).
 	if event.Key() == tcell.KeyF1 {
 		if t.maximized != panelNone {
 			t.maximized = panelNone
@@ -999,7 +1080,7 @@ func (t *tuiApp) handleGlobalKeys(event *tcell.EventKey) *tcell.EventKey {
 			t.toggleMenuPanel()
 		}
 		t.focusMode = false
-		t.setFocus(panelAgents)
+		t.cycleFocus(1)
 		t.updateStatusBar()
 		return nil
 	}
@@ -1255,7 +1336,11 @@ func renderSearchLogText(entries []logEntry, query string) string {
 			out.WriteString("[")
 			out.WriteString(entry.color)
 			out.WriteString("]")
-			out.WriteString(tview.Escape(entry.text))
+			if entry.markdown {
+				out.WriteString(renderMarkdownText(entry.text, entry.color, false))
+			} else {
+				out.WriteString(tview.Escape(entry.text))
+			}
 			out.WriteString("[-::-]")
 		}
 		return out.String()
@@ -1270,14 +1355,24 @@ func renderSearchLogText(entries []logEntry, query string) string {
 
 func renderHighlightedLogEntry(entry logEntry, query string) string {
 	if query == "" {
-		return "[" + entry.color + "]" + tview.Escape(entry.text) + "[-::-]"
+		rendered := tview.Escape(entry.text)
+		if entry.markdown {
+			rendered = renderMarkdownText(entry.text, entry.color, false)
+		}
+		return "[" + entry.color + "]" + rendered + "[-::-]"
 	}
 
+	var plainText string
+	if entry.markdown {
+		plainText = renderMarkdownText(entry.text, "", true)
+	} else {
+		plainText = entry.text
+	}
 	// Convert to runes and fold the query once. unicode.ToLower maps each rune
 	// to exactly one rune (unlike strings.ToLower which can expand byte length
 	// for certain Unicode codepoints), so rune offsets are safe to use as slice
 	// indices into the original text.
-	textRunes := []rune(entry.text)
+	textRunes := []rune(plainText)
 	queryRunes := []rune(query)
 	if len(queryRunes) == 0 {
 		return "[" + entry.color + "]" + tview.Escape(entry.text) + "[-::-]"
@@ -1352,7 +1447,7 @@ func (t *tuiApp) updateSearchStatusBar(query string) {
 }
 
 func (t *tuiApp) updateStatusBar() {
-	text := " F1: agents | F2: input | F3: hide menu | F4: search | F12: focus mode | Ctrl+E: copy mode | /quit to exit"
+	text := " F1: switch panels | F2: input | F3: hide menu | F4: search | F12: focus mode | Ctrl+E: copy mode | /quit to exit"
 	if t.menuHidden {
 		text = " [menu hidden] F3: show menu | F2: input | F4: search | F12: focus mode | Ctrl+E: copy mode | /quit to exit"
 	}
@@ -1460,7 +1555,11 @@ func (t *tuiApp) getLogPlainText(agentID string) string {
 	defer l.mu.Unlock()
 	var out strings.Builder
 	for _, entry := range l.entries {
-		out.WriteString(entry.text)
+		if entry.markdown {
+			out.WriteString(renderMarkdownText(entry.text, "", true))
+		} else {
+			out.WriteString(entry.text)
+		}
 	}
 	return out.String()
 }
@@ -1468,6 +1567,15 @@ func (t *tuiApp) getLogPlainText(agentID string) string {
 // writeLogBuf writes directly to the agent's log buffer without triggering a
 // screen update. Safe to call before app.Run() has started.
 func (t *tuiApp) writeLogBuf(agentID, text, color string) {
+	t.writeLogBufEntry(agentID, text, color, false)
+}
+
+// writeMarkdownLogBuf is like writeLogBuf but renders the text as markdown.
+func (t *tuiApp) writeMarkdownLogBuf(agentID, text, color string) {
+	t.writeLogBufEntry(agentID, text, color, true)
+}
+
+func (t *tuiApp) writeLogBufEntry(agentID, text, color string, markdown bool) {
 	if agentID == "" {
 		agentID = rootAgentID
 	}
@@ -1476,8 +1584,14 @@ func (t *tuiApp) writeLogBuf(agentID, text, color string) {
 	l := t.getOrCreateLog(agentID)
 	bg := colorName(t.theme.LogBg)
 	l.mu.Lock()
-	l.entries = append(l.entries, logEntry{color: color, text: text})
-	l.buf.WriteString("[" + withBg(color, bg) + "]" + tview.Escape(text) + "[-:" + bg + ":-]")
+	l.entries = append(l.entries, logEntry{color: color, text: text, markdown: markdown})
+	var rendered string
+	if markdown {
+		rendered = renderMarkdownText(text, color, false)
+	} else {
+		rendered = tview.Escape(text)
+	}
+	l.buf.WriteString("[" + withBg(color, bg) + "]" + rendered + "[-:" + bg + ":-]")
 	l.mu.Unlock()
 }
 
@@ -1509,15 +1623,30 @@ func (t *tuiApp) setAgentAtBottom(agentID string, atBottom bool) {
 }
 
 func (t *tuiApp) appendLog(agentID, text, color string) {
+	t.appendLogEntry(agentID, text, color, false)
+}
+
+// appendMarkdownLog is like appendLog but renders the text as markdown.
+func (t *tuiApp) appendMarkdownLog(agentID, text, color string) {
+	t.appendLogEntry(agentID, text, color, true)
+}
+
+func (t *tuiApp) appendLogEntry(agentID, text, color string, markdown bool) {
 	if agentID == "" {
 		agentID = rootAgentID
 	}
 	t.logMu.Lock()
 	log := t.getOrCreateLog(agentID)
 	log.mu.Lock()
-	log.entries = append(log.entries, logEntry{color: color, text: text})
+	log.entries = append(log.entries, logEntry{color: color, text: text, markdown: markdown})
 	bg := colorName(t.theme.LogBg)
-	log.buf.WriteString("[" + withBg(color, bg) + "]" + tview.Escape(text) + "[-:" + bg + ":-]")
+	var rendered string
+	if markdown {
+		rendered = renderMarkdownText(text, color, false)
+	} else {
+		rendered = tview.Escape(text)
+	}
+	log.buf.WriteString("[" + withBg(color, bg) + "]" + rendered + "[-:" + bg + ":-]")
 	atBottom := log.atBottom
 	selected := t.selectedAgent
 	if selected == "" {
@@ -1978,14 +2107,21 @@ func (t *tuiApp) handleSlashCommand(text string) {
 	case "/help":
 		var sb strings.Builder
 		sb.WriteString("[yellow]Available commands:[-]\n")
+		maxLen := 0
 		for _, c := range slashCommands {
-			sb.WriteString(fmt.Sprintf("  [cyan]%-8s[-]  %s", c.name, c.description))
+			if l := len(c.name); l > maxLen {
+				maxLen = l
+			}
+		}
+		fmtStr := fmt.Sprintf("  [cyan]%%-%ds[-]  %%s", maxLen+1)
+		for _, c := range slashCommands {
+			sb.WriteString(fmt.Sprintf(fmtStr, c.name, c.description))
 			if c.topLevelOnly {
 				sb.WriteString(" [gray](top-level agent only)[-]")
 			}
 			sb.WriteString("\n")
 		}
-		t.appendLog(agentID, sb.String(), t.theme.LogSystem)
+		t.appendRawLog(agentID, sb.String(), t.theme.LogSystem)
 
 	default:
 		t.appendLog(agentID, fmt.Sprintf("[capelin-go] Unknown command: %s (type /help for list)\n", cmd), t.theme.LogError)
@@ -1993,6 +2129,41 @@ func (t *tuiApp) handleSlashCommand(text string) {
 }
 
 // saveLog strips color tags from the given agent's log and writes it to filename.
+// appendRawLog is like appendLog but does NOT escape tview color tags in the text,
+// allowing pre-colored strings (e.g. from /help) to render correctly.
+func (t *tuiApp) appendRawLog(agentID, text, color string) {
+	if agentID == "" {
+		agentID = rootAgentID
+	}
+	t.logMu.Lock()
+	log := t.getOrCreateLog(agentID)
+	log.mu.Lock()
+	log.entries = append(log.entries, logEntry{color: color, text: text, markdown: false})
+	bg := colorName(t.theme.LogBg)
+	log.buf.WriteString("[" + withBg(color, bg) + "]" + text + "[-:" + bg + ":-]")
+	atBottom := log.atBottom
+	selected := t.selectedAgent
+	if selected == "" {
+		selected = tuiRootRef
+	}
+	if !atBottom {
+		t.hasNewMessages[agentID] = true
+	} else if selected != agentID {
+		t.hasNewMessages[agentID] = true
+	}
+	log.mu.Unlock()
+	t.logMu.Unlock()
+
+	if selected == agentID && !t.searchMode {
+		t.app.QueueUpdateDraw(func() {
+			if atBottom {
+				t.setAgentAtBottom(agentID, true)
+			}
+			t.updateMoreIndicator()
+		})
+	}
+}
+
 func (t *tuiApp) saveLog(agentID, filename string) {
 	raw := t.getLogText(agentID)
 	plain := stripColorTags(raw)
@@ -2022,7 +2193,7 @@ func (t *tuiApp) showSkillPicker() {
 	if len(names) == 0 {
 		// No skills loaded — remove %% and inform.
 		cur := t.inputField.GetText()
-		t.inputField.SetText(strings.Replace(cur, "%%", "", 1))
+		t.inputField.SetText(strings.Replace(cur, "%%", "", 1), false)
 		t.skillPickerActive = false
 		go t.appendLog(t.currentSelectedAgent(), "[capelin-go] No skills available\n", t.theme.LogSystem)
 		return
@@ -2044,7 +2215,7 @@ func (t *tuiApp) showSkillPicker() {
 
 	dismiss := func() {
 		cur := t.inputField.GetText()
-		t.inputField.SetText(removeFirstBareSkillTrigger(cur))
+		t.inputField.SetText(removeFirstBareSkillTrigger(cur), false)
 		t.app.SetRoot(t.normalLayout, true)
 		t.skillPickerActive = false
 		t.setFocus(panelInput)
@@ -2052,7 +2223,7 @@ func (t *tuiApp) showSkillPicker() {
 
 	list.SetSelectedFunc(func(_ int, name, _ string, _ rune) {
 		cur := t.inputField.GetText()
-		t.inputField.SetText(replaceFirstBareSkillTrigger(cur, "%%"+name+"%%"))
+		t.inputField.SetText(replaceFirstBareSkillTrigger(cur, "%%"+name+"%%"), false)
 		t.app.SetRoot(t.normalLayout, true)
 		t.skillPickerActive = false
 		t.setFocus(panelInput)
@@ -2076,6 +2247,55 @@ func (t *tuiApp) showSkillPicker() {
 		AddItem(nil, 0, 1, false)
 
 	t.app.SetRoot(overlay, true).SetFocus(list)
+}
+
+// showCommandPicker opens a dropdown-style list anchored below the input field,
+// showing slash commands that match the partial text (e.g. "/qu" matches "/quit").
+// Arrow keys to navigate, Enter/Tab to select, Esc to dismiss.
+func (t *tuiApp) showCommandPicker(partial string) {
+	t.commandPickerActive = true
+
+	t.commandList.Clear()
+	t.commandList.ShowSecondaryText(true)
+
+	matches := matchingCommands(partial)
+	if len(matches) == 0 {
+		t.commandList.AddItem("(no matching commands)", "", 0, nil)
+	} else {
+		for _, c := range matches {
+			t.commandList.AddItem(c.name, c.description, 0, nil)
+		}
+	}
+
+	t.commandDropdown = tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(t.normalLayout, 0, 1, false).
+		AddItem(t.commandList, commandPickerHeight, 0, true)
+
+	t.app.SetRoot(t.commandDropdown, true).SetFocus(t.commandList)
+}
+
+// updateCommandPicker refreshes the picker list when the partial text changes
+// while the dropdown is already visible. Does not swap root/focus.
+func (t *tuiApp) updateCommandPicker(partial string) {
+	matches := matchingCommands(partial)
+
+	t.commandList.Clear()
+	if len(matches) == 0 {
+		t.commandList.AddItem("(no matching commands)", "", 0, nil)
+	} else {
+		for _, c := range matches {
+			t.commandList.AddItem(c.name, c.description, 0, nil)
+		}
+	}
+}
+
+func (t *tuiApp) dismissCommandPicker() {
+	t.commandPickerActive = false
+	t.commandList.Clear()
+	t.commandDropdown = nil
+	t.app.SetRoot(t.normalLayout, true)
+	t.setFocus(panelInput)
 }
 
 // findAgentByRef looks up a top-level agent by numeric ID (e.g. "1", "2")
@@ -2196,7 +2416,7 @@ func (t *tuiApp) showSessionForkCascade(src *tuiAgent) {
 		if len(sel) < 1 {
 			return
 		}
-		t.inputField.SetText("")
+		t.inputField.SetText("", false)
 		t.setFocus(panelInput)
 		go t.handleSessionFork(src, "", sel[0])
 	}, func() {
@@ -2252,10 +2472,10 @@ func (t *tuiApp) showAppendToAgentCascade(src *tuiAgent) {
 		}
 		// Pre-fill input so user can append optional extra text before submitting.
 		prefill := fmt.Sprintf("/append-to-agent %s %s ", mode, dst.id)
-		t.inputField.SetText(prefill)
+		t.inputField.SetText(prefill, false)
 		t.setFocus(panelInput)
 	}, func() {
-		t.inputField.SetText("")
+		t.inputField.SetText("", false)
 		t.setFocus(panelInput)
 	})
 }
@@ -2412,6 +2632,13 @@ func (t *tuiApp) generateAgentName(agent *tuiAgent, firstUserMsg string) {
 // resetAgentSession clears the agent's conversation back to the system prompt and wipes its log.
 // Safe to call from goroutines.
 func (t *tuiApp) resetAgentSession(agent *tuiAgent) {
+	agent.queueMu.Lock()
+	if agent.busy {
+		agent.queueMu.Unlock()
+		t.appendLog(agent.id, "[capelin-go] Cannot reset while busy; try again after the current request completes\n", t.theme.LogError)
+		return
+	}
+	agent.queueMu.Unlock()
 	sysPrompt := t.owner.systemPromptWithSkills()
 	agent.msgMu.Lock()
 	agent.messages = []apiMessage{{Role: "system", Content: sysPrompt}}
@@ -2668,7 +2895,7 @@ func (t *tuiApp) handleSessionResume(callerAgentID string, uuidPrefix string) {
 
 	// We're in a goroutine — use QueueUpdateDraw to show the overlay.
 	t.app.QueueUpdateDraw(func() {
-		t.inputField.SetText("")
+		t.inputField.SetText("", false)
 		t.app.SetRoot(overlay, true).SetFocus(filterInput)
 	})
 }
@@ -3089,7 +3316,7 @@ func (t *tuiApp) handleWorkspacePicker(callerAgentID string) {
 		AddItem(nil, 0, 1, false)
 
 	t.app.QueueUpdateDraw(func() {
-		t.inputField.SetText("")
+		t.inputField.SetText("", false)
 		t.app.SetRoot(overlay, true).SetFocus(list)
 	})
 }
@@ -3270,6 +3497,813 @@ func stripColorTags(s string) string {
 	return colorTagRe.ReplaceAllString(s, "")
 }
 
+// renderMarkdownText converts a markdown fragment into either plain text or
+// tview markup, depending on plain.
+func renderMarkdownText(s, baseStyle string, plain bool) string {
+	if strings.TrimSpace(s) == "" {
+		if plain {
+			return s
+		}
+		return tview.Escape(s)
+	}
+
+	source := []byte(s)
+	doc := markdownParser.Parser().Parse(text.NewReader(source))
+	var rendered string
+	if plain {
+		rendered = renderMarkdownNode(doc, source, baseStyle, true)
+	} else {
+		rendered = renderMarkdownNode(doc, source, baseStyle, false)
+	}
+	return strings.TrimRight(rendered, " \t\r")
+}
+
+func renderMarkdownNode(n ast.Node, source []byte, baseStyle string, plain bool) string {
+	switch node := n.(type) {
+	case *ast.Document:
+		var out strings.Builder
+		for c := node.FirstChild(); c != nil; c = c.NextSibling() {
+			out.WriteString(renderMarkdownNode(c, source, baseStyle, plain))
+		}
+		return out.String()
+	case *ast.Heading:
+		inner := strings.TrimSpace(renderMarkdownInlineChildren(node, source, baseStyle, plain))
+		if inner == "" {
+			return ""
+		}
+		if plain {
+			return strings.Repeat("#", node.Level) + " " + inner + "\n\n"
+		}
+		return "\n\n[" + withAttr(baseStyle, "b") + "]" + inner + "[-:-:-][" + baseStyle + "]\n\n"
+	case *ast.Paragraph:
+		inner := strings.TrimSpace(renderMarkdownInlineChildren(node, source, baseStyle, plain))
+		if inner == "" {
+			return ""
+		}
+		return inner + "\n\n"
+	case *ast.Blockquote:
+		inner := strings.TrimSpace(renderMarkdownBlockChildren(node, source, baseStyle, plain))
+		if inner == "" {
+			return ""
+		}
+		lines := strings.Split(inner, "\n")
+		var out strings.Builder
+		out.WriteByte('\n')
+		for _, line := range lines {
+			out.WriteString("> ")
+			out.WriteString(line)
+			out.WriteByte('\n')
+		}
+		out.WriteByte('\n')
+		return out.String()
+	case *ast.List:
+		var out strings.Builder
+		index := node.Start
+		if index <= 0 {
+			index = 1
+		}
+		for c := node.FirstChild(); c != nil; c = c.NextSibling() {
+			item, ok := c.(*ast.ListItem)
+			if !ok {
+				continue
+			}
+			itemText := strings.TrimSpace(renderMarkdownBlockChildren(item, source, baseStyle, plain))
+			if node.IsOrdered() {
+				out.WriteString(prefixMultiline(fmt.Sprintf("%d. ", index), itemText))
+			} else {
+				out.WriteString(prefixMultiline("- ", itemText))
+			}
+			out.WriteByte('\n')
+			index++
+		}
+		if out.Len() == 0 {
+			return ""
+		}
+		out.WriteByte('\n')
+		return out.String()
+	case *ast.ListItem:
+		return renderMarkdownBlockChildren(node, source, baseStyle, plain)
+	case *ast.FencedCodeBlock:
+		return renderMarkdownCodeBlock(node.Language(source), renderMarkdownNodeText(node, source), baseStyle, plain)
+	case *ast.CodeBlock:
+		return renderMarkdownCodeBlock(nil, renderMarkdownNodeText(node, source), baseStyle, plain)
+	case *extast.Table:
+		return renderMarkdownTable(node, source, baseStyle, plain)
+	case *ast.ThematicBreak:
+		return "\n---\n\n"
+	default:
+		if node.FirstChild() != nil {
+			return renderMarkdownInlineChildren(node, source, baseStyle, plain)
+		}
+		return ""
+	}
+}
+
+func renderMarkdownBlockChildren(n ast.Node, source []byte, baseStyle string, plain bool) string {
+	var out strings.Builder
+	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
+		out.WriteString(renderMarkdownNode(c, source, baseStyle, plain))
+	}
+	return out.String()
+}
+
+func renderMarkdownInlineChildren(n ast.Node, source []byte, baseStyle string, plain bool) string {
+	var out strings.Builder
+	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
+		out.WriteString(renderMarkdownInline(c, source, baseStyle, plain))
+	}
+	return out.String()
+}
+
+func renderMarkdownInline(n ast.Node, source []byte, baseStyle string, plain bool) string {
+	switch node := n.(type) {
+	case *ast.Text:
+		text := string(node.Text(source))
+		if node.HardLineBreak() {
+			return text + "\n"
+		}
+		if node.SoftLineBreak() {
+			return text + " "
+		}
+		return text
+	case *ast.String:
+		return string(node.Text(source))
+	case *ast.Emphasis:
+		inner := renderMarkdownInlineChildren(node, source, baseStyle, plain)
+		if plain {
+			return inner
+		}
+		if node.Level >= 2 {
+			return "[" + withAttr(baseStyle, "b") + "]" + inner + "[-:-:-][" + baseStyle + "]"
+		}
+		return "[" + withAttr(baseStyle, "u") + "]" + inner + "[-:-:-][" + baseStyle + "]"
+	case *ast.CodeSpan:
+		code := strings.TrimSpace(renderMarkdownRawText(node, source))
+		if plain {
+			return code
+		}
+		return "[" + withAttr(baseStyle, "d") + "]`" + tview.Escape(code) + "`[-:-:-][" + baseStyle + "]"
+	case *ast.Link:
+		return renderMarkdownInlineChildren(node, source, baseStyle, plain)
+	case *ast.AutoLink:
+		return string(node.URL(source))
+	case *ast.Image:
+		return renderMarkdownInlineChildren(node, source, baseStyle, plain)
+	default:
+		if node.FirstChild() != nil {
+			return renderMarkdownInlineChildren(node, source, baseStyle, plain)
+		}
+		return ""
+	}
+}
+
+func renderMarkdownRawText(n ast.Node, source []byte) string {
+	var out strings.Builder
+	ast.Walk(n, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		switch t := node.(type) {
+		case *ast.Text:
+			out.Write(t.Text(source))
+			if t.HardLineBreak() {
+				out.WriteByte('\n')
+			} else if t.SoftLineBreak() {
+				out.WriteByte(' ')
+			}
+		case *ast.String:
+			out.Write(t.Text(source))
+		}
+		return ast.WalkContinue, nil
+	})
+	return out.String()
+}
+
+func renderMarkdownCodeBlock(lang []byte, raw string, baseStyle string, plain bool) string {
+	code := strings.TrimRight(raw, "\n")
+	if plain {
+		return code + "\n\n"
+	}
+	var out strings.Builder
+	out.WriteString("\n\n[")
+	out.WriteString(withAttr(baseStyle, "d"))
+	out.WriteString("]")
+	fence := "```"
+	if len(lang) > 0 {
+		fence += string(lang)
+	}
+	out.WriteString(fence)
+	out.WriteByte('\n')
+	lines := strings.Split(code, "\n")
+	for _, line := range lines {
+		out.WriteString("    ")
+		out.WriteString(tview.Escape(line))
+		out.WriteByte('\n')
+	}
+	out.WriteString("```")
+	out.WriteString("[-:-:-][")
+	out.WriteString(baseStyle)
+	out.WriteString("]\n\n")
+	return out.String()
+}
+
+func renderMarkdownNodeText(n ast.Node, source []byte) string {
+	if lines := n.Lines(); lines != nil && lines.Len() > 0 {
+		var out strings.Builder
+		for i := 0; i < lines.Len(); i++ {
+			if i > 0 {
+				out.WriteByte('\n')
+			}
+			seg := lines.At(i)
+			out.Write(seg.Value(source))
+		}
+		return out.String()
+	}
+	return string(n.Text(source))
+}
+
+func renderMarkdownTable(table *extast.Table, source []byte, baseStyle string, plain bool) string {
+	var header []string
+	var rows [][]string
+
+	for c := table.FirstChild(); c != nil; c = c.NextSibling() {
+		switch node := c.(type) {
+		case *extast.TableHeader:
+			header = renderMarkdownTableCells(node, source)
+		case *extast.TableRow:
+			rows = append(rows, renderMarkdownTableCells(node, source))
+		}
+	}
+
+	if len(header) == 0 && len(rows) == 0 {
+		return ""
+	}
+	widths := tableColumnWidths(header, rows)
+	if len(widths) == 0 {
+		return ""
+	}
+
+	var out strings.Builder
+	out.WriteString(renderTableBorder("┌", "┬", "┐", widths))
+	if len(header) > 0 {
+		out.WriteString(renderTableRow(header, widths))
+		out.WriteString(renderTableBorder("├", "┼", "┤", widths))
+	}
+	for _, row := range rows {
+		out.WriteString(renderTableRow(row, widths))
+	}
+	out.WriteString(renderTableBorder("└", "┴", "┘", widths))
+	out.WriteByte('\n')
+	return out.String()
+}
+
+func renderMarkdownTableCells(n ast.Node, source []byte) []string {
+	var cells []string
+	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
+		cell, ok := c.(*extast.TableCell)
+		if !ok {
+			continue
+		}
+		text := strings.TrimSpace(renderMarkdownInlineChildren(cell, source, "", true))
+		if text == "" {
+			text = " "
+		}
+		cells = append(cells, text)
+	}
+	if len(cells) == 0 {
+		for c := n.FirstChild(); c != nil; c = c.NextSibling() {
+			cells = append(cells, renderMarkdownTableCells(c, source)...)
+		}
+	}
+	return cells
+}
+
+func tableColumnWidths(header []string, rows [][]string) []int {
+	maxCols := len(header)
+	for _, row := range rows {
+		if len(row) > maxCols {
+			maxCols = len(row)
+		}
+	}
+	if maxCols == 0 {
+		return nil
+	}
+	widths := make([]int, maxCols)
+	update := func(cells []string) {
+		for i := 0; i < maxCols; i++ {
+			if i >= len(cells) {
+				continue
+			}
+			if w := len([]rune(cells[i])); w > widths[i] {
+				widths[i] = w
+			}
+		}
+	}
+	update(header)
+	for _, row := range rows {
+		update(row)
+	}
+	for i := range widths {
+		if widths[i] < 1 {
+			widths[i] = 1
+		}
+	}
+	return widths
+}
+
+func renderTableBorder(left, mid, right string, widths []int) string {
+	var out strings.Builder
+	out.WriteString(left)
+	for i, w := range widths {
+		if i > 0 {
+			out.WriteString(mid)
+		}
+		out.WriteString(strings.Repeat("─", w+2))
+	}
+	out.WriteString(right)
+	out.WriteByte('\n')
+	return out.String()
+}
+
+func renderTableRow(cells []string, widths []int) string {
+	var out strings.Builder
+	out.WriteString("│")
+	for i, w := range widths {
+		cell := ""
+		if i < len(cells) {
+			cell = cells[i]
+		}
+		out.WriteByte(' ')
+		out.WriteString(padRight(cell, w))
+		out.WriteByte(' ')
+		out.WriteString("│")
+	}
+	out.WriteByte('\n')
+	return out.String()
+}
+
+func padRight(s string, width int) string {
+	runes := []rune(s)
+	if len(runes) >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-len(runes))
+}
+
+func prefixMultiline(prefix, s string) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) == 0 {
+		return prefix
+	}
+	var out strings.Builder
+	out.WriteString(prefix)
+	out.WriteString(lines[0])
+	indent := strings.Repeat(" ", len([]rune(prefix)))
+	for _, line := range lines[1:] {
+		out.WriteByte('\n')
+		out.WriteString(indent)
+		out.WriteString(line)
+	}
+	return out.String()
+}
+
+func markdownToPlainText(s string) string {
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			if len(out) == 0 || out[len(out)-1] == "" {
+				continue
+			}
+			out = append(out, "")
+			continue
+		}
+		if strings.HasPrefix(trimmed, "```") || trimmed == "---" || isMarkdownTableDividerLine(trimmed) {
+			continue
+		}
+		trimmed = stripMarkdownLinePrefix(trimmed)
+		trimmed = strings.ReplaceAll(trimmed, "`", "")
+		trimmed = strings.ReplaceAll(trimmed, "**", "")
+		trimmed = strings.ReplaceAll(trimmed, "__", "")
+		trimmed = strings.ReplaceAll(trimmed, "*", "")
+		trimmed = strings.ReplaceAll(trimmed, "_", "")
+		out = append(out, trimmed)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+func stripMarkdownLinePrefix(line string) string {
+	switch {
+	case strings.HasPrefix(line, "#"):
+		return strings.TrimSpace(strings.TrimLeft(line, "#"))
+	case strings.HasPrefix(line, "- "), strings.HasPrefix(line, "* "), strings.HasPrefix(line, "+ "):
+		return strings.TrimSpace(line[2:])
+	}
+	i := 0
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+		i++
+	}
+	if i > 0 && i+1 < len(line) && line[i] == '.' && line[i+1] == ' ' {
+		return strings.TrimSpace(line[i+2:])
+	}
+	return line
+}
+
+func isMarkdownTableDividerLine(line string) bool {
+	trimmed := strings.Trim(line, "| ")
+	if trimmed == "" {
+		return false
+	}
+	parts := strings.Split(trimmed, "|")
+	hasCell := false
+	for _, part := range parts {
+		cell := strings.TrimSpace(part)
+		if cell == "" {
+			continue
+		}
+		hasCell = true
+		cell = strings.TrimPrefix(cell, ":")
+		cell = strings.TrimSuffix(cell, ":")
+		for _, r := range cell {
+			if r != '-' {
+				return false
+			}
+		}
+	}
+	return hasCell
+}
+
+func renderHTMLToTview(n *html.Node, baseStyle string) string {
+	var out strings.Builder
+	var walk func(*html.Node, bool)
+
+	walk = func(n *html.Node, inPre bool) {
+		if n == nil {
+			return
+		}
+		if n.Type == html.TextNode {
+			text := n.Data
+			if inPre {
+				out.WriteString(tview.Escape(text))
+				return
+			}
+			text = strings.Join(strings.Fields(text), " ")
+			if text == "" {
+				if strings.Contains(n.Data, "\n") {
+					out.WriteByte(' ')
+				}
+				return
+			}
+			out.WriteString(tview.Escape(text))
+			out.WriteByte(' ')
+			return
+		}
+		if n.Type != html.ElementNode {
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				walk(c, inPre)
+			}
+			return
+		}
+
+		switch n.Data {
+		case "script", "style", "nav", "footer", "aside", "head", "noscript", "iframe", "svg", "figure":
+			return
+		case "html", "body":
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				walk(c, inPre)
+			}
+			return
+		case "h1", "h2", "h3", "h4", "h5", "h6":
+			inner := strings.TrimSpace(renderHTMLChildrenToTview(n, baseStyle, inPre))
+			if inner == "" {
+				return
+			}
+			out.WriteString("\n\n")
+			out.WriteString("[")
+			out.WriteString(withAttr(baseStyle, "b"))
+			out.WriteString("]")
+			out.WriteString(inner)
+			out.WriteString("[")
+			out.WriteString(baseStyle)
+			out.WriteString("]\n\n")
+			return
+		case "p", "div", "section", "article", "main":
+			inner := strings.TrimSpace(renderHTMLChildrenToTview(n, baseStyle, inPre))
+			if inner == "" {
+				return
+			}
+			out.WriteString("\n")
+			out.WriteString(inner)
+			out.WriteString("\n")
+			return
+		case "blockquote":
+			inner := strings.TrimSpace(renderHTMLChildrenToTview(n, baseStyle, inPre))
+			if inner == "" {
+				return
+			}
+			lines := strings.Split(inner, "\n")
+			out.WriteString("\n")
+			for _, line := range lines {
+				out.WriteString("> ")
+				out.WriteString(line)
+				out.WriteByte('\n')
+			}
+			out.WriteByte('\n')
+			return
+		case "strong", "b":
+			out.WriteString("[")
+			out.WriteString(withAttr(baseStyle, "b"))
+			out.WriteString("]")
+			out.WriteString(renderHTMLChildrenToTview(n, baseStyle, inPre))
+			out.WriteString("[")
+			out.WriteString(baseStyle)
+			out.WriteString("]")
+			return
+		case "em", "i":
+			out.WriteString("[")
+			out.WriteString(withAttr(baseStyle, "u"))
+			out.WriteString("]")
+			out.WriteString(renderHTMLChildrenToTview(n, baseStyle, inPre))
+			out.WriteString("[")
+			out.WriteString(baseStyle)
+			out.WriteString("]")
+			return
+		case "code":
+			if inPre {
+				out.WriteString(tview.Escape(htmlNodeRawText(n)))
+				return
+			}
+			out.WriteString("[")
+			out.WriteString(withAttr(baseStyle, "r"))
+			out.WriteString("]")
+			out.WriteString(tview.Escape(strings.TrimSpace(htmlNodeRawText(n))))
+			out.WriteString("[")
+			out.WriteString(baseStyle)
+			out.WriteString("]")
+			return
+		case "pre":
+			raw := strings.TrimSuffix(htmlNodeRawText(n), "\n")
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				return
+			}
+			out.WriteString("\n\n```\n")
+			out.WriteString(tview.Escape(raw))
+			out.WriteString("\n```\n\n")
+			return
+		case "br":
+			out.WriteByte('\n')
+			return
+		case "hr":
+			out.WriteString("\n---\n")
+			return
+		case "a":
+			inner := strings.TrimSpace(renderHTMLChildrenToTview(n, baseStyle, inPre))
+			href := htmlAttr(n, "href")
+			if href != "" && inner != "" && inner != href && !strings.HasPrefix(href, "#") {
+				out.WriteString(inner)
+				out.WriteString(" (")
+				out.WriteString(tview.Escape(href))
+				out.WriteString(")")
+				return
+			}
+			out.WriteString(inner)
+			return
+		case "ul":
+			out.WriteString("\n")
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				if c.Type == html.ElementNode && c.Data == "li" {
+					inner := strings.TrimSpace(renderHTMLChildrenToTview(c, baseStyle, inPre))
+					if inner != "" {
+						out.WriteString("- ")
+						out.WriteString(inner)
+						out.WriteByte('\n')
+					}
+					continue
+				}
+				walk(c, inPre)
+			}
+			out.WriteString("\n")
+			return
+		case "ol":
+			out.WriteString("\n")
+			item := 1
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				if c.Type == html.ElementNode && c.Data == "li" {
+					inner := strings.TrimSpace(renderHTMLChildrenToTview(c, baseStyle, inPre))
+					if inner != "" {
+						out.WriteString(fmt.Sprintf("%d. %s\n", item, inner))
+						item++
+					}
+					continue
+				}
+				walk(c, inPre)
+			}
+			out.WriteString("\n")
+			return
+		case "li":
+			inner := strings.TrimSpace(renderHTMLChildrenToTview(n, baseStyle, inPre))
+			if inner == "" {
+				return
+			}
+			prefix := "- "
+			if n.Parent != nil && n.Parent.Type == html.ElementNode && n.Parent.Data == "ol" {
+				prefix = "1. "
+			}
+			out.WriteString(prefix)
+			out.WriteString(inner)
+			out.WriteByte('\n')
+			return
+		case "table":
+			out.WriteString(renderHTMLTableToTview(n, baseStyle))
+			return
+		}
+
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c, inPre)
+		}
+	}
+
+	walk(n, false)
+	return out.String()
+}
+
+func renderHTMLChildrenToTview(n *html.Node, baseStyle string, inPre bool) string {
+	var out strings.Builder
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		out.WriteString(renderHTMLNodeToTview(c, baseStyle, inPre))
+	}
+	return out.String()
+}
+
+func renderHTMLNodeToTview(n *html.Node, baseStyle string, inPre bool) string {
+	if n == nil {
+		return ""
+	}
+	if n.Type == html.TextNode {
+		if inPre {
+			return tview.Escape(n.Data)
+		}
+		text := strings.Join(strings.Fields(n.Data), " ")
+		if text == "" {
+			if strings.Contains(n.Data, "\n") {
+				return " "
+			}
+			return ""
+		}
+		return tview.Escape(text) + " "
+	}
+	if n.Type != html.ElementNode {
+		return renderHTMLChildrenToTview(n, baseStyle, inPre)
+	}
+
+	switch n.Data {
+	case "strong", "b":
+		return "[" + withAttr(baseStyle, "b") + "]" + renderHTMLChildrenToTview(n, baseStyle, inPre) + "[" + baseStyle + "]"
+	case "em", "i":
+		return "[" + withAttr(baseStyle, "u") + "]" + renderHTMLChildrenToTview(n, baseStyle, inPre) + "[" + baseStyle + "]"
+	case "code":
+		if inPre {
+			return tview.Escape(htmlNodeRawText(n))
+		}
+		return "[" + withAttr(baseStyle, "r") + "]" + tview.Escape(strings.TrimSpace(htmlNodeRawText(n))) + "[" + baseStyle + "]"
+	case "br":
+		return "\n"
+	case "a":
+		inner := strings.TrimSpace(renderHTMLChildrenToTview(n, baseStyle, inPre))
+		href := htmlAttr(n, "href")
+		if href != "" && inner != "" && inner != href && !strings.HasPrefix(href, "#") {
+			return inner + " (" + tview.Escape(href) + ")"
+		}
+		return inner
+	case "li":
+		inner := strings.TrimSpace(renderHTMLChildrenToTview(n, baseStyle, inPre))
+		if inner == "" {
+			return ""
+		}
+		prefix := "- "
+		if n.Parent != nil && n.Parent.Type == html.ElementNode && n.Parent.Data == "ol" {
+			prefix = "1. "
+		}
+		return prefix + inner + "\n"
+	}
+	return renderHTMLChildrenToTview(n, baseStyle, inPre)
+}
+
+func renderHTMLTableToTview(n *html.Node, baseStyle string) string {
+	var rows [][]string
+	var header []string
+
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type != html.ElementNode {
+			continue
+		}
+		switch c.Data {
+		case "thead":
+			for r := c.FirstChild; r != nil; r = r.NextSibling {
+				if r.Type == html.ElementNode && r.Data == "tr" {
+					header = renderHTMLRowToTview(r, baseStyle)
+				}
+			}
+		case "tbody", "tfoot":
+			for r := c.FirstChild; r != nil; r = r.NextSibling {
+				if r.Type == html.ElementNode && r.Data == "tr" {
+					rows = append(rows, renderHTMLRowToTview(r, baseStyle))
+				}
+			}
+		case "tr":
+			rows = append(rows, renderHTMLRowToTview(c, baseStyle))
+		}
+	}
+
+	if len(header) == 0 && len(rows) == 0 {
+		return ""
+	}
+
+	var out strings.Builder
+	writeRow := func(cells []string) {
+		out.WriteString("| ")
+		for i, cell := range cells {
+			if i > 0 {
+				out.WriteString(" | ")
+			}
+			out.WriteString(strings.TrimSpace(cell))
+		}
+		out.WriteString(" |\n")
+	}
+
+	if len(header) > 0 {
+		writeRow(header)
+		out.WriteString("|")
+		for i := range header {
+			if i > 0 {
+				out.WriteString("|")
+			}
+			out.WriteString(" --- ")
+		}
+		out.WriteString("|\n")
+	}
+	for _, row := range rows {
+		writeRow(row)
+	}
+	out.WriteByte('\n')
+	return out.String()
+}
+
+func renderHTMLRowToTview(n *html.Node, baseStyle string) []string {
+	var cells []string
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type != html.ElementNode {
+			continue
+		}
+		if c.Data == "th" || c.Data == "td" {
+			cells = append(cells, strings.TrimSpace(renderHTMLChildrenToTview(c, baseStyle, false)))
+		}
+	}
+	return cells
+}
+
+func htmlNodeRawText(n *html.Node) string {
+	var b strings.Builder
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type == html.TextNode {
+			b.WriteString(n.Data)
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return b.String()
+}
+
+func withAttr(style, attr string) string {
+	parts := strings.SplitN(style, ":", 3)
+	switch len(parts) {
+	case 0:
+		return "::" + attr
+	case 1:
+		if style == "" {
+			return "::" + attr
+		}
+		return style + "::" + attr
+	case 2:
+		return parts[0] + ":" + parts[1] + ":" + attr
+	default:
+		if parts[2] == "" {
+			parts[2] = attr
+		} else if !strings.Contains(parts[2], attr) {
+			parts[2] += ":" + attr
+		}
+		return strings.Join(parts, ":")
+	}
+}
+
 // withBg inserts bg into a tview color string at the background position.
 // tview format is "fg:bg:attrs". Examples:
 //   - "cyan"    → "cyan:black"
@@ -3282,6 +4316,40 @@ func withBg(color, bg string) string {
 	}
 	parts[1] = bg
 	return strings.Join(parts, ":")
+}
+
+// matchingCommands returns slash commands whose name starts with partial.
+func matchingCommands(partial string) []slashCommand {
+	partial = strings.ToLower(strings.TrimSpace(partial))
+	var matches []slashCommand
+	for _, c := range slashCommands {
+		if strings.HasPrefix(c.name, partial) {
+			matches = append(matches, c)
+		}
+	}
+	// Also match bare "quit" → "/quit" and "exit" → "/exit".
+	if len(matches) == 0 {
+		if strings.HasPrefix("quit", partial) {
+			matches = append(matches, slashCommand{name: "/quit", description: "Exit the TUI"})
+		}
+		if strings.HasPrefix("exit", partial) {
+			matches = append(matches, slashCommand{name: "/exit", description: "Exit the TUI"})
+		}
+	}
+	return matches
+}
+
+// isExactSlashMatch returns true when text exactly matches one slash command name
+// (case-insensitive), meaning the user has already typed a complete command and
+// the autocomplete picker does not need to appear.
+func isExactSlashMatch(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	for _, c := range slashCommands {
+		if c.name == lower {
+			return true
+		}
+	}
+	return lower == "/quit" || lower == "/exit"
 }
 
 func colorName(c tcell.Color) string {

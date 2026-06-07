@@ -5,7 +5,8 @@
 ## Features
 
 - one-shot task execution
-- **interactive mode** (`-i` / `--interactive`): multi-turn REPL sharing a single conversation history
+- **REPL mode** (`-i` / `--interactive`): multi-turn readline REPL sharing a single conversation history
+- **TUI mode** (`-tui` / `--tui`): full terminal UI with multi-agent tree, auto-falls back to REPL on non-TTY
 - model loop with tool calling (`/chat/completions`)
 - Claude-style skill discovery from:
   - `.agents/skills` (project-local)
@@ -50,7 +51,13 @@ make test
 ./capelin-go "summarize repository structure"
 ```
 
-Interactive mode (multi-turn REPL with shared conversation history):
+Suppress intermediate tool output, showing only the final answer (one-shot mode):
+
+```bash
+./capelin-go --final-only "summarize repository structure"
+```
+
+REPL mode (multi-turn readline REPL with shared conversation history):
 
 ```bash
 # Start with an initial question, then follow up interactively
@@ -60,7 +67,16 @@ Interactive mode (multi-turn REPL with shared conversation history):
 ./capelin-go -i
 ```
 
-Type `exit` or `quit` (or press Ctrl+D) to end an interactive session.
+TUI mode (full terminal UI with multi-agent tree; falls back to REPL on non-TTY):
+
+```bash
+./capelin-go -tui "summarize this repo"
+
+# Or open the TUI directly
+./capelin-go -tui
+```
+
+Type `exit`, `quit`, `/exit`, or `/quit` (or press Ctrl+D) to end a REPL session.
 
 **Keybindings:**
 
@@ -79,16 +95,17 @@ Type `exit` or `quit` (or press Ctrl+D) to end an interactive session.
 | Ctrl+C *(empty line)*  | Exit session                              |
 | Ctrl+D                 | Exit session (EOF)                        |
 | Ctrl+L                 | Clear screen                              |
-| F1/F2                 | Focus agents / input panel *(TUI)*        |
+| `Esc` `Esc` | Clear current line *(REPL)* |
+| F1/F2                 | Switch panels / focus input panel *(TUI)* |
 | F3                     | Hide / show agents panel *(TUI)*          |
 | F4                     | Open / close log search *(TUI)*           |
 | F12                    | Enter TUI panel-navigation focus mode     |
 
 Command history is persisted to `~/.local/capelin-go/history`.
 
-## TUI Interactive Mode
+## TUI Mode
 
-When running on an interactive terminal, `-i` launches a full TUI with three panels.
+`-tui` launches a full TUI with three panels when running on an interactive terminal.
 
 ```
 ┌────────────────┬──────────────────────────────────────────────┐
@@ -103,7 +120,7 @@ When running on an interactive terminal, `-i` launches a full TUI with three pan
 ├────────────────┴──────────────────────────────────────────────┤
 │  > input text here (type / for commands, %% for skill picker)  │
 ├───────────────────────────────────────────────────────────────┤
-│  F1: agents | F2: input | F3: hide menu | F4: search | /quit  ~/workspace │
+│  F1: switch panels | F2: input | F3: hide menu | F4: search | /quit  gpt-5-mini  ~/workspace │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -120,15 +137,15 @@ The **input panel** routes messages to the currently selected top-level agent. W
 ### Panels
 
 - **Agents panel (left, 1/5 width):** live tree of agents and subagents. Top-level agents show auto-generated names (`N::short title`) after their first turn.
-- **Log panel (right, 4/5 width):** shows the selected agent's transcript starting with the system prompt. Tool calls appear dimmed. Panel title shows the agent name; a spinner (`⠋⠙⠹…`) and **bold** text appear when the agent is busy.
+- **Log panel (right, 4/5 width):** shows the selected agent's transcript starting with the system prompt, with lightweight markdown rendering for headings, lists, inline code, code blocks, bold/italic, and tables. Tool calls appear dimmed. Panel title shows the agent name; a spinner (`⠋⠙⠹…`) and **bold** text appear when the agent is busy.
 - **Input panel (bottom):** send messages to the selected top-level agent. Type `/` to see available commands. Type `%%` anywhere to open the **skill picker** (see below).
-- **Status bar (bottom row):** hotkey hints on the left; current working directory on the right.
+- **Status bar (bottom row):** hotkey hints on the left; selected LLM model and current working directory on the right.
 
 **Hotkeys**
 
 | Input | Action |
 |-------|--------|
-| `F1` | Focus agents panel (un-hides it if hidden) |
+| `F1` | Switch between panels (agents → log → input) |
 | `F2` | Focus input panel |
 | `F3` | Hide / show agents panel |
 | `F4` | Open / close log search (type to search, `Enter`/`n`=next, `N`=prev, `Esc`=close) |
@@ -139,6 +156,7 @@ The **input panel** routes messages to the currently selected top-level agent. W
 | `M` *(in focus mode)* | Maximize or restore the focused panel |
 | `C` *(in focus mode)* | Cancel the selected agent/subagent |
 | `Esc` | Cancel focus mode / close search; also restores a maximized panel |
+| `Esc` `Esc` *(in input panel)* | Clear input field |
 | `Ctrl+C` | Press twice within 2 s to exit (single press shows a warning) |
 | `Ctrl+E` | Toggle copy mode: releases mouse to terminal for text selection |
 | Mouse click | Switch focus to clicked panel; click tree node to switch agent |
