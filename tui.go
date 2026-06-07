@@ -222,8 +222,9 @@ type tuiApp struct {
 
 	// treeDirty signals that the agent tree needs to be rebuilt on the next
 	// ticker fire. Set when agents are created/removed or subagent state changes.
-	treeDirty    atomic.Bool
-	lastSubnodes atomic.Value // stores []tuiAgentNode for change detection
+	treeDirty     atomic.Bool
+	lastSubnodes  atomic.Value // stores []tuiAgentNode for change detection
+	needsUpdate   chan struct{} // buffered(1); signals the update loop to wake
 
 	// input history for Up/Down navigation
 	inputHistory    []string
@@ -268,6 +269,7 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 		focusedPanel:   panelInput,
 		mouseCapture:   true,
 		topAgents:      make(map[string]*tuiAgent),
+		needsUpdate:    make(chan struct{}, 1),
 	}
 
 	// Load skills for the %% inline picker. Failure is non-fatal.
@@ -742,60 +744,81 @@ func (t *tuiApp) run(ctx context.Context) error {
 		<-ctx.Done()
 		t.app.Stop()
 	}()
-	// Rebuild agent tree + advance busy spinner periodically after Run() has started.
+	// Rebuild agent tree + advance busy spinner when signaled.
+	// Blocks on needsUpdate when idle (zero CPU); uses a timer for spinner
+	// animation only while at least one agent is busy.
 	go func() {
-		ticker := time.NewTicker(150 * time.Millisecond)
-		defer ticker.Stop()
 		t.lastSubnodes.Store([]tuiAgentNode(nil))
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				// Advance spinner frame when any top-level agent is busy.
-				t.agentsMu.Lock()
-				anyBusy := false
-				for _, a := range t.topAgents {
-					a.queueMu.Lock()
-					if a.busy {
-						anyBusy = true
-					}
-					a.queueMu.Unlock()
-					if anyBusy {
-						break
-					}
-				}
-				t.agentsMu.Unlock()
-				if anyBusy {
-					t.spinnerFrame.Add(1)
-				}
+			case <-t.needsUpdate:
+			}
 
-				// Check if subagent state has changed.
-				subNodesChanged := false
-				var subNodes []tuiAgentNode
-				if t.subagents != nil {
-					subNodes = t.subagents.ListAll()
-					prev, _ := t.lastSubnodes.Load().([]tuiAgentNode)
-					if !subagentNodesEqual(prev, subNodes) {
-						subNodesChanged = true
-						t.lastSubnodes.Store(subNodes)
-					}
+			// Advance spinner frame when any top-level agent is busy.
+			t.agentsMu.Lock()
+			anyBusy := false
+			for _, a := range t.topAgents {
+				a.queueMu.Lock()
+				if a.busy {
+					anyBusy = true
 				}
-				treeDirty := t.treeDirty.Load()
-				if !anyBusy && !treeDirty && !subNodesChanged {
-					continue // nothing to update — skip the draw entirely
+				a.queueMu.Unlock()
+				if anyBusy {
+					break
 				}
-				if treeDirty {
-					t.treeDirty.Store(false)
+			}
+			t.agentsMu.Unlock()
+			if anyBusy {
+				t.spinnerFrame.Add(1)
+			}
+
+			// Check if subagent state has changed.
+			subNodesChanged := false
+			var subNodes []tuiAgentNode
+			if t.subagents != nil {
+				subNodes = t.subagents.ListAll()
+				prev, _ := t.lastSubnodes.Load().([]tuiAgentNode)
+				if !subagentNodesEqual(prev, subNodes) {
+					subNodesChanged = true
+					t.lastSubnodes.Store(subNodes)
 				}
-				topLevel := t.snapshotTopLevelAgents()
-				t.app.QueueUpdateDraw(func() {
-					t.rebuildAgentTree(topLevel, subNodes)
-				})
+			}
+			treeDirty := t.treeDirty.Load()
+			if !anyBusy && !treeDirty && !subNodesChanged {
+				continue
+			}
+			if treeDirty {
+				t.treeDirty.Store(false)
+			}
+			topLevel := t.snapshotTopLevelAgents()
+			t.app.QueueUpdateDraw(func() {
+				t.rebuildAgentTree(topLevel, subNodes)
+			})
+
+			// If agents are busy, schedule next spinner tick after 150ms.
+			// Otherwise loop back to blocking on needsUpdate (idle = zero CPU).
+			if anyBusy {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.needsUpdate:
+				case <-time.After(150 * time.Millisecond):
+				}
 			}
 		}
 	}()
 	return t.app.Run()
+}
+
+// signalUpdate wakes the update loop goroutine so it can process state changes.
+// Does nothing if the loop is already awake (non-blocking send).
+func (t *tuiApp) signalUpdate() {
+	select {
+	case t.needsUpdate <- struct{}{}:
+	default:
+	}
 }
 
 // submitInputForAgent sends text to the given top-level agent's conversation.
@@ -888,6 +911,7 @@ func (t *tuiApp) processQueueForAgent(agent *tuiAgent) {
 	}
 	agent.busy = false
 	agent.queueMu.Unlock()
+	t.signalUpdate()
 	t.app.QueueUpdateDraw(func() {
 		if t.currentSelectedAgent() == agent.id {
 			t.inputField.SetLabel("> ")
@@ -951,6 +975,7 @@ func (t *tuiApp) submitInputText(text string) {
 	if !agent.busy {
 		agent.busy = true
 		agent.queueMu.Unlock()
+		t.signalUpdate()
 		t.inputField.SetLabel("> [busy] ")
 		go t.submitInputForAgent(agent, text)
 	} else {
@@ -992,6 +1017,7 @@ func (t *tuiApp) createTopLevelAgentWithMessages(messages []apiMessage, writeSys
 	t.topAgents[id] = agent
 	t.agentsMu.Unlock()
 	t.treeDirty.Store(true)
+	t.signalUpdate()
 
 	// Always show session UUID at the top of the log so the user can see it
 	// without needing a /session-id command.
@@ -1756,9 +1782,6 @@ func (t *tuiApp) appendLogEntry(agentID, text, color string, markdown bool) {
 	log.mu.Unlock()
 	t.logMu.Unlock()
 
-	f, _ := os.OpenFile("/tmp/capelin-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	fmt.Fprintf(f, "DEBUG appendLogEntry agentID=%q selected=%q atBottom=%v searchMode=%v\n", agentID, selected, atBottom, t.searchMode)
-	f.Close()
 	if selected == agentID && !t.searchMode {
 		t.app.QueueUpdateDraw(func() {
 			t.logView.SetText(t.getLogText(agentID))
@@ -1787,9 +1810,6 @@ func (t *tuiApp) selectAgent(id string) {
 		return
 	}
 	t.logMu.Unlock()
-	f, _ := os.OpenFile("/tmp/capelin-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	fmt.Fprintf(f, "DEBUG selectAgent id=%q selected=%q\n", id, t.selectedAgent)
-	f.Close()
 	// Allow selecting the root container — it acts as a "create new agent" target.
 	if id == tuiRootRef {
 		t.logMu.Lock()
@@ -2077,6 +2097,7 @@ func (t *tuiApp) handleSlashCommand(text string) {
 			agent.queueMu.Lock()
 			agent.busy = true
 			agent.queueMu.Unlock()
+			t.signalUpdate()
 		}
 		t.app.QueueUpdateDraw(func() {
 			t.selectAgent(agent.id)
@@ -2381,14 +2402,16 @@ func (t *tuiApp) showSkillPicker() {
 	filterInput.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyDown:
-			if selectedIdx < len(filtered)-1 {
-				selectedIdx++
+			n := len(filtered)
+			if n > 0 {
+				selectedIdx = (selectedIdx + 1) % n
 				list.SetCurrentItem(selectedIdx)
 			}
 			return nil
 		case tcell.KeyUp:
-			if selectedIdx > 0 {
-				selectedIdx--
+			n := len(filtered)
+			if n > 0 {
+				selectedIdx = (selectedIdx - 1 + n) % n
 				list.SetCurrentItem(selectedIdx)
 			}
 			return nil
@@ -2737,6 +2760,7 @@ func (t *tuiApp) handleAppendToAgent(src, dst *tuiAgent, mode, extraText string)
 	if !dst.busy {
 		dst.busy = true
 		dst.queueMu.Unlock()
+		t.signalUpdate()
 		t.app.QueueUpdateDraw(func() {
 			t.updateInputLabel(dst)
 		})
@@ -2860,6 +2884,7 @@ func (t *tuiApp) compactAgentSession(agent *tuiAgent) {
 	}
 	agent.busy = true
 	agent.queueMu.Unlock()
+	t.signalUpdate()
 	t.app.QueueUpdateDraw(func() {
 		if t.currentSelectedAgent() == agent.id {
 			t.inputField.SetLabel("> [compacting...] ")
@@ -3168,6 +3193,7 @@ func (t *tuiApp) handleSessionAbandon(agentID string) {
 	delete(t.topAgents, agentID)
 	t.agentsMu.Unlock()
 	t.treeDirty.Store(true)
+	t.signalUpdate()
 
 	t.logMu.Lock()
 	delete(t.logs, agentID)
@@ -3233,6 +3259,7 @@ func (t *tuiApp) doHandleSessionDestroy(agentID string) {
 	delete(t.topAgents, agentID)
 	t.agentsMu.Unlock()
 	t.treeDirty.Store(true)
+	t.signalUpdate()
 
 	t.logMu.Lock()
 	delete(t.logs, agentID)
@@ -3321,6 +3348,7 @@ func (t *tuiApp) doHandleWorkspaceNew(callerAgentID string) {
 		t.logMu.Unlock()
 	}
 	t.treeDirty.Store(true)
+	t.signalUpdate()
 
 	// Reset workspace file to empty.
 	if t.owner.cfg.workspaceRoot != "" {
@@ -3384,6 +3412,7 @@ func (t *tuiApp) handleWorkspaceLoad(callerAgentID, name string) {
 		t.logMu.Unlock()
 	}
 	t.treeDirty.Store(true)
+	t.signalUpdate()
 
 	// Load sessions from the named workspace.
 	loaded := 0
@@ -3439,9 +3468,6 @@ func (t *tuiApp) handleWorkspacePicker(callerAgentID string) {
 		return
 	}
 	if len(names) == 0 {
-		f, _ := os.OpenFile("/tmp/capelin-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		fmt.Fprintf(f, "DEBUG handleWorkspacePicker: no workspaces, callerAgentID=%q\n", callerAgentID)
-		f.Close()
 		t.appendLog(callerAgentID, "[capelin-go] /workspace: no saved workspaces found (use /workspace-save <name> to create one)\n", t.theme.LogSystem)
 		return
 	}
@@ -3607,6 +3633,7 @@ func (t *tuiApp) handleSessionFork(src *tuiAgent, extraMsg string, mode string) 
 		newAgent.queueMu.Lock()
 		newAgent.busy = true
 		newAgent.queueMu.Unlock()
+		t.signalUpdate()
 		go t.submitInputForAgent(newAgent, extraMsg)
 	}
 }
