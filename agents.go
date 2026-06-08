@@ -24,8 +24,8 @@ const (
 	defaultSubagentMaxDepth          = 1
 	defaultSubagentMaxChildren       = 8
 	defaultSubagentMaxParallel       = 4
-	defaultSubagentDefaultTimeoutSec = 300
-	defaultSubagentMaxTimeoutSec     = 600
+	defaultSubagentDefaultTimeoutSec = 600  // 10 minutes
+	defaultSubagentMaxTimeoutSec     = 1800 // 30 minutes
 	defaultSubagentToolIterations    = 20
 	defaultSubagentResultChars       = 8000
 	defaultSubagentAggregateCount    = 12
@@ -335,7 +335,11 @@ func (m *subagentManager) run(ctx context.Context, parent *agentRuntime, args ru
 	session.started = true
 	session.ExecutionMode = mode
 	session.Status = subagentStatusQueued
-	session.parentCtx = ctx
+	if args.Wait {
+		session.parentCtx = ctx
+	} else {
+		session.parentCtx = context.Background()
+	}
 	runSession := session
 	queued := cloneSession(session)
 	m.mu.Unlock()
@@ -431,17 +435,30 @@ func (m *subagentManager) await(ctx context.Context, parent *agentRuntime, args 
 		return nil, err
 	}
 	done := session.done
+	subagentTimeout := session.Timeout
 	m.mu.Unlock()
 
 	waitCtx := ctx
 	var cancel context.CancelFunc
+
+	// Build the effective timeout: use the subagent's own timeout as the upper bound,
+	// then cap by the user's await timeout if provided.
+	deadline := subagentTimeout
+	if deadline <= 0 {
+		deadline = time.Duration(m.cfg.DefaultTimeoutSec) * time.Second
+	}
 	if args.TimeoutSeconds > 0 {
 		if args.TimeoutSeconds > m.cfg.MaxTimeoutSec {
 			return nil, fmt.Errorf("await_subagent timeout_seconds exceeds %d", m.cfg.MaxTimeoutSec)
 		}
-		waitCtx, cancel = context.WithTimeout(ctx, time.Duration(args.TimeoutSeconds)*time.Second)
-		defer cancel()
+		awaitDeadline := time.Duration(args.TimeoutSeconds) * time.Second
+		if awaitDeadline < deadline {
+			deadline = awaitDeadline
+		}
 	}
+	waitCtx, cancel = context.WithTimeout(ctx, deadline)
+	defer cancel()
+
 	select {
 	case <-done:
 	case <-waitCtx.Done():

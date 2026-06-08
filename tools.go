@@ -24,7 +24,7 @@ import (
 
 const (
 	browserUA        = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-	toolTimeout      = 30 * time.Second
+	toolTimeout      = 60 * time.Second
 	maxPageChars     = 14000
 	maxSearchResults = 12
 	maxListEntries   = 300
@@ -43,8 +43,8 @@ var errListLimitReached = errors.New("list limit reached")
 // attacks where a public IP is returned during the pre-flight validateFetchURL
 // check but a private IP is returned during the actual HTTP dial.
 var safeDialer = &net.Dialer{
-	Timeout:   30 * time.Second,
-	KeepAlive: 30 * time.Second,
+	Timeout:   toolTimeout,
+	KeepAlive: toolTimeout,
 }
 
 func safeDial(ctx context.Context, network, addr string) (net.Conn, error) {

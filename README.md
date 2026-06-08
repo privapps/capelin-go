@@ -82,7 +82,10 @@ Type `exit`, `quit`, `/exit`, or `/quit` (or press Ctrl+D) to end a REPL session
 
 | Key                    | Action                                    |
 |------------------------|-------------------------------------------|
-| ↑ / ↓                 | Navigate history *(readline fallback)* or TUI focus mode navigation |
+| `Enter`                | Insert newline in input panel *(TUI)*     |
+| `Ctrl+Enter`           | Submit input *(TUI)*                      |
+| `Ctrl+J`               | Insert newline in input panel *(TUI)*     |
+| ↑ / ↓                 | Navigate history *(readline fallback)* or cursor movement in input *(TUI)* |
 | ← / →                 | Move cursor *(readline fallback)* or TUI panel switch after `F12` |
 | Home / Ctrl+A          | Jump to start of line                     |
 | End / Ctrl+E           | Jump to end of line *(readline fallback only; in TUI mode `Ctrl+E` toggles copy mode)* |
@@ -90,13 +93,14 @@ Type `exit`, `quit`, `/exit`, or `/quit` (or press Ctrl+D) to end a REPL session
 | Ctrl+W / Alt+Backspace | Delete previous word                      |
 | Ctrl+K                 | Delete to end of line                     |
 | Ctrl+U                 | Clear entire line                         |
-| Ctrl+J                 | Submit line (same as Enter)               |
 | Ctrl+C *(non-empty)*   | Clear current line and reprompt           |
 | Ctrl+C *(empty line)*  | Exit session                              |
 | Ctrl+D                 | Exit session (EOF)                        |
 | Ctrl+L                 | Clear screen                              |
-| `Esc` `Esc` | Clear current line *(REPL)* |
-| F1/F2                 | Switch panels / focus input panel *(TUI)* |
+| `Esc` `Esc` *(in input)* | Clear input field                       |
+| `Esc` `Esc` `Esc`    | Cancel current agent                      |
+| F1                     | Switch panels (agents → log → input) *(TUI)* |
+| F2                     | Focus input panel *(TUI)*                 |
 | F3                     | Hide / show agents panel *(TUI)*          |
 | F4                     | Open / close log search *(TUI)*           |
 | F12                    | Enter TUI panel-navigation focus mode     |
@@ -114,13 +118,13 @@ Command history is persisted to `~/.local/capelin-go/history`.
 │ ▶ ⠹ Agent 1   │  [System Prompt]                             │
 │   └ ⠹ search… │  You are a helpful assistant…                │
 │   ◌ Agent 2   │                                              │
-│                │  [tool] web_search(...)       ← dim text     │
+│                │  [tool] web_search(...)       ← tool colour  │
 │                │  assistant response text...                  │
 │                │                     ▼ more messages ▼        │
 ├────────────────┴──────────────────────────────────────────────┤
 │  > input text here (type / for commands, %% for skill picker)  │
 ├───────────────────────────────────────────────────────────────┤
-│  F1: switch panels | F2: input | F3: hide menu | F4: search | /quit  gpt-5-mini  ~/workspace │
+│  Enter: newline | Ctrl+Enter: submit | Triple Esc: cancel | F3: hide menu | F4: search | Ctrl+E: copy | /quit  gpt-5-mini  ~/workspace │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -157,6 +161,9 @@ The **input panel** routes messages to the currently selected top-level agent. W
 | `C` *(in focus mode)* | Cancel the selected agent/subagent |
 | `Esc` | Cancel focus mode / close search; also restores a maximized panel |
 | `Esc` `Esc` *(in input panel)* | Clear input field |
+| `Esc` `Esc` `Esc` *(anywhere)* | Cancel current agent |
+| `Ctrl+Enter` | Submit input (newline with plain Enter) |
+| `Ctrl+J` | Insert newline in input panel |
 | `Ctrl+C` | Press twice within 2 s to exit (single press shows a warning) |
 | `Ctrl+E` | Toggle copy mode: releases mouse to terminal for text selection |
 | Mouse click | Switch focus to clicked panel; click tree node to switch agent |
@@ -202,16 +209,23 @@ without deleting its session data, or `/session-destroy` to also delete the sess
 
 **Agent status legend**
 
-- `⠋⠙⠹…` busy/running = **bold** yellow (animated Braille spinner)
-- `✓` completed = green
-- `✗` failed/timed_out = red
-- `◌` idle = white/black
-- `○` pending (subagent) = gray
-- `—` cancelled = darkgray
+- `⠋⠙⠹…` busy/running = **bold** yellow (dark) / darkorange (light)
+- `✓` completed = green / darkgreen
+- `✗` failed/timed_out = red / darkred
+- `◌` idle = white (dark) / black (light)
+- `○` pending (subagent) = gray / darkgray
+- `—` cancelled = darkgray / dimgray
 
 **Theme**
 
-Auto-detected from terminal background (`COLORFGBG`). Dark and light themes supported.
+Auto-detected from terminal background (`COLORFGBG`). Force with `--theme light|dark|auto` or `CAPELIN_THEME=light` env var. Dark and light themes supported.
+
+Detection precedence:
+1. `--theme` CLI flag
+2. `CAPELIN_THEME` env var (config file also supported)
+3. `COLORFGBG` environment variable (set by many terminals)
+4. macOS `AppleInterfaceStyle` (system appearance preference)
+5. Falls back to dark theme
 
 Falls back to readline-based REPL on non-TTY environments.
 
@@ -272,6 +286,9 @@ Enable everything (all tools + unrestricted paths):
 - `SUBAGENT_MAX_ITERATIONS` — maximum tool-call iterations per subagent (default: 20; overridden by `--subagent-max-iterations`)
 - `SUBAGENT_MODEL` — model ID used for subagents (default: inherits `MODEL`; overridden by `--subagent-model`)
 - `SUBAGENT_REASONING_EFFORT` — reasoning effort for subagents (default: inherits `REASONING_EFFORT`; set to `none` to omit; overridden by `--subagent-reasoning-effort`)
+- `TOOL_MAX_PARALLEL` — maximum concurrent tool calls per LLM turn (default: 8; overridden by `--tool-max-parallel`); set to 0 to disable parallelism (serial execution)
+- `TOOL_TIMEOUT_SECONDS` — per-tool deadline in seconds (default: 60; overridden by `--tool-timeout-seconds`); set to 0 for no per-tool timeout
+- `TOOL_RETRY_ON_TIMEOUT` — retry once on tool timeout (default: true; overridden by `--tool-retry-on-timeout` / `--no-tool-retry-on-timeout`)
 
 ## Config file
 
@@ -304,6 +321,12 @@ SUBAGENT_MAX_ITERATIONS = 20
 # env vars: SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT; also settable via CLI flags
 SUBAGENT_MODEL =
 SUBAGENT_REASONING_EFFORT =
+
+# Parallel tool execution (env vars: TOOL_MAX_PARALLEL, TOOL_TIMEOUT_SECONDS, TOOL_RETRY_ON_TIMEOUT)
+# 0 = disable (serial); empty = default. Also settable via CLI flags.
+TOOL_MAX_PARALLEL = 8
+TOOL_TIMEOUT_SECONDS = 60
+TOOL_RETRY_ON_TIMEOUT = true
 ```
 
 Edit that file to set your preferred model, server URL, or other defaults without needing environment variables every time. Environment variables and CLI flags still take priority over config file values.

@@ -21,17 +21,22 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/term"
 )
 
 const (
-	defaultBaseURL       = "http://localhost:8235/v1"
-	defaultModel         = "gpt-5-mini"
-	defaultToken         = ""
-	defaultReasoning     = "medium"
-	defaultMaxIterations = 40
-	requestTimeout       = 10 * time.Minute
-	usageMessageTemplate = "Usage: %s [--allow-tool TOOL] \"your task\"\n"
+	defaultBaseURL            = "http://localhost:8235/v1"
+	defaultModel              = "gpt-5-mini"
+	defaultToken              = ""
+	defaultReasoning          = "medium"
+	defaultMaxIterations      = 40
+	defaultToolMaxParallel    = 8
+	defaultToolTimeoutSec     = 60
+	defaultToolRetryOnTimeout = true
+	toolTimeoutMax            = 600 // 10 minutes – absolute cap for any tool timeout
+	requestTimeout            = 10 * time.Minute
+	usageMessageTemplate      = "Usage: %s [--allow-tool TOOL] \"your task\"\n"
 )
 
 var version = "dev"
@@ -129,21 +134,25 @@ var optInTools = map[string]struct{}{
 }
 
 type config struct {
-	baseURL         string
-	model           string
-	token           string
-	reasoning       string
-	systemPrompt    string
-	showVersion     bool
-	interactive     bool
-	tui             bool
-	finalOnly       bool
-	initialQuestion string
-	workspaceRoot   string
-	allowedTools    map[string]bool
-	yolo            bool // enables all tools and unrestricted paths
-	maxIterations   int
-	subagents       subagentRuntimeConfig
+	baseURL            string
+	model              string
+	token              string
+	reasoning          string
+	systemPrompt       string
+	showVersion        bool
+	interactive        bool
+	tui                bool
+	finalOnly          bool
+	initialQuestion    string
+	workspaceRoot      string
+	allowedTools       map[string]bool
+	yolo               bool // enables all tools and unrestricted paths
+	maxIterations      int
+	subagents          subagentRuntimeConfig
+	theme              string // "auto", "light", "dark"
+	toolMaxParallel    int    // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
+	toolTimeoutSec     int    // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
+	toolRetryOnTimeout bool   // retry once on timeout (0 = disable; empty = default true)
 }
 
 type app struct {
@@ -399,6 +408,10 @@ func loadConfig(args []string) (config, error) {
 	finalOnly := false
 	maxIter := 0
 	subagentCfg := subagentRuntimeConfig{} // zero = "not set by flag"; env/file/normalize fills gaps
+	themeVal := ""                         // "light", "dark", or "" for auto
+	toolMaxParallel := 0                   // zero = "not set by flag"
+	toolTimeoutSec := 0                    // zero = "not set by flag"
+	toolRetryOnTimeout := -1               // -1 = "not set by flag"; 0 = explicitly false; 1 = explicitly true
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -578,6 +591,58 @@ func loadConfig(args []string) (config, error) {
 				return config{}, err
 			}
 			maxIter = value
+		case arg == "--theme":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--theme requires a value (light, dark, or auto)")
+			}
+			i++
+			theme := strings.ToLower(strings.TrimSpace(args[i]))
+			if theme != "light" && theme != "dark" && theme != "auto" {
+				return config{}, fmt.Errorf("--theme must be light, dark, or auto, got %q", args[i])
+			}
+			themeVal = theme
+		case strings.HasPrefix(arg, "--theme="):
+			theme := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(arg, "--theme=")))
+			if theme != "light" && theme != "dark" && theme != "auto" {
+				return config{}, fmt.Errorf("--theme must be light, dark, or auto, got %q", theme)
+			}
+			themeVal = theme
+		case arg == "--tool-max-parallel":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--tool-max-parallel requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--tool-max-parallel")
+			if err != nil {
+				return config{}, err
+			}
+			toolMaxParallel = value
+		case strings.HasPrefix(arg, "--tool-max-parallel="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--tool-max-parallel="), "--tool-max-parallel")
+			if err != nil {
+				return config{}, err
+			}
+			toolMaxParallel = value
+		case arg == "--tool-timeout-seconds":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--tool-timeout-seconds requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--tool-timeout-seconds")
+			if err != nil {
+				return config{}, err
+			}
+			toolTimeoutSec = value
+		case strings.HasPrefix(arg, "--tool-timeout-seconds="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--tool-timeout-seconds="), "--tool-timeout-seconds")
+			if err != nil {
+				return config{}, err
+			}
+			toolTimeoutSec = value
+		case arg == "--tool-retry-on-timeout":
+			toolRetryOnTimeout = 1
+		case arg == "--no-tool-retry-on-timeout":
+			toolRetryOnTimeout = 0
 		case strings.HasPrefix(arg, "-"):
 			return config{}, fmt.Errorf("unknown flag %q", arg)
 		default:
@@ -677,21 +742,54 @@ func loadConfig(args []string) (config, error) {
 		finalOnly = false
 	}
 
+	if themeVal == "" {
+		themeVal = strings.ToLower(strings.TrimSpace(readCfg("CAPELIN_THEME", fileCfg, "")))
+	}
+
+	// Resolve tool config: flag (non-zero) > env > file > built-in default.
+	if toolMaxParallel == 0 {
+		if env := readCfg("TOOL_MAX_PARALLEL", fileCfg, ""); env != "" {
+			if v, err := parsePositiveInt(env, "TOOL_MAX_PARALLEL"); err == nil {
+				toolMaxParallel = v
+			}
+		}
+	}
+	if toolMaxParallel == 0 {
+		toolMaxParallel = defaultToolMaxParallel
+	}
+	if toolTimeoutSec == 0 {
+		if env := readCfg("TOOL_TIMEOUT_SECONDS", fileCfg, ""); env != "" {
+			if v, err := parsePositiveInt(env, "TOOL_TIMEOUT_SECONDS"); err == nil {
+				toolTimeoutSec = v
+			}
+		}
+	}
+	if toolTimeoutSec == 0 {
+		toolTimeoutSec = defaultToolTimeoutSec
+	}
+	if toolRetryOnTimeout == -1 {
+		toolRetryOnTimeout = boolToInt(readBoolCfg("TOOL_RETRY_ON_TIMEOUT", fileCfg, defaultToolRetryOnTimeout))
+	}
+
 	return config{
-		baseURL:         baseURL,
-		model:           rootModel,
-		token:           readCfg("TOKEN", fileCfg, defaultToken),
-		reasoning:       reasoning,
-		systemPrompt:    readSystemPrompt(fileCfg),
-		interactive:     interactive,
-		tui:             tui,
-		finalOnly:       finalOnly,
-		initialQuestion: strings.TrimSpace(strings.Join(filtered, " ")),
-		workspaceRoot:   workspaceRoot,
-		allowedTools:    allowedTools,
-		yolo:            yolo,
-		maxIterations:   maxIter,
-		subagents:       subagentCfg,
+		baseURL:            baseURL,
+		model:              rootModel,
+		token:              readCfg("TOKEN", fileCfg, defaultToken),
+		reasoning:          reasoning,
+		systemPrompt:       readSystemPrompt(fileCfg),
+		interactive:        interactive,
+		tui:                tui,
+		finalOnly:          finalOnly,
+		initialQuestion:    strings.TrimSpace(strings.Join(filtered, " ")),
+		workspaceRoot:      workspaceRoot,
+		allowedTools:       allowedTools,
+		yolo:               yolo,
+		maxIterations:      maxIter,
+		subagents:          subagentCfg,
+		theme:              themeVal,
+		toolMaxParallel:    toolMaxParallel,
+		toolTimeoutSec:     toolTimeoutSec,
+		toolRetryOnTimeout: toolRetryOnTimeout == 1,
 	}, nil
 }
 
@@ -723,6 +821,31 @@ func readCfg(key string, fileCfg map[string]string, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// readBoolCfg returns a boolean from env var or config file.
+// Accepted true values: "true", "1", "yes", "on" (case-insensitive).
+// Empty string returns fallback.
+func readBoolCfg(key string, fileCfg map[string]string, fallback bool) bool {
+	value := readCfg(key, fileCfg, "")
+	if value == "" {
+		return fallback
+	}
+	switch strings.ToLower(value) {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func readSystemPrompt(fileCfg map[string]string) string {
@@ -789,7 +912,7 @@ MAX_ITERATIONS = 40
 SUBAGENT_MAX_DEPTH = 1
 SUBAGENT_MAX_CHILDREN = 8
 SUBAGENT_MAX_PARALLEL = 4
-SUBAGENT_TIMEOUT_SECONDS = 300
+SUBAGENT_TIMEOUT_SECONDS = 600
 SUBAGENT_MAX_RESULT_CHARS = 8000
 SUBAGENT_MAX_AGGREGATE_CHARS = 12000
 SUBAGENT_MAX_ITERATIONS = 20
@@ -798,6 +921,12 @@ SUBAGENT_MAX_ITERATIONS = 20
 # env vars: SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT; also settable via CLI flags
 SUBAGENT_MODEL =
 SUBAGENT_REASONING_EFFORT =
+
+# Parallel tool execution (env vars: TOOL_MAX_PARALLEL, TOOL_TIMEOUT_SECONDS, TOOL_RETRY_ON_TIMEOUT)
+# 0 = disable (serial); empty = default. Also settable via CLI flags.
+TOOL_MAX_PARALLEL = 8
+TOOL_TIMEOUT_SECONDS = 60
+TOOL_RETRY_ON_TIMEOUT = true
 `
 
 // ensureConfigFile creates the config file with defaults if it does not exist,
@@ -909,10 +1038,12 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  -i / --interactive         readline REPL (multi-turn; initial question is optional)")
 	fmt.Fprintln(w, "  -tui / --tui               TUI (auto-falls back to REPL on non-TTY)")
 	fmt.Fprintln(w, "  --final-only               one-shot mode: suppress intermediate tool output, show only the final answer")
+	fmt.Fprintln(w, "  --theme light|dark|auto    force TUI theme (default: auto-detect from terminal)")
 	fmt.Fprintln(w, "Env: BASE_URL, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS")
-	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
+	fmt.Fprintln(w, "     CAPELIN_THEME, SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT")
+	fmt.Fprintln(w, "     TOOL_MAX_PARALLEL, TOOL_TIMEOUT_SECONDS, TOOL_RETRY_ON_TIMEOUT")
 	fmt.Fprintln(w, "Opt-in tools (repeatable): --allow-tool write_file --allow-tool edit_file --allow-tool append_file --allow-tool execute_program --allow-tool execute_skill")
 	fmt.Fprintln(w, "Iteration limit: --max-iterations N (default 40; env MAX_ITERATIONS; always wraps up gracefully on limit)")
 	fmt.Fprintln(w, "Subagent limits (flags, env vars, or config file):")
@@ -926,6 +1057,11 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Subagent model (defaults to root MODEL if not set):")
 	fmt.Fprintln(w, "  --subagent-model MODEL              (env SUBAGENT_MODEL)")
 	fmt.Fprintln(w, "  --subagent-reasoning-effort VALUE   (env SUBAGENT_REASONING_EFFORT; set to 'none' to omit)")
+	fmt.Fprintln(w, "Tool execution (flags, env vars, or config file):")
+	fmt.Fprintln(w, "  --tool-max-parallel N               (default 8;     env TOOL_MAX_PARALLEL)")
+	fmt.Fprintln(w, "  --tool-timeout-seconds N            (default 60;    env TOOL_TIMEOUT_SECONDS)")
+	fmt.Fprintln(w, "  --tool-retry-on-timeout             (default true;  env TOOL_RETRY_ON_TIMEOUT)")
+	fmt.Fprintln(w, "  --no-tool-retry-on-timeout          (disable retry)")
 	fmt.Fprintln(w, "All tools + unrestricted paths:  --yolo")
 }
 
@@ -982,6 +1118,12 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 		sink = &stdioSink{}
 	}
 
+	// Turn-level retry constants for transient errors (429, 5xx).
+	const (
+		turnMaxAttempts = 3
+		turnRetryBase   = 2 * time.Second
+	)
+
 	for iter := 0; iter < maxIterations; iter++ {
 		if a.logger != nil {
 			a.logger.emit("assistant.turn_start", map[string]any{
@@ -997,9 +1139,32 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 			})
 		}
 
-		resp, err := a.client.complete(ctx, messages, toolset, runtimeModel, runtimeReasoning)
-		if err != nil {
-			return messages, "", err
+		// Retry the model request on transient errors (429/5xx).
+		var resp *completionMessage
+		var lastTurnErr error
+		for attempt := 0; attempt < turnMaxAttempts; attempt++ {
+			if attempt > 0 {
+				delay := turnRetryBase * time.Duration(1<<(attempt-1))
+				if emitOutput {
+					sink.WriteSystem(agentID, fmt.Sprintf("[tool] model request failed (429/5xx), retrying in %v…", delay))
+				}
+				select {
+				case <-ctx.Done():
+					return messages, "", ctx.Err()
+				case <-time.After(delay):
+				}
+			}
+			resp, lastTurnErr = a.client.complete(ctx, messages, toolset, runtimeModel, runtimeReasoning)
+			if lastTurnErr == nil {
+				break
+			}
+			// Only retry on transient (retryable) errors.
+			if !isRetryableError(lastTurnErr) {
+				return messages, "", lastTurnErr
+			}
+		}
+		if lastTurnErr != nil {
+			return messages, "", lastTurnErr
 		}
 
 		if content := strings.TrimSpace(resp.Content()); content != "" {
@@ -1024,35 +1189,100 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 			return messages, lastContent, nil
 		}
 
-		for _, call := range resp.ToolCalls() {
-			if emitOutput {
-				sink.WriteToolCall(agentID, call.Function.Name, call.Function.Arguments)
-			}
-			if a.logger != nil {
-				a.logger.emit("tool.call", map[string]any{
-					"toolName":  call.Function.Name,
-					"arguments": call.Function.Arguments,
-				})
-			}
-			out, err := a.runToolForRuntime(ctx, runtime, call)
-			if err != nil {
+		// Parallel tool execution: run up to toolMaxParallel tools concurrently,
+		// each with its own toolTimeoutSec deadline. Results are collected in
+		// original call order and appended to messages after all complete.
+		type toolResult struct {
+			idx     int
+			call    apiToolCall
+			out     string
+			isError bool
+			retried bool
+		}
+		toolCalls := resp.ToolCalls()
+		results := make([]toolResult, len(toolCalls))
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(a.cfg.toolMaxParallel)
+		for i, call := range toolCalls {
+			i, call := i, call
+			g.Go(func() error {
 				if emitOutput {
-					sink.WriteToolResult(agentID, call.Function.Name, true, err.Error())
+					sink.WriteToolCall(agentID, call.Function.Name, call.Function.Arguments)
 				}
-				out = fmt.Sprintf("Tool error: %v", err)
-			} else if emitOutput {
-				sink.WriteToolResult(agentID, call.Function.Name, false, "")
-			}
+				if a.logger != nil {
+					a.logger.emit("tool.call", map[string]any{
+						"toolName":  call.Function.Name,
+						"arguments": call.Function.Arguments,
+					})
+				}
+				var lastErr error
+				// Determine per-tool timeout: use the tool's declared timeout if present,
+				// otherwise use the default. The per-tool timeout is capped at toolTimeoutMax.
+				timeoutSec := a.cfg.toolTimeoutSec
+				if toolTimeout := parseToolTimeout(call); toolTimeout > 0 {
+					timeoutSec = toolTimeout
+				}
+				for attempt := 0; attempt <= 1; attempt++ {
+					toolCtx, cancel := context.WithTimeout(gctx, time.Duration(timeoutSec)*time.Second)
+					defer cancel()
+					out, err := a.runToolForRuntime(toolCtx, runtime, call)
+					if err != nil {
+						lastErr = err
+						if attempt == 0 && a.cfg.toolRetryOnTimeout && errors.Is(err, context.DeadlineExceeded) {
+							if emitOutput {
+								sink.WriteSystem(agentID, fmt.Sprintf("[tool] %s timed out, retrying…", call.Function.Name))
+							}
+							continue
+						}
+						results[i] = toolResult{
+							idx:     i,
+							call:    call,
+							out:     fmt.Sprintf("Tool error: %v", err),
+							isError: true,
+							retried: attempt == 1,
+						}
+						return nil
+					}
+					results[i] = toolResult{
+						idx:     i,
+						call:    call,
+						out:     out,
+						isError: false,
+						retried: attempt == 1,
+					}
+					return nil
+				}
+				results[i] = toolResult{
+					idx:     i,
+					call:    call,
+					out:     fmt.Sprintf("Tool error after retry: %v", lastErr),
+					isError: true,
+					retried: true,
+				}
+				return nil
+			})
+		}
+		g.Wait()
 
+		// Emit results in original call order
+		for i := range results {
+			r := &results[i]
+			if emitOutput {
+				if r.isError {
+					sink.WriteToolResult(agentID, r.call.Function.Name, true, "")
+				} else {
+					sink.WriteToolResult(agentID, r.call.Function.Name, false, "")
+				}
+			}
 			messages = append(messages, apiMessage{
 				Role:       "tool",
-				ToolCallID: call.ID,
-				Content:    out,
+				ToolCallID: r.call.ID,
+				Content:    r.out,
 			})
 			if a.logger != nil {
 				a.logger.emit("tool.result", map[string]any{
-					"toolName": call.Function.Name,
-					"isError":  err != nil,
+					"toolName": r.call.Function.Name,
+					"isError":  r.isError,
 				})
 			}
 		}
@@ -1410,6 +1640,24 @@ func (a *app) systemPromptWithSkills() string {
 	return b.String()
 }
 
+// parseToolTimeout extracts the per-tool timeout from the tool call arguments
+// for tools that have a timeout_seconds parameter. Returns 0 if no timeout
+// is set or if the tool doesn't have a timeout parameter. The returned value
+// is capped at toolTimeoutMax (10 minutes).
+func parseToolTimeout(call apiToolCall) int {
+	type timeoutArgs struct {
+		TimeoutSeconds int `json:"timeout_seconds"`
+	}
+	var args timeoutArgs
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil || args.TimeoutSeconds <= 0 {
+		return 0
+	}
+	if args.TimeoutSeconds > toolTimeoutMax {
+		return toolTimeoutMax
+	}
+	return args.TimeoutSeconds
+}
+
 func (a *app) runTool(ctx context.Context, call apiToolCall) (string, error) {
 	return a.runToolForRuntime(ctx, a.rootRuntime(), call)
 }
@@ -1651,6 +1899,24 @@ const (
 // 429 (rate limit) and 5xx (server errors) are transient; other 4xx are not.
 func isRetryableStatus(code int) bool {
 	return code == 429 || code >= 500
+}
+
+// isRetryableError reports whether an error is transient and worth retrying at the turn level.
+// Checks the error message for 429 or 5xx status patterns, which indicate transient failures.
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Context deadline or cancellation are not retryable.
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	msg := err.Error()
+	// Check for 429 (rate limit) or 5xx (server error) patterns in the error message.
+	if strings.Contains(msg, "429") || strings.Contains(msg, "model request failed: 5") {
+		return true
+	}
+	return false
 }
 
 func (c *client) complete(ctx context.Context, messages []apiMessage, tools []apiTool, model, reasoning string) (*completionMessage, error) {

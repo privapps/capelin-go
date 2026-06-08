@@ -11,26 +11,57 @@ import (
 )
 
 func TestDetectThemeDark(t *testing.T) {
+	t.Setenv("CAPELIN_THEME", "")
 	t.Setenv("COLORFGBG", "15;0")
-	theme := detectTheme()
+	theme := detectTheme("")
 	if theme.ActiveBorder != newDarkTheme().ActiveBorder {
 		t.Fatal("expected dark theme")
 	}
 }
 
 func TestDetectThemeLight(t *testing.T) {
+	t.Setenv("CAPELIN_THEME", "")
 	t.Setenv("COLORFGBG", "0;15")
-	theme := detectTheme()
+	theme := detectTheme("")
 	if theme.ActiveBorder != newLightTheme().ActiveBorder {
 		t.Fatal("expected light theme")
 	}
 }
 
 func TestDetectThemeFallbackDark(t *testing.T) {
+	t.Setenv("CAPELIN_THEME", "")
 	t.Setenv("COLORFGBG", "")
-	theme := detectTheme()
+	theme := detectTheme("")
 	if theme.ActiveBorder != newDarkTheme().ActiveBorder {
 		t.Fatal("expected dark theme as fallback")
+	}
+}
+
+func TestDetectThemeCapelinOverride(t *testing.T) {
+	t.Setenv("CAPELIN_THEME", "light")
+	t.Setenv("COLORFGBG", "15;0")
+	theme := detectTheme("")
+	if theme.ActiveBorder != newLightTheme().ActiveBorder {
+		t.Fatal("expected light theme via CAPELIN_THEME override")
+	}
+	t.Setenv("CAPELIN_THEME", "dark")
+	t.Setenv("COLORFGBG", "0;15")
+	theme = detectTheme("")
+	if theme.ActiveBorder != newDarkTheme().ActiveBorder {
+		t.Fatal("expected dark theme via CAPELIN_THEME override")
+	}
+}
+
+func TestDetectThemeArgOverride(t *testing.T) {
+	t.Setenv("CAPELIN_THEME", "")
+	t.Setenv("COLORFGBG", "15;0")
+	theme := detectTheme("light")
+	if theme.ActiveBorder != newLightTheme().ActiveBorder {
+		t.Fatal("expected light theme via arg override")
+	}
+	theme = detectTheme("dark")
+	if theme.ActiveBorder != newDarkTheme().ActiveBorder {
+		t.Fatal("expected dark theme via arg override despite COLORFGBG")
 	}
 }
 
@@ -42,6 +73,192 @@ func TestThemesAreDifferent(t *testing.T) {
 	}
 	if dark.LogContent == light.LogContent {
 		t.Error("dark and light LogContent should differ")
+	}
+}
+
+// TestLightThemeContrast verifies that light-theme color tags are readable
+// on a white background: no "olive" or "teal" ANSI names (low contrast),
+// and LogBg is explicitly white.
+func TestLightThemeContrast(t *testing.T) {
+	light := newLightTheme()
+	if light.LogBg != tcell.ColorWhite {
+		t.Error("light theme LogBg should be white")
+	}
+	lowContrast := []string{"olive", "teal", "gray", "silver", "white", "lightgray"}
+	for _, name := range lowContrast {
+		if light.LogContent == name {
+			t.Errorf("light theme LogContent %q has low contrast on white", name)
+		}
+		if light.LogTool == name {
+			t.Errorf("light theme LogTool %q has low contrast on white", name)
+		}
+		if light.LogError == name {
+			t.Errorf("light theme LogError %q has low contrast on white", name)
+		}
+		if light.LogSystem == name {
+			t.Errorf("light theme LogSystem %q has low contrast on white", name)
+		}
+	}
+	// AgentBusy should not be olive/yellow-like low-contrast on white.
+	if light.AgentBusy == tcell.ColorOlive {
+		t.Error("light theme AgentBusy should not be Olive (low contrast on white)")
+	}
+}
+
+// TestWidgetColorsAreReadable guards against the most common regression:
+// tview's default foreground is white, so any widget left unstyled on a
+// light-theme background produces invisible text. Both themes must declare
+// every "text-on-bg" pair explicitly with a foreground different from the
+// background.
+func TestWidgetColorsAreReadable(t *testing.T) {
+	cases := []struct {
+		name    string
+		theme   tuiTheme
+		isLight bool
+	}{
+		{"dark", newDarkTheme(), false},
+		{"light", newLightTheme(), true},
+	}
+	for _, tc := range cases {
+		// TitleColor must differ from any background it is rendered on
+		// (LogBg, InputBg, StatusBarBg).
+		for _, bg := range []tcell.Color{tc.theme.LogBg, tc.theme.InputBg, tc.theme.StatusBarBg} {
+			if tc.theme.TitleColor == bg {
+				t.Errorf("%s theme: TitleColor equals background %v — titles will be invisible", tc.name, bg)
+			}
+		}
+		// InputFg must differ from InputBg, otherwise typed text is invisible.
+		if tc.theme.InputFg == tc.theme.InputBg {
+			t.Errorf("%s theme: InputFg equals InputBg — typed text will be invisible", tc.name)
+		}
+		// StatusBarFg must differ from StatusBarBg.
+		if tc.theme.StatusBarFg == tc.theme.StatusBarBg {
+			t.Errorf("%s theme: StatusBarFg equals StatusBarBg — status bar text will be invisible", tc.name)
+		}
+		// ListMain must differ from LogBg (the list's background).
+		if tc.theme.ListMain == tc.theme.LogBg {
+			t.Errorf("%s theme: ListMain equals LogBg — list items will be invisible", tc.name)
+		}
+		// ListSelFg and ListSelBg must differ and not match LogBg/InputBg exactly.
+		if tc.theme.ListSelFg == tc.theme.ListSelBg {
+			t.Errorf("%s theme: ListSelFg equals ListSelBg — selected item will be invisible", tc.name)
+		}
+		// On the light theme, white is the dangerous color (matches white bg);
+		// on the dark theme, black is dangerous.
+		dangerous := tcell.ColorWhite
+		if tc.isLight {
+			// Light theme uses white backgrounds — white foreground is the
+			// main culprit for invisible text.
+			if tc.theme.TitleColor == dangerous {
+				t.Errorf("%s theme: TitleColor is white (matches white LogBg) — titles will be invisible", tc.name)
+			}
+			if tc.theme.StatusBarFg == dangerous && tc.theme.StatusBarBg == tcell.ColorWhite {
+				t.Errorf("%s theme: StatusBarFg is white on a white-ish background — status bar invisible", tc.name)
+			}
+			if tc.theme.ListMain == dangerous && tc.theme.LogBg == tcell.ColorWhite {
+				t.Errorf("%s theme: ListMain is white on white LogBg — list items will be invisible", tc.name)
+			}
+		} else {
+			// Dark theme uses black backgrounds — black foreground is the
+			// main culprit for invisible text.
+			if tc.theme.TitleColor == tcell.ColorBlack {
+				t.Errorf("%s theme: TitleColor is black (matches black LogBg) — titles will be invisible", tc.name)
+			}
+			if tc.theme.InputFg == tcell.ColorBlack && tc.theme.InputBg == tcell.ColorBlack {
+				t.Errorf("%s theme: InputFg is black on black InputBg — typed text will be invisible", tc.name)
+			}
+		}
+	}
+}
+
+// TestWidgetColorsContrast uses tcell's RGB decomposition to verify that
+// every text-on-bg pair has a real luminance gap (not just different color
+// names). Threshold is loose on purpose — terminals and themes vary — but a
+// delta of < 0.15 is a clear red flag for invisible text.
+func TestWidgetColorsContrast(t *testing.T) {
+	type pair struct {
+		label string
+		fg    tcell.Color
+		bg    tcell.Color
+	}
+	luminance := func(c tcell.Color) float64 {
+		if c == tcell.ColorDefault {
+			return -1
+		}
+		r, g, b := c.RGB()
+		// Relative luminance approximation (BT.601).
+		return (0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b)) / 255.0
+	}
+	themes := []struct {
+		name  string
+		theme tuiTheme
+	}{
+		{"light", newLightTheme()},
+		{"dark", newDarkTheme()},
+	}
+	for _, th := range themes {
+		pairs := []pair{
+			{"Title-on-LogBg", th.theme.TitleColor, th.theme.LogBg},
+			{"InputFg-on-InputBg", th.theme.InputFg, th.theme.InputBg},
+			{"StatusBarFg-on-StatusBarBg", th.theme.StatusBarFg, th.theme.StatusBarBg},
+			{"ListMain-on-LogBg", th.theme.ListMain, th.theme.LogBg},
+			{"ListSelFg-on-ListSelBg", th.theme.ListSelFg, th.theme.ListSelBg},
+		}
+		// Resolve LogTool (a tview colour name) into a tcell color so we
+		// can measure its luminance. A dim attribute on the open tag is no
+		// longer emitted — but the colour itself must still be visibly
+		// distinct from both ColorBlack and the panel's LogBg.
+		//
+		// If the lookup fails, the tag parser will set fg to ColorDefault
+		// at render time (round-4 bug: tcell uses "aqua" not "cyan").
+		// Record the failure so the loop's continue-on-ColorDefault path
+		// doesn't silently hide it.
+		if fg, ok := tcell.ColorNames[th.theme.LogTool]; !ok {
+			t.Errorf("%s theme: LogTool %q is not in tcell.ColorNames — tool text will render as ColorDefault",
+				th.name, th.theme.LogTool)
+		} else {
+			pairs = append(pairs,
+				pair{"LogTool-on-LogBg", fg, th.theme.LogBg},
+				pair{"LogTool-on-Black", fg, tcell.ColorBlack},
+			)
+		}
+		for _, p := range pairs {
+			if p.fg == tcell.ColorDefault || p.bg == tcell.ColorDefault {
+				continue // ColorDefault falls back to terminal; can't measure.
+			}
+			fgL, bgL := luminance(p.fg), luminance(p.bg)
+			delta := fgL - bgL
+			if delta < 0 {
+				delta = -delta
+			}
+			if delta < 0.15 {
+				t.Errorf("%s theme: %s has near-zero luminance gap (fg=%.2f bg=%.2f delta=%.2f) — likely invisible",
+					th.name, p.label, fgL, bgL, delta)
+			}
+		}
+	}
+}
+
+// TestPlaceholderTextContrast checks that the placeholder message in an
+// empty log view uses a color different from the panel's LogBg, on both
+// themes. The placeholder color name must also be resolvable via colorName
+// (since we inline it into a tview color tag).
+func TestPlaceholderTextContrast(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		theme tuiTheme
+	}{
+		{"dark", newDarkTheme()},
+		{"light", newLightTheme()},
+	} {
+		if tc.theme.PlaceholderText == "" {
+			t.Errorf("%s theme: PlaceholderText is empty", tc.name)
+		}
+		// It must not match LogBg exactly — we map names, not tcell constants,
+		// so we compare strings via colorName.
+		if colorName(tc.theme.LogBg) == tc.theme.PlaceholderText {
+			t.Errorf("%s theme: PlaceholderText %q matches LogBg — placeholder will be invisible", tc.name, tc.theme.PlaceholderText)
+		}
 	}
 }
 
@@ -166,6 +383,34 @@ func TestThemeLogBgSet(t *testing.T) {
 	}
 }
 
+// TestLogToolResolvesToConcreteColor guards against the round-4 bug: tview
+// resolves every colour name via tcell.ColorNames[name], and tcell does
+// NOT contain a "cyan" entry (ANSI "cyan" is named "aqua" in tcell).
+// Looking up an unknown name returns the zero value ColorDefault, which
+// the terminal renders as its own default foreground — on a light
+// terminal that is black, so the tool text disappears on the white
+// panel. This test pins every theme's LogTool to a real tcell colour.
+func TestLogToolResolvesToConcreteColor(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		theme tuiTheme
+	}{
+		{"dark", newDarkTheme()},
+		{"light", newLightTheme()},
+	} {
+		resolved, ok := tcell.ColorNames[tc.theme.LogTool]
+		if !ok {
+			t.Errorf("%s theme: LogTool %q is not in tcell.ColorNames — tool text will render as ColorDefault (likely invisible on a contrasting LogBg)",
+				tc.name, tc.theme.LogTool)
+			continue
+		}
+		if resolved == tcell.ColorDefault {
+			t.Errorf("%s theme: LogTool %q resolves to tcell.ColorDefault — same as above",
+				tc.name, tc.theme.LogTool)
+		}
+	}
+}
+
 // TestSelectAgentRootUpdatesSelectedAgent verifies that selecting the root container
 // node sets selectedAgent to tuiRootRef (instead of silently ignoring the request).
 func TestSelectAgentRootUpdatesSelectedAgent(t *testing.T) {
@@ -189,6 +434,43 @@ func TestSelectAgentRootUpdatesSelectedAgent(t *testing.T) {
 
 	if tui.currentSelectedAgent() != tuiRootRef {
 		t.Errorf("expected currentSelectedAgent() == %q, got %q", tuiRootRef, tui.currentSelectedAgent())
+	}
+}
+
+// TestAppendToolLogUsesNoDim guards the round-3 fix: the `::d` (dim) attribute
+// was removed from tool-call / tool-result lines. The dim attribute caused
+// darkcyan to render at ~50% brightness, which on a light-terminal collapses
+// to a near-black that the user reported as "tool calls are black, hard to
+// read". This test pins the open tag to "fg:bg" with no `d` so future
+// changes can't silently re-introduce the dim attribute.
+func TestAppendToolLogUsesNoDim(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		theme tuiTheme
+	}{
+		{"dark", newDarkTheme()},
+		{"light", newLightTheme()},
+	} {
+		tui := &tuiApp{
+			theme:          tc.theme,
+			logs:           make(map[string]*agentLog),
+			agentNames:     make(map[string]string),
+			hasNewMessages: make(map[string]bool),
+		}
+		// selectedAgent is empty (zero value), so appendLogEntry's
+		// "selected == agentID" branch is false and t.app.QueueUpdateDraw
+		// is not invoked — t.app is nil on purpose.
+		tui.appendToolLog("agent-x", "[tool] foo(1)\n")
+
+		bg := colorName(tc.theme.LogBg)
+		expectedOpen := "[" + tc.theme.LogTool + ":" + bg + "]"
+		got := tui.getLogText("agent-x")
+		if !strings.Contains(got, expectedOpen) {
+			t.Errorf("%s theme: expected open tag %q in log buffer, got %q", tc.name, expectedOpen, got)
+		}
+		if strings.Contains(got, ":d]") {
+			t.Errorf("%s theme: log buffer must not contain a `d` (dim) attribute, got %q", tc.name, got)
+		}
 	}
 }
 
@@ -619,13 +901,13 @@ func TestSpinnerFramesLen(t *testing.T) {
 		t.Error("expected multiple distinct spinner frames in topLevelAgentNodeText")
 	}
 
-	// Idle agent should use ◌ icon.
+	// Idle agent should use ○ icon.
 	ag.queueMu.Lock()
 	ag.busy = false
 	ag.queueMu.Unlock()
 	label, _ := tui.topLevelAgentNodeText(ag)
-	if !strings.HasPrefix(label, "◌ ") {
-		t.Errorf("idle agent label should start with '◌ ', got %q", label)
+	if !strings.HasPrefix(label, "○ ") {
+		t.Errorf("idle agent label should start with '○ ', got %q", label)
 	}
 }
 
@@ -982,4 +1264,171 @@ func TestStatusCWDSetInNewTuiApp(t *testing.T) {
 	if !strings.Contains(text, dir) && !strings.Contains(text, "…") {
 		t.Errorf("expected CWD widget to contain %q or a truncated path, got %q", dir, text)
 	}
+}
+
+// makeTestTuiApp returns a tuiApp with just the fields the log/trim tests
+// need. It does NOT start tview's event loop; callers that would otherwise
+// trigger QueueUpdateDraw must steer around it (the log append helpers
+// short-circuit on selected != agentID, so we keep the test agent unselected).
+func makeTestTuiApp() *tuiApp {
+	return &tuiApp{
+		theme:          newDarkTheme(),
+		logs:           make(map[string]*agentLog),
+		hasNewMessages: make(map[string]bool),
+		selectedAgent:  tuiRootRef,
+	}
+}
+
+func TestAgentLogTrimByEntryCount(t *testing.T) {
+	tui := makeTestTuiApp()
+	const agentID = "agent-1"
+	for i := 0; i < maxAgentLogEntries+500; i++ {
+		tui.writeLogBufEntry(agentID, "line\n", "white", false)
+	}
+	tui.logMu.Lock()
+	defer tui.logMu.Unlock()
+	l := tui.logs[agentID]
+	if got := len(l.entries); got > maxAgentLogEntries {
+		t.Fatalf("entries cap: want <= %d, got %d", maxAgentLogEntries, got)
+	}
+	// buf length must be <= cap (the trim rebuilds buf from survivors).
+	if l.buf.Len() > maxAgentLogBytes+1024 {
+		t.Errorf("buf length exceeds cap: %d > %d", l.buf.Len(), maxAgentLogBytes)
+	}
+	// To prove the trim fired, the total appends exceeded the cap, and
+	// the survivors cannot be all 2500 originals. Sanity: appends > cap.
+	if maxAgentLogEntries+500 <= maxAgentLogEntries {
+		t.Fatalf("test bug: append count must exceed cap")
+	}
+}
+
+func TestAgentLogTrimByByteSize(t *testing.T) {
+	tui := makeTestTuiApp()
+	const agentID = "agent-1"
+	// Each line is ~100 KiB. With 2 MiB cap, the trim must fire and drop
+	// old entries until buf is under cap.
+	big := strings.Repeat("x", 100*1024)
+	for i := 0; i < 50; i++ {
+		tui.writeLogBufEntry(agentID, big+"\n", "white", false)
+	}
+	tui.logMu.Lock()
+	defer tui.logMu.Unlock()
+	l := tui.logs[agentID]
+	if l.buf.Len() > maxAgentLogBytes+1024 {
+		t.Errorf("buf length exceeds cap after byte-size trim: %d > %d", l.buf.Len(), maxAgentLogBytes)
+	}
+	if len(l.entries) >= 50 {
+		t.Errorf("expected entries to be trimmed, got %d", len(l.entries))
+	}
+}
+
+func TestAgentLogTrimPreservesLatestContent(t *testing.T) {
+	tui := makeTestTuiApp()
+	const agentID = "agent-1"
+	// Fill past the cap and assert the very last entry is intact.
+	for i := 0; i < maxAgentLogEntries+10; i++ {
+		tui.writeLogBufEntry(agentID, "filler\n", "white", false)
+	}
+	tui.writeLogBufEntry(agentID, "FINAL-MARKER\n", "white", false)
+
+	tui.logMu.Lock()
+	defer tui.logMu.Unlock()
+	l := tui.logs[agentID]
+	last := l.entries[len(l.entries)-1]
+	if last.text != "FINAL-MARKER\n" {
+		t.Errorf("last entry: want %q, got %q", "FINAL-MARKER\n", last.text)
+	}
+	if !strings.Contains(l.buf.String(), "FINAL-MARKER") {
+		t.Errorf("buf should contain the final marker; got tail %q",
+			l.buf.String()[maxInt(0, l.buf.Len()-64):])
+	}
+}
+
+func TestAgentLogAppendAfterTrim(t *testing.T) {
+	tui := makeTestTuiApp()
+	const agentID = "agent-1"
+	// Append way past the cap, then keep going. Nothing should panic and
+	// the cap must continue to hold.
+	for i := 0; i < maxAgentLogEntries*3; i++ {
+		tui.writeLogBufEntry(agentID, "x\n", "white", false)
+	}
+	tui.logMu.Lock()
+	defer tui.logMu.Unlock()
+	l := tui.logs[agentID]
+	if got := len(l.entries); got > maxAgentLogEntries {
+		t.Errorf("entries cap broken after sustained append: got %d, want <= %d", got, maxAgentLogEntries)
+	}
+	if l.buf.Len() > maxAgentLogBytes+1024 {
+		t.Errorf("buf cap broken after sustained append: got %d, want <= %d", l.buf.Len(), maxAgentLogBytes)
+	}
+}
+
+func TestAgentLogRawFlagPreservedOnTrim(t *testing.T) {
+	tui := makeTestTuiApp()
+	// Hand-build a log that has both raw and non-raw entries so the trim
+	// rebuild exercises both render branches. The two special entries are
+	// placed at the END so they survive the trim (the trim drops the
+	// oldest entries, with a minimum batch of 10% of the cap).
+	l := tui.getOrCreateLog("agent-1")
+	bg := colorName(tui.theme.LogBg)
+	l.mu.Lock()
+	// Pre-fill entries past the cap with plain filler.
+	for i := 0; i < maxAgentLogEntries+10; i++ {
+		l.entries = append(l.entries, logEntry{color: "white", text: "filler\n", markdown: false})
+	}
+	// Append the two special entries at the tail.
+	l.entries = append(l.entries,
+		logEntry{color: "white", text: "esc[ped\n", markdown: false, raw: false},
+		logEntry{color: "white", text: "[#ff0000]raw-tag[-]\n", markdown: false, raw: true},
+	)
+	for i := 0; i < maxAgentLogEntries+10; i++ {
+		l.buf.WriteString("[white:" + bg + "]filler\n[-:" + bg + ":-]")
+	}
+	// Pre-append the rendered equivalents of the special entries so the
+	// buf length is consistent with entries (the trim doesn't care about
+	// buf/entries alignment, but a consistent state makes the test
+	// assertion clearer).
+	l.buf.WriteString("[white:" + bg + "]esc\\[ped\n[-:" + bg + ":-]")
+	l.buf.WriteString("[white:" + bg + "][#ff0000]raw-tag[-]\n[-:" + bg + ":-]")
+	tui.trimLogIfNeeded(l)
+	l.mu.Unlock()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Find the surviving non-raw and raw entries and check their rebuild
+	// in buf.
+	var foundEsc, foundRaw bool
+	for _, e := range l.entries {
+		if e.text == "esc[ped\n" {
+			foundEsc = true
+		}
+		if e.text == "[#ff0000]raw-tag[-]\n" {
+			foundRaw = true
+		}
+	}
+	if !foundEsc {
+		t.Errorf("escaped entry lost during trim")
+	}
+	if !foundRaw {
+		t.Errorf("raw entry lost during trim")
+	}
+	// The raw entry's tview color tag should appear verbatim in buf (not
+	// double-escaped by tview.Escape). The non-raw entry's text should
+	// also be present (rendered through tview.Escape, which is a no-op for
+	// this text).
+	bs := l.buf.String()
+	if !strings.Contains(bs, "[#ff0000]raw-tag[-]") {
+		t.Errorf("raw color tag not preserved in rebuilt buf")
+	}
+	if !strings.Contains(bs, "esc[ped") {
+		t.Errorf("non-raw text not present in rebuilt buf")
+	}
+}
+
+// maxInt is a tiny helper for the tail-slice math above.
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

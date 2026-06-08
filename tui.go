@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,7 +23,7 @@ import (
 	"github.com/yuin/goldmark/extension"
 	extast "github.com/yuin/goldmark/extension/ast"
 	"github.com/yuin/goldmark/text"
-	"golang.org/x/net/html"
+	xhtml "golang.org/x/net/html"
 )
 
 // spinnerFrames are cycled per-frame while a top-level agent is busy.
@@ -34,6 +36,15 @@ var markdownParser = goldmark.New(
 // commandPickerHeight is the fixed height of the command autocomplete dropdown.
 const commandPickerHeight = 12
 
+// Per-agent log cap. Bounds the in-memory log buffer so the TUI's per-event
+// SetText(buf.String()) copy cannot grow without limit across a long session.
+// 2000 entries / 2 MiB is large enough to scroll back through several minutes
+// of context, small enough to keep heap stable during "wait for tool result".
+const (
+	maxAgentLogEntries = 2000
+	maxAgentLogBytes   = 2 << 20
+)
+
 type agentLog struct {
 	mu       sync.Mutex
 	entries  []logEntry
@@ -45,6 +56,7 @@ type logEntry struct {
 	color    string
 	text     string
 	markdown bool // true only for assistant content; renders markdown markup
+	raw      bool // true if text was written via appendRawLog (no tview.Escape)
 }
 
 // tuiAgent holds all per-agent state for a top-level TUI agent.
@@ -87,59 +99,112 @@ type tuiTheme struct {
 	LogUserInput   string
 	LogBg          tcell.Color
 	InputBg        tcell.Color
+	InputFg        tcell.Color // typed text in the input panel
+	InputLabel     tcell.Color // "> " / "[busy] " prompt label
+	InputTitle     tcell.Color // " Input -> Agent 1 " title
+	InputPlacehold tcell.Color // placeholder text in filter inputs
 	StatusBarBg    tcell.Color
+	StatusBarFg    tcell.Color // text on the status bar
+	TitleColor     tcell.Color // bordered widget titles (" Agents ", " Agent 1 ", …)
+	// List widget colors (command picker, skill picker, session resume, etc.)
+	ListMain      tcell.Color
+	ListSecondary tcell.Color
+	ListSelFg     tcell.Color
+	ListSelBg     tcell.Color
+	// PlaceholderText is the colour for the "[darkgray]Select an agent…" prompt
+	// shown in an empty log view. Defaults to LogContent.
+	PlaceholderText string
 }
 
 func newDarkTheme() tuiTheme {
 	return tuiTheme{
-		ActiveBorder:   tcell.ColorAqua,
-		InactiveBorder: tcell.ColorGray,
-		AgentBusy:      tcell.ColorYellow,
-		AgentIdle:      tcell.ColorWhite,
-		AgentPending:   tcell.ColorGray,
-		AgentCompleted: tcell.ColorGreen,
-		AgentFailed:    tcell.ColorRed,
-		AgentCancelled: tcell.ColorDarkGray,
-		TreeSelectedBg: tcell.ColorNavy,
-		TreeSelectedFg: tcell.ColorWhite,
-		LogContent:     "white",
-		LogTool:        "cyan",
-		LogError:       "red",
-		LogSystem:      "yellow",
-		LogUserInput:   "aqua::b",
-		LogBg:          tcell.ColorBlack,
-		InputBg:        tcell.ColorNavy,
-		StatusBarBg:    tcell.ColorDarkSlateGray,
+		ActiveBorder:    tcell.ColorAqua,
+		InactiveBorder:  tcell.ColorGray,
+		AgentBusy:       tcell.ColorYellow,
+		AgentIdle:       tcell.ColorWhite,
+		AgentPending:    tcell.ColorGray,
+		AgentCompleted:  tcell.ColorGreen,
+		AgentFailed:     tcell.ColorRed,
+		AgentCancelled:  tcell.ColorDarkGray,
+		TreeSelectedBg:  tcell.ColorNavy,
+		TreeSelectedFg:  tcell.ColorWhite,
+		LogContent:      "white",
+		LogTool:         "dodgerblue",
+		LogError:        "red",
+		LogSystem:       "yellow",
+		LogUserInput:    "aqua::b",
+		LogBg:           tcell.ColorBlack,
+		InputBg:         tcell.ColorNavy,
+		InputFg:         tcell.ColorWhite,
+		InputLabel:      tcell.ColorAqua,
+		InputTitle:      tcell.ColorAqua,
+		InputPlacehold:  tcell.ColorDarkGray,
+		StatusBarBg:     tcell.ColorDarkSlateGray,
+		StatusBarFg:     tcell.ColorWhite,
+		TitleColor:      tcell.ColorWhite,
+		ListMain:        tcell.ColorWhite,
+		ListSecondary:   tcell.ColorDarkGray,
+		ListSelFg:       tcell.ColorBlack,
+		ListSelBg:       tcell.ColorAqua,
+		PlaceholderText: "darkgray",
 	}
 }
 
 func newLightTheme() tuiTheme {
 	return tuiTheme{
-		ActiveBorder:   tcell.ColorBlue,
-		InactiveBorder: tcell.ColorDarkGray,
-		AgentBusy:      tcell.ColorOlive,
-		AgentIdle:      tcell.ColorBlack,
-		AgentPending:   tcell.ColorDarkGray,
-		AgentCompleted: tcell.ColorDarkGreen,
-		AgentFailed:    tcell.ColorMaroon,
-		AgentCancelled: tcell.ColorGray,
-		TreeSelectedBg: tcell.ColorBlue,
-		TreeSelectedFg: tcell.ColorWhite,
-		LogContent:     "black",
-		LogTool:        "teal",
-		LogError:       "maroon",
-		LogSystem:      "olive",
-		LogUserInput:   "navy::b",
-		LogBg:          tcell.ColorWhite,
-		InputBg:        tcell.ColorLightBlue,
-		StatusBarBg:    tcell.ColorSilver,
+		ActiveBorder:    tcell.ColorBlue,
+		InactiveBorder:  tcell.ColorDarkGray,
+		AgentBusy:       tcell.ColorDarkOrange,
+		AgentIdle:       tcell.ColorBlack,
+		AgentPending:    tcell.ColorDarkGray,
+		AgentCompleted:  tcell.ColorDarkGreen,
+		AgentFailed:     tcell.ColorDarkRed,
+		AgentCancelled:  tcell.ColorDimGray,
+		TreeSelectedBg:  tcell.ColorBlue,
+		TreeSelectedFg:  tcell.ColorWhite,
+		LogContent:      "black",
+		LogTool:         "purple",
+		LogError:        "red",
+		LogSystem:       "darkorange",
+		LogUserInput:    "navy::b",
+		LogBg:           tcell.ColorWhite,
+		InputBg:         tcell.ColorLightBlue,
+		InputFg:         tcell.ColorBlack,
+		InputLabel:      tcell.ColorNavy,
+		InputTitle:      tcell.ColorNavy,
+		InputPlacehold:  tcell.ColorDarkGray,
+		StatusBarBg:     tcell.ColorSilver,
+		StatusBarFg:     tcell.ColorBlack,
+		TitleColor:      tcell.ColorBlack,
+		ListMain:        tcell.ColorBlack,
+		ListSecondary:   tcell.ColorDarkGray,
+		ListSelFg:       tcell.ColorWhite,
+		ListSelBg:       tcell.ColorBlue,
+		PlaceholderText: "darkgray",
 	}
 }
 
-// detectTheme checks COLORFGBG env var. Format is "fg;bg" where bg is
-// a color number. Values >= 8 are typically light themes.
-// Falls back to dark if detection fails.
-func detectTheme() tuiTheme {
+// detectTheme checks env vars for light/dark preference. Order of precedence:
+//  1. override ("light" or "dark") — from --theme flag
+//  2. CAPELIN_THEME env var
+//  3. COLORFGBG env var (last segment = bg; >= 8 → light)
+//  4. macOS system appearance (AppleInterfaceStyle defaults read)
+//  5. Falls back to dark.
+func detectTheme(override string) tuiTheme {
+	if override == "light" {
+		return newLightTheme()
+	}
+	if override == "dark" {
+		return newDarkTheme()
+	}
+
+	switch strings.ToLower(os.Getenv("CAPELIN_THEME")) {
+	case "light":
+		return newLightTheme()
+	case "dark":
+		return newDarkTheme()
+	}
+
 	fgbg := os.Getenv("COLORFGBG")
 	if fgbg != "" {
 		parts := strings.Split(fgbg, ";")
@@ -151,7 +216,22 @@ func detectTheme() tuiTheme {
 			}
 		}
 	}
+
+	if isMacOSLightMode() {
+		return newLightTheme()
+	}
+
 	return newDarkTheme()
+}
+
+// isMacOSLightMode returns true when the macOS system appearance is Light.
+// On non-macOS platforms it always returns false.
+func isMacOSLightMode() bool {
+	out, err := exec.Command("defaults", "read", "-g", "AppleInterfaceStyle").Output()
+	if err != nil {
+		return runtime.GOOS == "darwin" // macOS without key = Light mode
+	}
+	return strings.TrimSpace(string(out)) != "Dark"
 }
 
 type panelID int
@@ -204,6 +284,11 @@ type tuiApp struct {
 	// lastEscAt is used for double-Esc to clear the input field.
 	lastEscAt time.Time
 
+	// globalEscCount and globalEscAt track consecutive Esc presses globally
+	// for triple-Esc agent cancel (500ms window).
+	globalEscCount int
+	globalEscAt    time.Time
+
 	// spinnerFrame is incremented every 150 ms while any agent is busy,
 	// driving the Braille spinner icon in the agents panel.
 	spinnerFrame atomic.Int32
@@ -222,9 +307,9 @@ type tuiApp struct {
 
 	// treeDirty signals that the agent tree needs to be rebuilt on the next
 	// ticker fire. Set when agents are created/removed or subagent state changes.
-	treeDirty     atomic.Bool
-	lastSubnodes  atomic.Value // stores []tuiAgentNode for change detection
-	needsUpdate   chan struct{} // buffered(1); signals the update loop to wake
+	treeDirty    atomic.Bool
+	lastSubnodes atomic.Value  // stores []tuiAgentNode for change detection
+	needsUpdate  chan struct{} // buffered(1); signals the update loop to wake
 
 	// input history for Up/Down navigation
 	inputHistory    []string
@@ -241,15 +326,15 @@ func (s *tuiSink) WriteContent(agentID, content string) {
 }
 
 func (s *tuiSink) WriteToolCall(agentID, toolName, args string) {
-	s.tui.appendLog(agentID, fmt.Sprintf("[tool] %s(%s)\n", toolName, args), s.tui.theme.LogTool+"::d")
+	s.tui.appendToolLog(agentID, fmt.Sprintf("[tool] %s(%s)\n", toolName, args))
 }
 
 func (s *tuiSink) WriteToolResult(agentID, toolName string, isError bool, detail string) {
 	if isError {
-		s.tui.appendLog(agentID, fmt.Sprintf("[tool] %s error: %s\n", toolName, detail), s.tui.theme.LogError+"::d")
+		s.tui.appendLog(agentID, fmt.Sprintf("[tool] %s error: %s\n", toolName, detail), s.tui.theme.LogError)
 		return
 	}
-	s.tui.appendLog(agentID, fmt.Sprintf("[tool] %s done\n", toolName), s.tui.theme.LogTool+"::d")
+	s.tui.appendToolLog(agentID, fmt.Sprintf("[tool] %s done\n", toolName))
 }
 
 func (s *tuiSink) WriteSystem(agentID, msg string) {
@@ -285,6 +370,9 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 	tui.agentTree.SetBorder(true)
 	tui.agentTree.SetTitle(" Agents ")
 	tui.agentTree.SetBorderColor(theme.InactiveBorder)
+	tui.agentTree.SetBackgroundColor(theme.LogBg)
+	tui.agentTree.SetTitleColor(theme.TitleColor)
+	tui.agentTree.SetGraphicsColor(theme.InactiveBorder)
 
 	// --- Log / messages panel (right 4/5) ---
 	tui.logView = tview.NewTextView()
@@ -295,6 +383,15 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 	tui.logView.SetTitle(" Agent 1 ")
 	tui.logView.SetBorderColor(theme.InactiveBorder)
 	tui.logView.SetBackgroundColor(theme.LogBg)
+	tui.logView.SetTitleColor(theme.TitleColor)
+	// Default text style: tview ships with fg=ColorWhite which is invisible on
+	// the white light-theme LogBg. Use a style whose foreground matches the
+	// theme's content color so un-tagged text remains readable; tview color
+	// tags still override fg/bg per rune.
+	tui.logView.SetTextStyle(tcell.StyleDefault.
+		Foreground(tcell.ColorNames[theme.LogContent]).
+		Background(theme.LogBg).
+		Bold(false))
 
 	// --- Input panel (full width, bottom) ---
 	tui.inputField = tview.NewTextArea()
@@ -303,6 +400,20 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 	tui.inputField.SetBorder(true)
 	tui.inputField.SetTitle(" Input -> Agent 1 ")
 	tui.inputField.SetBorderColor(theme.ActiveBorder) // starts focused
+	tui.inputField.SetTitleColor(theme.InputTitle)
+	tui.inputField.SetWrap(true) // word wrap enabled
+	// TextArea's text style defaults to white-on-black, which paints an opaque
+	// black box inside the (light blue) panel — visible but jarring. Override
+	// the style so the typed text matches the theme on the InputBg background.
+	tui.inputField.SetTextStyle(tcell.StyleDefault.
+		Foreground(theme.InputFg).
+		Background(theme.InputBg))
+	tui.inputField.SetPlaceholderStyle(tcell.StyleDefault.
+		Foreground(theme.InputPlacehold).
+		Background(theme.InputBg))
+	tui.inputField.SetLabelStyle(tcell.StyleDefault.
+		Foreground(theme.InputLabel).
+		Background(theme.InputBg))
 
 	// --- Command autocomplete list (hidden until auto-triggered by /<partial>) ---
 	tui.commandList = tview.NewList()
@@ -310,6 +421,12 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 	tui.commandList.SetBorder(true)
 	tui.commandList.SetTitle(" Commands  [Esc] cancel ")
 	tui.commandList.SetBorderColor(theme.ActiveBorder)
+	tui.commandList.SetBackgroundColor(theme.LogBg)
+	tui.commandList.SetTitleColor(theme.TitleColor)
+	tui.commandList.SetMainTextColor(theme.ListMain)
+	tui.commandList.SetSecondaryTextColor(theme.ListSecondary)
+	tui.commandList.SetSelectedTextColor(theme.ListSelFg)
+	tui.commandList.SetSelectedBackgroundColor(theme.ListSelBg)
 	tui.commandList.SetSelectedFunc(func(_ int, name, _ string, _ rune) {
 		tui.inputField.SetText(name, true)
 		tui.dismissCommandPicker()
@@ -349,15 +466,23 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 	})
 
 	// --- Status bar (1 row, no border) ---
+	// TextView defaults to white text, which is invisible on the light-theme
+	// silver StatusBarBg. Set an explicit text style so status hints are
+	// readable in both themes; tview color tags still override per rune.
+	statusTextStyle := tcell.StyleDefault.
+		Foreground(theme.StatusBarFg).
+		Background(theme.StatusBarBg)
 	tui.statusBar = tview.NewTextView()
 	tui.statusBar.SetDynamicColors(true)
 	tui.statusBar.SetBackgroundColor(theme.StatusBarBg)
+	tui.statusBar.SetTextStyle(statusTextStyle)
 	tui.updateStatusBar()
 
 	// --- CWD display (right side of status bar row) ---
 	tui.statusCWD = tview.NewTextView()
 	tui.statusCWD.SetDynamicColors(true)
 	tui.statusCWD.SetBackgroundColor(theme.StatusBarBg)
+	tui.statusCWD.SetTextStyle(statusTextStyle)
 	tui.statusCWD.SetTextAlign(tview.AlignRight)
 	cwd := a.cfg.workspaceRoot
 	if cwd == "" {
@@ -376,6 +501,7 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 	tui.statusModel = tview.NewTextView()
 	tui.statusModel.SetDynamicColors(true)
 	tui.statusModel.SetBackgroundColor(theme.StatusBarBg)
+	tui.statusModel.SetTextStyle(statusTextStyle)
 	tui.statusModel.SetTextAlign(tview.AlignRight)
 	modelDisplay := " " + a.cfg.model + " "
 	tui.statusModel.SetText(modelDisplay)
@@ -501,18 +627,14 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 
 	// --- Input field keyboard: Enter submits; Esc unmaximizes; double-Esc clears ---
 	tui.inputField.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEnter && event.Modifiers() == tcell.ModNone {
-			// Submit
+		if event.Key() == tcell.KeyEnter {
+			// Enter or Ctrl+Enter: submit
 			text := strings.TrimSpace(tui.inputField.GetText())
 			tui.inputField.SetText("", false)
 			if text != "" {
 				tui.submitInputText(text)
 			}
 			return nil
-		}
-		if event.Key() == tcell.KeyEnter && event.Modifiers() == tcell.ModShift {
-			// Shift+Enter: insert newline via default handler
-			return event
 		}
 		// PgUp/PgDn while input is focused scrolls the log panel.
 		if event.Key() == tcell.KeyPgUp {
@@ -525,8 +647,8 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 			tui.updateMoreIndicator()
 			return nil
 		}
-		// Up/Down: navigate input history.
-		if event.Key() == tcell.KeyUp {
+		// Ctrl+Up/Ctrl+Down: navigate input history. Plain Up/Down: cursor movement.
+		if event.Key() == tcell.KeyUp && event.Modifiers()&tcell.ModCtrl != 0 {
 			if len(tui.inputHistory) == 0 {
 				return nil
 			}
@@ -540,7 +662,7 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 			tui.inputField.SetText(txt, true)
 			return nil
 		}
-		if event.Key() == tcell.KeyDown {
+		if event.Key() == tcell.KeyDown && event.Modifiers()&tcell.ModCtrl != 0 {
 			if len(tui.inputHistory) == 0 || tui.inputHistoryPos == -1 {
 				return nil
 			}
@@ -555,8 +677,10 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 			return nil
 		}
 		if event.Key() == tcell.KeyCtrlJ {
-			// Ctrl+J: insert newline via default handler
-			return event
+			// Ctrl+J: insert newline at cursor position
+			_, pos, _ := tui.inputField.GetSelection()
+			tui.inputField.Replace(pos, pos, "\n")
+			return nil
 		}
 		if event.Key() == tcell.KeyEscape {
 			if tui.commandPickerActive {
@@ -603,7 +727,7 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 	tui.normalLayout = tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(topFlex, 0, 1, false).
-		AddItem(tui.inputField, 3, 0, false).
+		AddItem(tui.inputField, 4, 0, false).
 		AddItem(statusFlex, 1, 0, false)
 
 	// searchField + searchBar row for search mode (F4).
@@ -611,10 +735,22 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 		SetLabel(" Search: ").
 		SetFieldWidth(0)
 	tui.searchField.SetBorder(false)
+	// InputField also defaults to white text — make it readable on the search
+	// bar background regardless of theme.
+	tui.searchField.SetFieldStyle(tcell.StyleDefault.
+		Foreground(theme.InputFg).
+		Background(theme.LogBg))
+	tui.searchField.SetPlaceholderTextColor(theme.InputPlacehold)
+	tui.searchField.SetLabelStyle(tcell.StyleDefault.
+		Foreground(theme.InputLabel).
+		Background(theme.LogBg))
 	tui.searchBar = tview.NewFlex().
 		SetDirection(tview.FlexColumn).
 		AddItem(tui.searchField, 0, 1, true)
 	tui.searchBar.SetBorder(true).SetTitle(" F4 Search  Enter/Tab: next  Shift+Tab: prev  Esc: close ")
+	tui.searchBar.SetBackgroundColor(theme.LogBg)
+	tui.searchBar.SetBorderColor(theme.InactiveBorder)
+	tui.searchBar.SetTitleColor(theme.TitleColor)
 	tui.searchLayout = tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(topFlex, 0, 1, false).
@@ -658,7 +794,7 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 }
 
 func (a *app) runTUI(ctx context.Context) error {
-	theme := detectTheme()
+	theme := detectTheme(a.cfg.theme)
 	tui := newTuiApp(a, theme)
 	a.sink = &tuiSink{tui: tui}
 	sysPrompt := a.systemPromptWithSkills()
@@ -683,12 +819,12 @@ func (a *app) runTUI(ctx context.Context) error {
 		// if the file is missing or all sessions fail to load.
 		tui.restoreLastWorkspace()
 		if len(tui.topAgents) == 0 {
-			tui.logView.SetText("[gray]Select an agent from the panel, or type a message here to start a new Agent.[-::-]")
+			tui.logView.SetText(fmt.Sprintf("[%s]Select an agent from the panel, or type a message here to start a new Agent.[-:%s:-]", tui.theme.PlaceholderText, colorName(tui.theme.LogBg)))
 			tui.updateMoreIndicator()
 		}
 	} else {
 		// No initial query: show root placeholder, user creates the first agent by typing.
-		tui.logView.SetText("[gray]Select an agent from the panel, or type a message here to start a new Agent.[-::-]")
+		tui.logView.SetText(fmt.Sprintf("[%s]Select an agent from the panel, or type a message here to start a new Agent.[-:%s:-]", tui.theme.PlaceholderText, colorName(tui.theme.LogBg)))
 		tui.updateMoreIndicator()
 	}
 	return tui.run(ctx)
@@ -745,16 +881,20 @@ func (t *tuiApp) run(ctx context.Context) error {
 		t.app.Stop()
 	}()
 	// Rebuild agent tree + advance busy spinner when signaled.
-	// Blocks on needsUpdate when idle (zero CPU); uses a timer for spinner
-	// animation only while at least one agent is busy.
+	// Blocks on needsUpdate when idle (zero CPU); also selects on a
+	// spinner timer while at least one agent is busy so the Braille
+	// icon cycles at ~6.7 Hz.
 	go func() {
 		t.lastSubnodes.Store([]tuiAgentNode(nil))
+		var spinnerC <-chan time.Time
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.needsUpdate:
+			case <-spinnerC:
 			}
+			spinnerC = nil
 
 			// Advance spinner frame when any top-level agent is busy.
 			t.agentsMu.Lock()
@@ -772,6 +912,7 @@ func (t *tuiApp) run(ctx context.Context) error {
 			t.agentsMu.Unlock()
 			if anyBusy {
 				t.spinnerFrame.Add(1)
+				spinnerC = time.After(150 * time.Millisecond)
 			}
 
 			// Check if subagent state has changed.
@@ -796,17 +937,6 @@ func (t *tuiApp) run(ctx context.Context) error {
 			t.app.QueueUpdateDraw(func() {
 				t.rebuildAgentTree(topLevel, subNodes)
 			})
-
-			// If agents are busy, schedule next spinner tick after 150ms.
-			// Otherwise loop back to blocking on needsUpdate (idle = zero CPU).
-			if anyBusy {
-				select {
-				case <-ctx.Done():
-					return
-				case <-t.needsUpdate:
-				case <-time.After(150 * time.Millisecond):
-				}
-			}
 		}
 	}()
 	return t.app.Run()
@@ -911,6 +1041,7 @@ func (t *tuiApp) processQueueForAgent(agent *tuiAgent) {
 	}
 	agent.busy = false
 	agent.queueMu.Unlock()
+	t.treeDirty.Store(true)
 	t.signalUpdate()
 	t.app.QueueUpdateDraw(func() {
 		if t.currentSelectedAgent() == agent.id {
@@ -1081,16 +1212,15 @@ func (t *tuiApp) replayMessagesToLogBuf(agentID string, msgs []apiMessage) {
 				t.writeMarkdownLogBuf(agentID, m.Content+"\n", t.theme.LogContent)
 			}
 			for _, tc := range m.ToolCalls {
-				t.writeLogBuf(agentID,
-					fmt.Sprintf("[tool] %s(%s)\n", tc.Function.Name, tc.Function.Arguments),
-					t.theme.LogTool+"::d")
+				t.writeToolLogBuf(agentID,
+					fmt.Sprintf("[tool] %s(%s)\n", tc.Function.Name, tc.Function.Arguments))
 			}
 		case "tool":
 			name := m.Name
 			if name == "" {
 				name = m.ToolCallID
 			}
-			t.writeLogBuf(agentID, fmt.Sprintf("[tool] %s done\n", name), t.theme.LogTool+"::d")
+			t.writeToolLogBuf(agentID, fmt.Sprintf("[tool] %s done\n", name))
 		}
 	}
 }
@@ -1134,7 +1264,7 @@ func (t *tuiApp) topLevelAgentNodeText(agent *tuiAgent) (string, tcell.Color) {
 		frame := int(t.spinnerFrame.Load()) % len(spinnerFrames)
 		return spinnerFrames[frame] + " " + label, t.theme.AgentBusy
 	}
-	return "◌ " + label, t.theme.AgentIdle
+	return "○ " + label, t.theme.AgentIdle
 }
 
 // agentNodeLabel returns the display label for an agent given its number and optional name.
@@ -1247,8 +1377,30 @@ func (t *tuiApp) handleGlobalKeys(event *tcell.EventKey) *tcell.EventKey {
 		return nil
 	}
 
-	// Escape: exit focus mode or restore from maximize.
+	// Escape: triple-Esc cancels agent; double-Esc exits maximize/focus mode.
 	if event.Key() == tcell.KeyEscape {
+		now := time.Now()
+		if now.Sub(t.globalEscAt) < 500*time.Millisecond {
+			t.globalEscCount++
+		} else {
+			t.globalEscCount = 1
+		}
+		t.globalEscAt = now
+
+		// Triple Esc: cancel agent
+		if t.globalEscCount >= 3 {
+			selected := t.currentSelectedAgent()
+			if selected != tuiRootRef {
+				if err := t.cancelAgent(selected); err == nil {
+					go t.appendLog(selected, "[capelin-go] canceled\n", t.theme.LogSystem)
+				}
+				t.updateStatusBar()
+				t.globalEscCount = 0
+				return nil
+			}
+			t.globalEscCount = 0
+		}
+
 		if t.maximized != panelNone {
 			t.maximized = panelNone
 			t.applyLayout()
@@ -1259,6 +1411,11 @@ func (t *tuiApp) handleGlobalKeys(event *tcell.EventKey) *tcell.EventKey {
 			t.focusMode = false
 			t.updateStatusBar()
 			return nil
+		}
+	} else {
+		// Reset Esc count on any non-Esc key press.
+		if event.Key() != tcell.KeyEscape {
+			t.globalEscCount = 0
 		}
 	}
 
@@ -1342,6 +1499,7 @@ func (t *tuiApp) applyLayout() {
 			t.setFocus(t.focusedPanel)
 		}
 	}
+	t.updateLogViewBorder()
 }
 
 // openSearch switches to search mode, showing the search bar.
@@ -1569,9 +1727,9 @@ func (t *tuiApp) updateSearchStatusBar(query string) {
 }
 
 func (t *tuiApp) updateStatusBar() {
-	text := " F1: switch panels | F2: input | F3: hide menu | F4: search | F12: focus mode | Ctrl+E: copy mode | /quit to exit"
+	text := " Enter: submit | Ctrl+J: newline | Triple Esc: cancel | F1: switch | F3: hide menu | F4: search | F12: focus | Ctrl+E: copy | /quit"
 	if t.menuHidden {
-		text = " [menu hidden] F3: show menu | F2: input | F4: search | F12: focus mode | Ctrl+E: copy mode | /quit to exit"
+		text = " [menu hidden] Enter: submit | Ctrl+J: newline | Triple Esc: cancel | F3: show menu | F4: search | F12: focus | Ctrl+E: copy | /quit"
 	}
 	if t.searchMode {
 		t.updateSearchStatusBar(t.searchField.GetText())
@@ -1603,6 +1761,17 @@ func (t *tuiApp) toggleMenuPanel() {
 	} else {
 		// Show: restore proportion 1 (log keeps proportion 4).
 		t.topFlex.ResizeItem(t.agentTree, 0, 1)
+	}
+	t.updateLogViewBorder()
+}
+
+// updateLogViewBorder sets the log panel border based on the current state.
+// Border is removed when menu is hidden or log is maximized (either condition).
+func (t *tuiApp) updateLogViewBorder() {
+	if t.menuHidden || t.maximized == panelLog {
+		t.logView.SetBorder(false)
+	} else {
+		t.logView.SetBorder(true)
 	}
 }
 
@@ -1686,6 +1855,48 @@ func (t *tuiApp) getLogPlainText(agentID string) string {
 	return out.String()
 }
 
+// trimLogIfNeeded enforces maxAgentLogEntries / maxAgentLogBytes by dropping
+// the oldest entries from both l.entries and l.buf. Triggered from every
+// append path. O(N) on overflow, O(1) amortized per append. Caller must
+// hold l.mu.
+func (t *tuiApp) trimLogIfNeeded(l *agentLog) {
+	if len(l.entries) <= maxAgentLogEntries && l.buf.Len() <= maxAgentLogBytes {
+		return
+	}
+	// Drop in one batch to amortize the rebuild cost. We aim to drop at
+	// least 10% of the cap so the next trim is a while away.
+	drop := len(l.entries) - maxAgentLogEntries
+	if drop < maxAgentLogEntries/10 {
+		drop = maxAgentLogEntries / 10
+	}
+	if drop >= len(l.entries) {
+		// Keep at least one entry so the buffer is never empty mid-session.
+		drop = len(l.entries) - 1
+	}
+	if drop <= 0 {
+		return
+	}
+	// Keep the underlying array of l.entries to avoid an alloc on the
+	// common path. Survivors is a slice that aliases the same array.
+	keep := append([]logEntry(nil), l.entries[drop:]...)
+	l.entries = keep
+	l.buf.Reset()
+	bg := colorName(t.theme.LogBg)
+	for i := range l.entries {
+		e := &l.entries[i]
+		var rendered string
+		switch {
+		case e.markdown:
+			rendered = renderMarkdownText(e.text, e.color, false)
+		case e.raw:
+			rendered = e.text
+		default:
+			rendered = tview.Escape(e.text)
+		}
+		l.buf.WriteString("[" + withBg(e.color, bg) + "]" + rendered + "[-:" + bg + ":-]")
+	}
+}
+
 // writeLogBuf writes directly to the agent's log buffer without triggering a
 // screen update. Safe to call before app.Run() has started.
 func (t *tuiApp) writeLogBuf(agentID, text, color string) {
@@ -1714,6 +1925,7 @@ func (t *tuiApp) writeLogBufEntry(agentID, text, color string, markdown bool) {
 		rendered = tview.Escape(text)
 	}
 	l.buf.WriteString("[" + withBg(color, bg) + "]" + rendered + "[-:" + bg + ":-]")
+	t.trimLogIfNeeded(l)
 	l.mu.Unlock()
 }
 
@@ -1748,6 +1960,23 @@ func (t *tuiApp) appendLog(agentID, text, color string) {
 	t.appendLogEntry(agentID, text, color, false)
 }
 
+// appendToolLog writes a tool-call / tool-result line using the theme's
+// tool colour without any dim attribute. Centralised so the colour and
+// emphasis choice cannot regress at individual call sites — the dim
+// attribute previously used here made darkcyan collapse to near-black
+// on light-theme terminals (see theme_fix.md round 3).
+func (t *tuiApp) appendToolLog(agentID, text string) {
+	t.appendLogEntry(agentID, text, t.theme.LogTool, false)
+}
+
+// writeToolLogBuf is the replay-time sibling of appendToolLog. The two
+// have separate code paths (writeLogBuf feeds the pre-render buffer used
+// for session replay; appendLogEntry feeds the live in-memory buffer),
+// so the centralisation has to live in both helpers.
+func (t *tuiApp) writeToolLogBuf(agentID, text string) {
+	t.writeLogBuf(agentID, text, t.theme.LogTool)
+}
+
 // appendMarkdownLog is like appendLog but renders the text as markdown.
 func (t *tuiApp) appendMarkdownLog(agentID, text, color string) {
 	t.appendLogEntry(agentID, text, color, true)
@@ -1769,6 +1998,7 @@ func (t *tuiApp) appendLogEntry(agentID, text, color string, markdown bool) {
 		rendered = tview.Escape(text)
 	}
 	log.buf.WriteString("[" + withBg(color, bg) + "]" + rendered + "[-:" + bg + ":-]")
+	t.trimLogIfNeeded(log)
 	atBottom := log.atBottom
 	selected := t.selectedAgent
 	if selected == "" {
@@ -1817,7 +2047,7 @@ func (t *tuiApp) selectAgent(id string) {
 		t.logMu.Unlock()
 		text := t.getLogText(tuiRootRef)
 		if text == "" {
-			t.logView.SetText("[gray]Select an agent from the panel, or type a message here to start a new Agent.[-]")
+			t.logView.SetText(fmt.Sprintf("[%s]Select an agent from the panel, or type a message here to start a new Agent.[-:%s:-]", t.theme.PlaceholderText, colorName(t.theme.LogBg)))
 		} else {
 			t.logView.SetText(text)
 			t.logView.ScrollToEnd()
@@ -1897,6 +2127,16 @@ func (t *tuiApp) updateMoreIndicator() {
 
 func (t *tuiApp) rebuildAgentTree(topLevel []*tuiAgent, subNodes []tuiAgentNode) {
 	selStyle := tcell.StyleDefault.Foreground(t.theme.TreeSelectedFg).Background(t.theme.TreeSelectedBg)
+	// All node text styles must carry the panel's LogBg as their background,
+	// otherwise tview's default ColorDefault leaks through and produces a
+	// mismatched (typically black) patch around every node on light terminals.
+	bgStyle := func(fg tcell.Color, bold bool) tcell.Style {
+		s := tcell.StyleDefault.Foreground(fg).Background(t.theme.LogBg)
+		if bold {
+			s = s.Bold(true)
+		}
+		return s
+	}
 
 	// Build subagent nodes map.
 	subNodeMap := map[string]*tview.TreeNode{}
@@ -1906,7 +2146,7 @@ func (t *tuiApp) rebuildAgentTree(topLevel []*tuiAgent, subNodes []tuiAgentNode)
 		tn := tview.NewTreeNode(label)
 		tn.SetReference(n.ID)
 		tn.SetExpanded(true)
-		tn.SetTextStyle(tcell.StyleDefault.Foreground(color))
+		tn.SetTextStyle(bgStyle(color, false))
 		tn.SetSelectedTextStyle(selStyle)
 		subNodeMap[n.ID] = tn
 		subNames[n.ID] = agentDisplayName(n)
@@ -1924,11 +2164,7 @@ func (t *tuiApp) rebuildAgentTree(topLevel []*tuiAgent, subNodes []tuiAgentNode)
 		busy := a.busy
 		aName := a.Name
 		a.queueMu.Unlock()
-		style := tcell.StyleDefault.Foreground(color)
-		if busy {
-			style = style.Bold(true)
-		}
-		tn.SetTextStyle(style)
+		tn.SetTextStyle(bgStyle(color, busy))
 		tn.SetSelectedTextStyle(selStyle)
 		topNodeMap[a.id] = tn
 		topNames[a.id] = agentNodeLabel(a.num, aName)
@@ -1950,6 +2186,8 @@ func (t *tuiApp) rebuildAgentTree(topLevel []*tuiAgent, subNodes []tuiAgentNode)
 	rootNode := tview.NewTreeNode("Agents").
 		SetReference(tuiRootRef).
 		SetExpanded(true)
+	rootNode.SetTextStyle(bgStyle(t.theme.AgentIdle, false))
+	rootNode.SetSelectedTextStyle(selStyle)
 	rootNode.SetSelectedTextStyle(selStyle)
 
 	// Wire top-level agents under root.
@@ -2241,18 +2479,18 @@ func (t *tuiApp) handleSlashCommand(text string) {
 
 	case "/help":
 		var sb strings.Builder
-		sb.WriteString("[yellow]Available commands:[-]\n")
+		sb.WriteString("[darkorange]Available commands:[-]\n")
 		maxLen := 0
 		for _, c := range slashCommands {
 			if l := len(c.name); l > maxLen {
 				maxLen = l
 			}
 		}
-		fmtStr := fmt.Sprintf("  [cyan]%%-%ds[-]  %%s", maxLen+1)
+		fmtStr := fmt.Sprintf("  [darkcyan]%%-%ds[-]  %%s", maxLen+1)
 		for _, c := range slashCommands {
 			sb.WriteString(fmt.Sprintf(fmtStr, c.name, c.description))
 			if c.topLevelOnly {
-				sb.WriteString(" [gray](top-level agent only)[-]")
+				sb.WriteString(" [darkgray](top-level agent only)[-]")
 			}
 			sb.WriteString("\n")
 		}
@@ -2273,9 +2511,10 @@ func (t *tuiApp) appendRawLog(agentID, text, color string) {
 	t.logMu.Lock()
 	log := t.getOrCreateLog(agentID)
 	log.mu.Lock()
-	log.entries = append(log.entries, logEntry{color: color, text: text, markdown: false})
+	log.entries = append(log.entries, logEntry{color: color, text: text, markdown: false, raw: true})
 	bg := colorName(t.theme.LogBg)
 	log.buf.WriteString("[" + withBg(color, bg) + "]" + text + "[-:" + bg + ":-]")
+	t.trimLogIfNeeded(log)
 	atBottom := log.atBottom
 	selected := t.selectedAgent
 	if selected == "" {
@@ -2334,6 +2573,13 @@ func (t *tuiApp) showSkillPicker() {
 
 	list := tview.NewList()
 	list.SetBorder(true).SetTitle(" Select Skill (Enter to select, Esc to cancel) ")
+	list.SetBackgroundColor(t.theme.LogBg)
+	list.SetTitleColor(t.theme.TitleColor)
+	list.SetBorderColor(t.theme.ActiveBorder)
+	list.SetMainTextColor(t.theme.ListMain)
+	list.SetSecondaryTextColor(t.theme.ListSecondary)
+	list.SetSelectedTextColor(t.theme.ListSelFg)
+	list.SetSelectedBackgroundColor(t.theme.ListSelBg)
 
 	type skillEntry struct {
 		name string
@@ -2395,6 +2641,13 @@ func (t *tuiApp) showSkillPicker() {
 	filterInput := tview.NewInputField()
 	filterInput.SetPlaceholder("Type to filter by name or description...")
 	filterInput.SetLabel("/")
+	filterInput.SetFieldStyle(tcell.StyleDefault.
+		Foreground(t.theme.InputFg).
+		Background(t.theme.LogBg))
+	filterInput.SetPlaceholderTextColor(t.theme.InputPlacehold)
+	filterInput.SetLabelStyle(tcell.StyleDefault.
+		Foreground(t.theme.InputLabel).
+		Background(t.theme.LogBg))
 	filterInput.SetChangedFunc(func(text string) {
 		selectedIdx = 0
 		populateList(text)
@@ -2572,7 +2825,13 @@ func (t *tuiApp) showCascadeMenu(steps []cascadeStep, onDone func([]string), onC
 		}
 		list.SetBorder(true)
 		list.SetTitle(fmt.Sprintf(" %s  [Esc] cancel ", step.title))
+		list.SetBackgroundColor(t.theme.LogBg)
+		list.SetTitleColor(t.theme.TitleColor)
 		list.SetBorderColor(t.theme.ActiveBorder)
+		list.SetMainTextColor(t.theme.ListMain)
+		list.SetSecondaryTextColor(t.theme.ListSecondary)
+		list.SetSelectedTextColor(t.theme.ListSelFg)
+		list.SetSelectedBackgroundColor(t.theme.ListSelBg)
 
 		list.SetSelectedFunc(func(i int, _, _ string, _ rune) {
 			if i >= len(items) {
@@ -2999,6 +3258,13 @@ func (t *tuiApp) handleSessionResume(callerAgentID string, uuidPrefix string) {
 	// Build the list from a filtered snapshot slice.
 	list := tview.NewList()
 	list.SetBorder(true).SetTitle(" Resume Session (Enter to open, Esc to cancel) ")
+	list.SetBackgroundColor(t.theme.LogBg)
+	list.SetTitleColor(t.theme.TitleColor)
+	list.SetBorderColor(t.theme.ActiveBorder)
+	list.SetMainTextColor(t.theme.ListMain)
+	list.SetSecondaryTextColor(t.theme.ListSecondary)
+	list.SetSelectedTextColor(t.theme.ListSelFg)
+	list.SetSelectedBackgroundColor(t.theme.ListSelBg)
 
 	var selectedIdx int
 	var filtered []sessionSnapshot
@@ -3041,6 +3307,13 @@ func (t *tuiApp) handleSessionResume(callerAgentID string, uuidPrefix string) {
 	filterInput := tview.NewInputField()
 	filterInput.SetPlaceholder("Type to filter by UUID, name, or content...")
 	filterInput.SetLabel("/")
+	filterInput.SetFieldStyle(tcell.StyleDefault.
+		Foreground(t.theme.InputFg).
+		Background(t.theme.LogBg))
+	filterInput.SetPlaceholderTextColor(t.theme.InputPlacehold)
+	filterInput.SetLabelStyle(tcell.StyleDefault.
+		Foreground(t.theme.InputLabel).
+		Background(t.theme.LogBg))
 	filterInput.SetChangedFunc(func(text string) {
 		selectedIdx = 0
 		populateList(text)
@@ -3230,7 +3503,11 @@ func (t *tuiApp) handleSessionDestroy(agentID string) {
 				if buttonLabel == "Destroy session" {
 					go t.doHandleSessionDestroy(agentID)
 				}
-			})
+			}).
+			SetBackgroundColor(t.theme.LogBg).
+			SetTextColor(t.theme.TitleColor).
+			SetButtonBackgroundColor(t.theme.InputBg).
+			SetButtonTextColor(t.theme.InputFg)
 		t.app.SetRoot(modal, false)
 	})
 }
@@ -3303,7 +3580,11 @@ func (t *tuiApp) handleWorkspaceNew(callerAgentID string) {
 					} else {
 						t.app.SetRoot(t.normalLayout, true).SetFocus(t.inputField)
 					}
-				})
+				}).
+				SetBackgroundColor(t.theme.LogBg).
+				SetTextColor(t.theme.TitleColor).
+				SetButtonBackgroundColor(t.theme.InputBg).
+				SetButtonTextColor(t.theme.InputFg)
 			t.app.SetRoot(modal, false)
 		})
 		return
@@ -3475,6 +3756,12 @@ func (t *tuiApp) handleWorkspacePicker(callerAgentID string) {
 	list := tview.NewList()
 	list.SetBorder(true).SetTitle(" Load Workspace (Enter to load, Esc to cancel) ")
 	list.SetBorderColor(t.theme.ActiveBorder)
+	list.SetBackgroundColor(t.theme.LogBg)
+	list.SetTitleColor(t.theme.TitleColor)
+	list.SetMainTextColor(t.theme.ListMain)
+	list.SetSecondaryTextColor(t.theme.ListSecondary)
+	list.SetSelectedTextColor(t.theme.ListSelFg)
+	list.SetSelectedBackgroundColor(t.theme.ListSelBg)
 	for _, name := range names {
 		snap, err := loadWorkspace(t.owner.cfg.workspaceRoot, name)
 		secondary := "(error loading)"
@@ -4153,15 +4440,15 @@ func isMarkdownTableDividerLine(line string) bool {
 	return hasCell
 }
 
-func renderHTMLToTview(n *html.Node, baseStyle string) string {
+func renderHTMLToTview(n *xhtml.Node, baseStyle string) string {
 	var out strings.Builder
-	var walk func(*html.Node, bool)
+	var walk func(*xhtml.Node, bool)
 
-	walk = func(n *html.Node, inPre bool) {
+	walk = func(n *xhtml.Node, inPre bool) {
 		if n == nil {
 			return
 		}
-		if n.Type == html.TextNode {
+		if n.Type == xhtml.TextNode {
 			text := n.Data
 			if inPre {
 				out.WriteString(tview.Escape(text))
@@ -4178,7 +4465,7 @@ func renderHTMLToTview(n *html.Node, baseStyle string) string {
 			out.WriteByte(' ')
 			return
 		}
-		if n.Type != html.ElementNode {
+		if n.Type != xhtml.ElementNode {
 			for c := n.FirstChild; c != nil; c = c.NextSibling {
 				walk(c, inPre)
 			}
@@ -4292,7 +4579,7 @@ func renderHTMLToTview(n *html.Node, baseStyle string) string {
 		case "ul":
 			out.WriteString("\n")
 			for c := n.FirstChild; c != nil; c = c.NextSibling {
-				if c.Type == html.ElementNode && c.Data == "li" {
+				if c.Type == xhtml.ElementNode && c.Data == "li" {
 					inner := strings.TrimSpace(renderHTMLChildrenToTview(c, baseStyle, inPre))
 					if inner != "" {
 						out.WriteString("- ")
@@ -4309,7 +4596,7 @@ func renderHTMLToTview(n *html.Node, baseStyle string) string {
 			out.WriteString("\n")
 			item := 1
 			for c := n.FirstChild; c != nil; c = c.NextSibling {
-				if c.Type == html.ElementNode && c.Data == "li" {
+				if c.Type == xhtml.ElementNode && c.Data == "li" {
 					inner := strings.TrimSpace(renderHTMLChildrenToTview(c, baseStyle, inPre))
 					if inner != "" {
 						out.WriteString(fmt.Sprintf("%d. %s\n", item, inner))
@@ -4327,7 +4614,7 @@ func renderHTMLToTview(n *html.Node, baseStyle string) string {
 				return
 			}
 			prefix := "- "
-			if n.Parent != nil && n.Parent.Type == html.ElementNode && n.Parent.Data == "ol" {
+			if n.Parent != nil && n.Parent.Type == xhtml.ElementNode && n.Parent.Data == "ol" {
 				prefix = "1. "
 			}
 			out.WriteString(prefix)
@@ -4348,7 +4635,7 @@ func renderHTMLToTview(n *html.Node, baseStyle string) string {
 	return out.String()
 }
 
-func renderHTMLChildrenToTview(n *html.Node, baseStyle string, inPre bool) string {
+func renderHTMLChildrenToTview(n *xhtml.Node, baseStyle string, inPre bool) string {
 	var out strings.Builder
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
 		out.WriteString(renderHTMLNodeToTview(c, baseStyle, inPre))
@@ -4356,11 +4643,11 @@ func renderHTMLChildrenToTview(n *html.Node, baseStyle string, inPre bool) strin
 	return out.String()
 }
 
-func renderHTMLNodeToTview(n *html.Node, baseStyle string, inPre bool) string {
+func renderHTMLNodeToTview(n *xhtml.Node, baseStyle string, inPre bool) string {
 	if n == nil {
 		return ""
 	}
-	if n.Type == html.TextNode {
+	if n.Type == xhtml.TextNode {
 		if inPre {
 			return tview.Escape(n.Data)
 		}
@@ -4373,7 +4660,7 @@ func renderHTMLNodeToTview(n *html.Node, baseStyle string, inPre bool) string {
 		}
 		return tview.Escape(text) + " "
 	}
-	if n.Type != html.ElementNode {
+	if n.Type != xhtml.ElementNode {
 		return renderHTMLChildrenToTview(n, baseStyle, inPre)
 	}
 
@@ -4402,7 +4689,7 @@ func renderHTMLNodeToTview(n *html.Node, baseStyle string, inPre bool) string {
 			return ""
 		}
 		prefix := "- "
-		if n.Parent != nil && n.Parent.Type == html.ElementNode && n.Parent.Data == "ol" {
+		if n.Parent != nil && n.Parent.Type == xhtml.ElementNode && n.Parent.Data == "ol" {
 			prefix = "1. "
 		}
 		return prefix + inner + "\n"
@@ -4410,24 +4697,24 @@ func renderHTMLNodeToTview(n *html.Node, baseStyle string, inPre bool) string {
 	return renderHTMLChildrenToTview(n, baseStyle, inPre)
 }
 
-func renderHTMLTableToTview(n *html.Node, baseStyle string) string {
+func renderHTMLTableToTview(n *xhtml.Node, baseStyle string) string {
 	var rows [][]string
 	var header []string
 
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		if c.Type != html.ElementNode {
+		if c.Type != xhtml.ElementNode {
 			continue
 		}
 		switch c.Data {
 		case "thead":
 			for r := c.FirstChild; r != nil; r = r.NextSibling {
-				if r.Type == html.ElementNode && r.Data == "tr" {
+				if r.Type == xhtml.ElementNode && r.Data == "tr" {
 					header = renderHTMLRowToTview(r, baseStyle)
 				}
 			}
 		case "tbody", "tfoot":
 			for r := c.FirstChild; r != nil; r = r.NextSibling {
-				if r.Type == html.ElementNode && r.Data == "tr" {
+				if r.Type == xhtml.ElementNode && r.Data == "tr" {
 					rows = append(rows, renderHTMLRowToTview(r, baseStyle))
 				}
 			}
@@ -4470,10 +4757,10 @@ func renderHTMLTableToTview(n *html.Node, baseStyle string) string {
 	return out.String()
 }
 
-func renderHTMLRowToTview(n *html.Node, baseStyle string) []string {
+func renderHTMLRowToTview(n *xhtml.Node, baseStyle string) []string {
 	var cells []string
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		if c.Type != html.ElementNode {
+		if c.Type != xhtml.ElementNode {
 			continue
 		}
 		if c.Data == "th" || c.Data == "td" {
@@ -4483,14 +4770,14 @@ func renderHTMLRowToTview(n *html.Node, baseStyle string) []string {
 	return cells
 }
 
-func htmlNodeRawText(n *html.Node) string {
+func htmlNodeRawText(n *xhtml.Node) string {
 	var b strings.Builder
-	var walk func(*html.Node)
-	walk = func(n *html.Node) {
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
 		if n == nil {
 			return
 		}
-		if n.Type == html.TextNode {
+		if n.Type == xhtml.TextNode {
 			b.WriteString(n.Data)
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
@@ -4591,26 +4878,66 @@ func colorName(c tcell.Color) string {
 		return "yellow"
 	case tcell.ColorGreen:
 		return "green"
+	case tcell.ColorLime:
+		return "lime"
 	case tcell.ColorRed:
 		return "red"
+	case tcell.ColorMaroon:
+		return "maroon"
+	case tcell.ColorPurple:
+		return "purple"
+	case tcell.ColorFuchsia:
+		return "fuchsia"
 	case tcell.ColorGray:
 		return "gray"
 	case tcell.ColorDarkGray:
 		return "darkgray"
+	case tcell.ColorDimGray:
+		return "dimgray"
 	case tcell.ColorWhite:
 		return "white"
 	case tcell.ColorBlack:
 		return "black"
 	case tcell.ColorOlive:
 		return "olive"
+	case tcell.ColorTeal:
+		return "teal"
+	case tcell.ColorDarkCyan:
+		return "darkcyan"
+	case tcell.ColorDarkBlue:
+		return "darkblue"
 	case tcell.ColorDarkGreen:
 		return "darkgreen"
-	case tcell.ColorMaroon:
-		return "maroon"
+	case tcell.ColorDarkMagenta:
+		return "darkmagenta"
+	case tcell.ColorDarkOrange:
+		return "darkorange"
+	case tcell.ColorDarkRed:
+		return "darkred"
+	case tcell.ColorDarkViolet:
+		return "darkviolet"
 	case tcell.ColorBlue:
 		return "blue"
 	case tcell.ColorAqua:
 		return "aqua"
+	case tcell.ColorNavy:
+		return "navy"
+	case tcell.ColorSilver:
+		return "silver"
+	case tcell.ColorLightBlue:
+		return "lightblue"
+	case tcell.ColorDarkSlateGray:
+		return "darkslategray"
+	case tcell.ColorLightGray:
+		return "lightgray"
+	case tcell.ColorLightSlateGray:
+		return "lightslategray"
+	case tcell.ColorOrange:
+		return "orange"
+	case tcell.ColorPink:
+		return "pink"
+	case tcell.ColorBrown:
+		return "brown"
 	default:
 		return "white"
 	}

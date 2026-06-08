@@ -1799,37 +1799,243 @@ func TestRootRuntimeCarriesModelAndReasoning(t *testing.T) {
 // "functions." prefix (emitted by some models in legacy OpenAI format) are
 // normalized before validation so they don't produce a spurious error.
 func TestDeriveChildAllowedToolsFunctionsPrefix(t *testing.T) {
-parent := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	parent := map[string]bool{toolWebSearch: true, toolFetchPage: true}
 
-// "functions.web_search" should be accepted and normalized to "web_search".
-child, err := deriveChildAllowedTools(parent, []string{"functions.web_search"}, 0, 2)
-if err != nil {
-t.Fatalf("unexpected error with functions. prefix: %v", err)
-}
-if !child[toolWebSearch] {
-t.Fatalf("expected web_search to be enabled, got %v", child)
-}
-if child["functions.web_search"] {
-t.Fatalf("normalized key should not appear verbatim in child map")
-}
+	// "functions.web_search" should be accepted and normalized to "web_search".
+	child, err := deriveChildAllowedTools(parent, []string{"functions.web_search"}, 0, 2)
+	if err != nil {
+		t.Fatalf("unexpected error with functions. prefix: %v", err)
+	}
+	if !child[toolWebSearch] {
+		t.Fatalf("expected web_search to be enabled, got %v", child)
+	}
+	if child["functions.web_search"] {
+		t.Fatalf("normalized key should not appear verbatim in child map")
+	}
 
-// Unknown name even after stripping prefix should still fail.
-_, err = deriveChildAllowedTools(parent, []string{"functions.not_a_tool"}, 0, 2)
-if err == nil {
-t.Fatal("expected error for unknown tool after prefix strip")
-}
+	// Unknown name even after stripping prefix should still fail.
+	_, err = deriveChildAllowedTools(parent, []string{"functions.not_a_tool"}, 0, 2)
+	if err == nil {
+		t.Fatal("expected error for unknown tool after prefix strip")
+	}
 }
 
 // TestDeriveChildAllowedToolsMixedPrefixes verifies that a mix of plain and
 // prefixed tool names in allowed_tools all normalize correctly.
 func TestDeriveChildAllowedToolsMixedPrefixes(t *testing.T) {
-parent := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	parent := map[string]bool{toolWebSearch: true, toolFetchPage: true}
 
-child, err := deriveChildAllowedTools(parent, []string{"functions.web_search", "fetch_page"}, 0, 2)
-if err != nil {
-t.Fatalf("unexpected error: %v", err)
+	child, err := deriveChildAllowedTools(parent, []string{"functions.web_search", "fetch_page"}, 0, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !child[toolWebSearch] || !child[toolFetchPage] {
+		t.Fatalf("expected both tools enabled, got %v", child)
+	}
 }
-if !child[toolWebSearch] || !child[toolFetchPage] {
-t.Fatalf("expected both tools enabled, got %v", child)
+
+func TestLoadConfigToolDefaults(t *testing.T) {
+	cfg, err := loadConfig([]string{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.toolMaxParallel != defaultToolMaxParallel {
+		t.Errorf("expected toolMaxParallel=%d, got %d", defaultToolMaxParallel, cfg.toolMaxParallel)
+	}
+	if cfg.toolTimeoutSec != defaultToolTimeoutSec {
+		t.Errorf("expected toolTimeoutSec=%d, got %d", defaultToolTimeoutSec, cfg.toolTimeoutSec)
+	}
+	if cfg.toolRetryOnTimeout != defaultToolRetryOnTimeout {
+		t.Errorf("expected toolRetryOnTimeout=%v, got %v", defaultToolRetryOnTimeout, cfg.toolRetryOnTimeout)
+	}
 }
+
+func TestLoadConfigToolFlags(t *testing.T) {
+	cfg, err := loadConfig([]string{
+		"--tool-max-parallel", "12",
+		"--tool-timeout-seconds", "90",
+		"--tool-retry-on-timeout",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.toolMaxParallel != 12 {
+		t.Errorf("expected toolMaxParallel=12, got %d", cfg.toolMaxParallel)
+	}
+	if cfg.toolTimeoutSec != 90 {
+		t.Errorf("expected toolTimeoutSec=90, got %d", cfg.toolTimeoutSec)
+	}
+	if !cfg.toolRetryOnTimeout {
+		t.Errorf("expected toolRetryOnTimeout=true, got false")
+	}
+}
+
+func TestLoadConfigToolFlagsNoRetry(t *testing.T) {
+	cfg, err := loadConfig([]string{
+		"--no-tool-retry-on-timeout",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.toolRetryOnTimeout {
+		t.Errorf("expected toolRetryOnTimeout=false, got true")
+	}
+}
+
+func TestLoadConfigToolEnvVars(t *testing.T) {
+	t.Setenv("TOOL_MAX_PARALLEL", "16")
+	t.Setenv("TOOL_TIMEOUT_SECONDS", "120")
+	t.Setenv("TOOL_RETRY_ON_TIMEOUT", "false")
+	cfg, err := loadConfig([]string{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.toolMaxParallel != 16 {
+		t.Errorf("expected toolMaxParallel=16, got %d", cfg.toolMaxParallel)
+	}
+	if cfg.toolTimeoutSec != 120 {
+		t.Errorf("expected toolTimeoutSec=120, got %d", cfg.toolTimeoutSec)
+	}
+	if cfg.toolRetryOnTimeout {
+		t.Errorf("expected toolRetryOnTimeout=false, got true")
+	}
+}
+
+func TestLoadConfigToolFlagsOverrideEnvVars(t *testing.T) {
+	t.Setenv("TOOL_MAX_PARALLEL", "16")
+	t.Setenv("TOOL_TIMEOUT_SECONDS", "120")
+	t.Setenv("TOOL_RETRY_ON_TIMEOUT", "false")
+	cfg, err := loadConfig([]string{
+		"--tool-max-parallel", "24",
+		"--tool-timeout-seconds", "180",
+		"--tool-retry-on-timeout",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.toolMaxParallel != 24 {
+		t.Errorf("expected toolMaxParallel=24, got %d", cfg.toolMaxParallel)
+	}
+	if cfg.toolTimeoutSec != 180 {
+		t.Errorf("expected toolTimeoutSec=180, got %d", cfg.toolTimeoutSec)
+	}
+	if !cfg.toolRetryOnTimeout {
+		t.Errorf("expected toolRetryOnTimeout=true, got false")
+	}
+}
+
+func TestReadBoolCfg(t *testing.T) {
+	tests := []struct {
+		key      string
+		value    string
+		expected bool
+	}{
+		{"TEST_BOOL", "true", true},
+		{"TEST_BOOL", "1", true},
+		{"TEST_BOOL", "yes", true},
+		{"TEST_BOOL", "on", true},
+		{"TEST_BOOL", "TRUE", true},
+		{"TEST_BOOL", "false", false},
+		{"TEST_BOOL", "0", false},
+		{"TEST_BOOL", "no", false},
+		{"TEST_BOOL", "off", false},
+		{"TEST_BOOL", "invalid", false}, // fallback to default
+	}
+	for _, tt := range tests {
+		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
+			t.Setenv(tt.key, tt.value)
+			fileCfg := map[string]string{}
+			got := readBoolCfg(tt.key, fileCfg, false)
+			if got != tt.expected {
+				t.Errorf("expected %v, got %v", tt.expected, got)
+			}
+		})
+	}
+}
+
+func TestParseToolTimeout(t *testing.T) {
+	tests := []struct {
+		name     string
+		call     apiToolCall
+		expected int
+	}{
+		{
+			name: "no timeout",
+			call: apiToolCall{
+				Function: apiFunctionCall{
+					Name:      "await_subagent",
+					Arguments: `{"id": "subagent-1"}`,
+				},
+			},
+			expected: 0,
+		},
+		{
+			name: "timeout set",
+			call: apiToolCall{
+				Function: apiFunctionCall{
+					Name:      "await_subagent",
+					Arguments: `{"id": "subagent-1", "timeout_seconds": 120}`,
+				},
+			},
+			expected: 120,
+		},
+		{
+			name: "timeout capped at max",
+			call: apiToolCall{
+				Function: apiFunctionCall{
+					Name:      "await_subagent",
+					Arguments: `{"id": "subagent-1", "timeout_seconds": 720}`,
+				},
+			},
+			expected: toolTimeoutMax,
+		},
+		{
+			name: "negative timeout",
+			call: apiToolCall{
+				Function: apiFunctionCall{
+					Name:      "await_subagent",
+					Arguments: `{"id": "subagent-1", "timeout_seconds": -10}`,
+				},
+			},
+			expected: 0,
+		},
+		{
+			name: "invalid json",
+			call: apiToolCall{
+				Function: apiFunctionCall{
+					Name:      "await_subagent",
+					Arguments: `{invalid json`,
+				},
+			},
+			expected: 0,
+		},
+		{
+			name: "execute_program timeout",
+			call: apiToolCall{
+				Function: apiFunctionCall{
+					Name:      "execute_program",
+					Arguments: `{"command": "ls", "timeout_seconds": 60}`,
+				},
+			},
+			expected: 60,
+		},
+		{
+			name: "run_subagent with wait timeout",
+			call: apiToolCall{
+				Function: apiFunctionCall{
+					Name:      "run_subagent",
+					Arguments: `{"id": "subagent-1", "wait": true, "timeout_seconds": 180}`,
+				},
+			},
+			expected: 180,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseToolTimeout(tt.call)
+			if got != tt.expected {
+				t.Errorf("parseToolTimeout() = %d, want %d", got, tt.expected)
+			}
+		})
+	}
 }
