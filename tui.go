@@ -423,8 +423,8 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 	tui.commandList.SetBorderColor(theme.ActiveBorder)
 	tui.commandList.SetBackgroundColor(theme.LogBg)
 	tui.commandList.SetTitleColor(theme.TitleColor)
-	tui.commandList.SetMainTextColor(theme.ListMain)
-	tui.commandList.SetSecondaryTextColor(theme.ListSecondary)
+	tui.commandList.SetMainTextStyle(tcell.StyleDefault.Foreground(theme.ListMain).Background(theme.LogBg))
+	tui.commandList.SetSecondaryTextStyle(tcell.StyleDefault.Foreground(theme.ListSecondary).Background(theme.LogBg))
 	tui.commandList.SetSelectedTextColor(theme.ListSelFg)
 	tui.commandList.SetSelectedBackgroundColor(theme.ListSelBg)
 	tui.commandList.SetSelectedFunc(func(_ int, name, _ string, _ rune) {
@@ -716,6 +716,7 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 		SetDirection(tview.FlexColumn).
 		AddItem(tui.agentTree, 0, 1, false).
 		AddItem(tui.logView, 0, 4, false)
+	topFlex.SetBackgroundColor(theme.LogBg)
 	tui.topFlex = topFlex
 	cwdWidth := len([]rune(cwd)) + 2 // +1 for trailing space, +1 margin
 	modelWidth := len([]rune(a.cfg.model)) + 2
@@ -724,17 +725,20 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 		AddItem(tui.statusBar, 0, 1, false).
 		AddItem(tui.statusModel, modelWidth, 0, false).
 		AddItem(tui.statusCWD, cwdWidth, 0, false)
+	statusFlex.SetBackgroundColor(theme.StatusBarBg)
 	tui.normalLayout = tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(topFlex, 0, 1, false).
 		AddItem(tui.inputField, 4, 0, false).
 		AddItem(statusFlex, 1, 0, false)
+	tui.normalLayout.SetBackgroundColor(theme.LogBg)
 
 	// searchField + searchBar row for search mode (F4).
 	tui.searchField = tview.NewInputField().
 		SetLabel(" Search: ").
 		SetFieldWidth(0)
 	tui.searchField.SetBorder(false)
+	tui.searchField.SetBackgroundColor(theme.LogBg)
 	// InputField also defaults to white text — make it readable on the search
 	// bar background regardless of theme.
 	tui.searchField.SetFieldStyle(tcell.StyleDefault.
@@ -756,6 +760,7 @@ func newTuiApp(a *app, theme tuiTheme) *tuiApp {
 		AddItem(topFlex, 0, 1, false).
 		AddItem(tui.searchBar, 3, 0, false).
 		AddItem(statusFlex, 1, 0, false)
+	tui.searchLayout.SetBackgroundColor(theme.LogBg)
 
 	// Wire search field callbacks.
 	tui.searchField.SetChangedFunc(func(text string) {
@@ -2698,14 +2703,18 @@ func (t *tuiApp) showSkillPicker() {
 	if h > 24 {
 		h = 24
 	}
+	innerFlex := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(nil, 0, 1, false).
+		AddItem(filterInput, 1, 0, true).
+		AddItem(list, h, 0, false).
+		AddItem(nil, 0, 1, false)
+	innerFlex.SetBackgroundColor(t.theme.LogBg)
+
 	overlay := tview.NewFlex().
 		AddItem(nil, 0, 1, false).
-		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
-			AddItem(nil, 0, 1, false).
-			AddItem(filterInput, 1, 0, true).
-			AddItem(list, h, 0, false).
-			AddItem(nil, 0, 1, false), 60, 0, true).
+		AddItem(innerFlex, 60, 0, true).
 		AddItem(nil, 0, 1, false)
+	overlay.SetBackgroundColor(t.theme.LogBg)
 
 	t.app.SetRoot(overlay, true).SetFocus(filterInput)
 }
@@ -2732,6 +2741,7 @@ func (t *tuiApp) showCommandPicker(partial string) {
 		SetDirection(tview.FlexRow).
 		AddItem(t.normalLayout, 0, 1, false).
 		AddItem(t.commandList, commandPickerHeight, 0, true)
+	t.commandDropdown.SetBackgroundColor(t.theme.LogBg)
 
 	t.app.SetRoot(t.commandDropdown, true).SetFocus(t.commandList)
 }
@@ -2828,10 +2838,10 @@ func (t *tuiApp) showCascadeMenu(steps []cascadeStep, onDone func([]string), onC
 		list.SetBackgroundColor(t.theme.LogBg)
 		list.SetTitleColor(t.theme.TitleColor)
 		list.SetBorderColor(t.theme.ActiveBorder)
-		list.SetMainTextColor(t.theme.ListMain)
-		list.SetSecondaryTextColor(t.theme.ListSecondary)
-		list.SetSelectedTextColor(t.theme.ListSelFg)
-		list.SetSelectedBackgroundColor(t.theme.ListSelBg)
+	list.SetMainTextStyle(tcell.StyleDefault.Foreground(t.theme.ListMain).Background(t.theme.LogBg))
+	list.SetSecondaryTextStyle(tcell.StyleDefault.Foreground(t.theme.ListSecondary).Background(t.theme.LogBg))
+	list.SetSelectedTextColor(t.theme.ListSelFg)
+	list.SetSelectedBackgroundColor(t.theme.ListSelBg)
 
 		list.SetSelectedFunc(func(i int, _, _ string, _ rune) {
 			if i >= len(items) {
@@ -2854,13 +2864,18 @@ func (t *tuiApp) showCascadeMenu(steps []cascadeStep, onDone func([]string), onC
 		if h > 24 {
 			h = 24
 		}
+		innerFlex := tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(list, h, 0, true).
+			AddItem(nil, 0, 1, false)
+		innerFlex.SetBackgroundColor(t.theme.LogBg)
+
 		overlay := tview.NewFlex().
 			AddItem(nil, 0, 1, false).
-			AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
-				AddItem(nil, 0, 1, false).
-				AddItem(list, h, 0, true).
-				AddItem(nil, 0, 1, false), 0, 3, true).
+			AddItem(innerFlex, 0, 3, true).
 			AddItem(nil, 0, 1, false)
+		overlay.SetBackgroundColor(t.theme.LogBg)
+
 		t.app.SetRoot(overlay, true).SetFocus(list)
 	}
 	showStep(0)
@@ -3261,8 +3276,8 @@ func (t *tuiApp) handleSessionResume(callerAgentID string, uuidPrefix string) {
 	list.SetBackgroundColor(t.theme.LogBg)
 	list.SetTitleColor(t.theme.TitleColor)
 	list.SetBorderColor(t.theme.ActiveBorder)
-	list.SetMainTextColor(t.theme.ListMain)
-	list.SetSecondaryTextColor(t.theme.ListSecondary)
+	list.SetMainTextStyle(tcell.StyleDefault.Foreground(t.theme.ListMain).Background(t.theme.LogBg))
+	list.SetSecondaryTextStyle(tcell.StyleDefault.Foreground(t.theme.ListSecondary).Background(t.theme.LogBg))
 	list.SetSelectedTextColor(t.theme.ListSelFg)
 	list.SetSelectedBackgroundColor(t.theme.ListSelBg)
 
@@ -3367,14 +3382,18 @@ func (t *tuiApp) handleSessionResume(callerAgentID string, uuidPrefix string) {
 		h = 40
 	}
 	// Center the list in a flex overlay.
+	innerFlex := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(nil, 0, 1, false).
+		AddItem(filterInput, 1, 0, true).
+		AddItem(list, h, 0, false).
+		AddItem(nil, 0, 1, false)
+	innerFlex.SetBackgroundColor(t.theme.LogBg)
+
 	overlay := tview.NewFlex().
 		AddItem(nil, 0, 1, false).
-		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
-			AddItem(nil, 0, 1, false).
-			AddItem(filterInput, 1, 0, true).
-			AddItem(list, h, 0, false).
-			AddItem(nil, 0, 1, false), 0, 3, true).
+		AddItem(innerFlex, 0, 3, true).
 		AddItem(nil, 0, 1, false)
+	overlay.SetBackgroundColor(t.theme.LogBg)
 
 	// We're in a goroutine — use QueueUpdateDraw to show the overlay.
 	t.app.QueueUpdateDraw(func() {
@@ -3758,8 +3777,8 @@ func (t *tuiApp) handleWorkspacePicker(callerAgentID string) {
 	list.SetBorderColor(t.theme.ActiveBorder)
 	list.SetBackgroundColor(t.theme.LogBg)
 	list.SetTitleColor(t.theme.TitleColor)
-	list.SetMainTextColor(t.theme.ListMain)
-	list.SetSecondaryTextColor(t.theme.ListSecondary)
+	list.SetMainTextStyle(tcell.StyleDefault.Foreground(t.theme.ListMain).Background(t.theme.LogBg))
+	list.SetSecondaryTextStyle(tcell.StyleDefault.Foreground(t.theme.ListSecondary).Background(t.theme.LogBg))
 	list.SetSelectedTextColor(t.theme.ListSelFg)
 	list.SetSelectedBackgroundColor(t.theme.ListSelBg)
 	for _, name := range names {
@@ -3812,13 +3831,17 @@ func (t *tuiApp) handleWorkspacePicker(callerAgentID string) {
 	if h > 30 {
 		h = 30
 	}
+	innerFlex := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(nil, 0, 1, false).
+		AddItem(list, h, 0, true).
+		AddItem(nil, 0, 1, false)
+	innerFlex.SetBackgroundColor(t.theme.LogBg)
+
 	overlay := tview.NewFlex().
 		AddItem(nil, 0, 1, false).
-		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
-			AddItem(nil, 0, 1, false).
-			AddItem(list, h, 0, true).
-			AddItem(nil, 0, 1, false), 0, 3, true).
+		AddItem(innerFlex, 0, 3, true).
 		AddItem(nil, 0, 1, false)
+	overlay.SetBackgroundColor(t.theme.LogBg)
 
 	t.app.QueueUpdateDraw(func() {
 		t.inputField.SetText("", false)
