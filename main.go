@@ -26,10 +26,10 @@ import (
 )
 
 const (
-	defaultBaseURL            = "http://localhost:8235/v1"
-	defaultModel              = "gpt-5-mini"
-	defaultToken              = ""
-	defaultReasoning          = "medium"
+	defaultBaseURL            = "https://opencode.ai/zen/v1"
+	defaultModel              = "big-pickle"
+	defaultToken              = "public"
+	defaultReasoning          = ""
 	defaultMaxIterations      = 40
 	defaultToolMaxParallel    = 8
 	defaultToolTimeoutSec     = 60
@@ -899,10 +899,10 @@ const defaultConfigFileContent = `# capelin-go configuration
 # Edit this file to set persistent defaults.
 # Priority: CLI flags > environment variables > this file > built-in defaults.
 
-BASE_URL = http://localhost:8235/v1
-MODEL = gpt-5-mini
-TOKEN =
-REASONING_EFFORT = medium
+BASE_URL = https://opencode.ai/zen/v1
+MODEL = big-pickle
+TOKEN = public
+REASONING_EFFORT =
 SYSTEM_PROMPT =
 MAX_ITERATIONS = 40
 
@@ -1635,7 +1635,11 @@ func (a *app) systemPromptWithSkills() string {
 	b.WriteString("When user asks to use a skill, execute the relevant skill command instead of only summarizing.\n")
 	b.WriteString("Prefer execute_skill for skill-driven actions.\n")
 	b.WriteString("Follow loaded skill instructions when relevant to the user task.\n")
-	b.WriteString("Write, edit, and execute tools require explicit --allow-tool or --yolo to be enabled.\n")
+	if a.cfg.yolo {
+		b.WriteString("All tools are enabled (--yolo mode). No path restrictions apply.\n")
+	} else {
+		b.WriteString("Write, edit, and execute tools require explicit --allow-tool or --yolo to be enabled.\n")
+	}
 	b.WriteString("Subagents inherit all tools the parent has. Use allowed_tools on create_subagent to restrict a subagent's always-enabled tools if needed.\n")
 	return b.String()
 }

@@ -1303,13 +1303,13 @@ func TestConfigFileCreatedWithDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readConfigFile: %v", err)
 	}
-	if cfg["BASE_URL"] != "http://localhost:8235/v1" {
+	if cfg["BASE_URL"] != "https://opencode.ai/zen/v1" {
 		t.Fatalf("unexpected BASE_URL: %q", cfg["BASE_URL"])
 	}
-	if cfg["MODEL"] != "gpt-5-mini" {
+	if cfg["MODEL"] != "big-pickle" {
 		t.Fatalf("unexpected MODEL: %q", cfg["MODEL"])
 	}
-	if cfg["REASONING_EFFORT"] != "medium" {
+	if cfg["REASONING_EFFORT"] != "" {
 		t.Fatalf("unexpected REASONING_EFFORT: %q", cfg["REASONING_EFFORT"])
 	}
 }
