@@ -1309,7 +1309,7 @@ func TestConfigFileCreatedWithDefaults(t *testing.T) {
 	if cfg["MODEL"] != "big-pickle" {
 		t.Fatalf("unexpected MODEL: %q", cfg["MODEL"])
 	}
-	if cfg["REASONING_EFFORT"] != "" {
+	if cfg["REASONING_EFFORT"] != "nil" {
 		t.Fatalf("unexpected REASONING_EFFORT: %q", cfg["REASONING_EFFORT"])
 	}
 }
@@ -1345,14 +1345,14 @@ func TestConfigFileEnvOverridesFile(t *testing.T) {
 	}
 }
 
-func TestReasoningEffortNoneOmitted(t *testing.T) {
-	t.Setenv("REASONING_EFFORT", "none")
+func TestReasoningEffortNilOmitted(t *testing.T) {
+	t.Setenv("REASONING_EFFORT", "nil")
 	v, err := readReasoningEffort(map[string]string{})
 	if err != nil {
 		t.Fatalf("readReasoningEffort: %v", err)
 	}
 	if v != "" {
-		t.Fatalf("expected empty string for reasoning_effort=none, got %q", v)
+		t.Fatalf("expected empty string for reasoning_effort=nil, got %q", v)
 	}
 
 	// Ensure omitempty actually omits the field when empty.
@@ -1363,14 +1363,44 @@ func TestReasoningEffortNoneOmitted(t *testing.T) {
 	}
 }
 
-func TestReasoningEffortNoneCaseInsensitive(t *testing.T) {
-	for _, val := range []string{"none", "None", "NONE", "nOnE"} {
+func TestReasoningEffortNoneSent(t *testing.T) {
+	t.Setenv("REASONING_EFFORT", "none")
+	v, err := readReasoningEffort(map[string]string{})
+	if err != nil {
+		t.Fatalf("readReasoningEffort: %v", err)
+	}
+	if v != "none" {
+		t.Fatalf("expected \"none\" for reasoning_effort=none, got %q", v)
+	}
+
+	// Ensure the field is included in JSON when set to "none".
+	req := apiRequest{Model: "m", ReasoningEffort: v}
+	b, _ := json.Marshal(req)
+	if !strings.Contains(string(b), "reasoning_effort") {
+		t.Fatalf("expected reasoning_effort to be present in JSON, got %s", string(b))
+	}
+}
+
+func TestReasoningEffortNilCaseInsensitive(t *testing.T) {
+	for _, val := range []string{"nil", "Nil", "NIL", "nIL"} {
 		v, err := readReasoningEffort(map[string]string{"REASONING_EFFORT": val})
 		if err != nil {
 			t.Fatalf("readReasoningEffort(%q): %v", val, err)
 		}
 		if v != "" {
 			t.Fatalf("readReasoningEffort(%q) expected empty, got %q", val, v)
+		}
+	}
+}
+
+func TestReasoningEffortNonePassedThrough(t *testing.T) {
+	for _, val := range []string{"none", "None", "NONE"} {
+		v, err := readReasoningEffort(map[string]string{"REASONING_EFFORT": val})
+		if err != nil {
+			t.Fatalf("readReasoningEffort(%q): %v", val, err)
+		}
+		if !strings.EqualFold(v, "none") {
+			t.Fatalf("readReasoningEffort(%q) expected \"none\", got %q", val, v)
 		}
 	}
 }
@@ -1529,20 +1559,46 @@ func TestLoadConfigSubagentReasoningEffortFlag(t *testing.T) {
 	}
 }
 
-func TestLoadConfigSubagentReasoningEffortNone(t *testing.T) {
+func TestLoadConfigSubagentReasoningEffortNil(t *testing.T) {
 	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
-	// "none" must be converted to "" so the field is omitted from API requests.
-	cfg, err := loadConfig([]string{"--subagent-reasoning-effort", "none", "task"})
+	// "nil" must be converted to "" so the field is omitted from API requests.
+	cfg, err := loadConfig([]string{"--subagent-reasoning-effort", "nil", "task"})
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
 	if cfg.subagents.ReasoningEffort != "" {
-		t.Fatalf("expected empty (none→omit) for subagent reasoning, got %q", cfg.subagents.ReasoningEffort)
+		t.Fatalf("expected empty (nil→omit) for subagent reasoning, got %q", cfg.subagents.ReasoningEffort)
 	}
 }
 
-func TestLoadConfigSubagentReasoningEffortNoneCaseInsensitive(t *testing.T) {
+func TestLoadConfigSubagentReasoningEffortNoneIsSent(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	cfg, err := loadConfig([]string{"--subagent-reasoning-effort", "none", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.subagents.ReasoningEffort != "none" {
+		t.Fatalf("expected \"none\" for subagent reasoning effort, got %q", cfg.subagents.ReasoningEffort)
+	}
+}
+
+func TestLoadConfigSubagentReasoningEffortNilCaseInsensitive(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	for _, val := range []string{"nil", "Nil", "NIL"} {
+		cfg, err := loadConfig([]string{"--subagent-reasoning-effort", val, "task"})
+		if err != nil {
+			t.Fatalf("loadConfig(%q): %v", val, err)
+		}
+		if cfg.subagents.ReasoningEffort != "" {
+			t.Fatalf("--subagent-reasoning-effort=%q expected empty, got %q", val, cfg.subagents.ReasoningEffort)
+		}
+	}
+}
+
+func TestLoadConfigSubagentReasoningEffortNoneCaseInsensitiveSent(t *testing.T) {
 	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	for _, val := range []string{"none", "None", "NONE"} {
@@ -1550,8 +1606,8 @@ func TestLoadConfigSubagentReasoningEffortNoneCaseInsensitive(t *testing.T) {
 		if err != nil {
 			t.Fatalf("loadConfig(%q): %v", val, err)
 		}
-		if cfg.subagents.ReasoningEffort != "" {
-			t.Fatalf("--subagent-reasoning-effort=%q expected empty, got %q", val, cfg.subagents.ReasoningEffort)
+		if !strings.EqualFold(cfg.subagents.ReasoningEffort, "none") {
+			t.Fatalf("--subagent-reasoning-effort=%q expected \"none\", got %q", val, cfg.subagents.ReasoningEffort)
 		}
 	}
 }

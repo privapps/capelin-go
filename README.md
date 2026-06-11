@@ -57,6 +57,27 @@ Suppress intermediate tool output, showing only the final answer (one-shot mode)
 ./capelin-go --final-only "summarize repository structure"
 ```
 
+Debug mode (dump HTTP request and response to stderr):
+
+```bash
+./capelin-go --debug "summarize repository structure"
+```
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--debug` | Dump HTTP request and response headers and bodies to stderr |
+| `--final-only` | Suppress intermediate tool output, show only the final answer |
+| `--theme light\|dark\|auto` | Force TUI color theme |
+| `--max-iterations N` | Tool-call iteration cap (default: 40; env: `MAX_ITERATIONS`) |
+| `--allow-tool NAME` | Enable opt-in tool (repeatable) |
+| `--yolo` | Enable all tools + unrestricted paths |
+| `--tool-max-parallel N` | Max concurrent tool calls per turn (default: 8) |
+| `--tool-timeout-seconds N` | Per-tool deadline in seconds (default: 60) |
+| `--tool-retry-on-timeout` / `--no-tool-retry-on-timeout` | Retry once on tool timeout |
+| `--subagent-*` | Subagent orchestration limits (see env section) |
+
 REPL mode (multi-turn readline REPL with shared conversation history):
 
 ```bash
@@ -274,7 +295,7 @@ Enable everything (all tools + unrestricted paths):
 - `BASE_URL` — model server base URL (default: `http://localhost:8235/v1`)
 - `MODEL` — model ID (default: `gpt-5-mini`)
 - `TOKEN` — optional API token
-- `REASONING_EFFORT` — passed through to the model backend; set to `none` to omit the field entirely from the request
+- `REASONING_EFFORT` — passed through to the model backend; set to `nil` to omit the field, `none` to send explicitly
 - `SYSTEM_PROMPT` (or `systemPrompt`) — prompt override
 - `MAX_ITERATIONS` — root agent tool-call iteration cap (default: 40; overridden by `--max-iterations`); always wraps up gracefully on limit
 - `SUBAGENT_MAX_DEPTH` — maximum subagent nesting depth (default: 1; overridden by `--subagent-max-depth`)
@@ -285,7 +306,7 @@ Enable everything (all tools + unrestricted paths):
 - `SUBAGENT_MAX_AGGREGATE_CHARS` — maximum total characters across all subagent results in a single turn (default: 12000; overridden by `--subagent-max-aggregate-chars`)
 - `SUBAGENT_MAX_ITERATIONS` — maximum tool-call iterations per subagent (default: 20; overridden by `--subagent-max-iterations`)
 - `SUBAGENT_MODEL` — model ID used for subagents (default: inherits `MODEL`; overridden by `--subagent-model`)
-- `SUBAGENT_REASONING_EFFORT` — reasoning effort for subagents (default: inherits `REASONING_EFFORT`; set to `none` to omit; overridden by `--subagent-reasoning-effort`)
+- `SUBAGENT_REASONING_EFFORT` — reasoning effort for subagents (default: inherits `REASONING_EFFORT`; `nil`=omit, `none`=send explicitly; overridden by `--subagent-reasoning-effort`)
 - `TOOL_MAX_PARALLEL` — maximum concurrent tool calls per LLM turn (default: 8; overridden by `--tool-max-parallel`); set to 0 to disable parallelism (serial execution)
 - `TOOL_TIMEOUT_SECONDS` — per-tool deadline in seconds (default: 60; overridden by `--tool-timeout-seconds`); set to 0 for no per-tool timeout
 - `TOOL_RETRY_ON_TIMEOUT` — retry once on tool timeout (default: true; overridden by `--tool-retry-on-timeout` / `--no-tool-retry-on-timeout`)

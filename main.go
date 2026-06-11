@@ -153,6 +153,7 @@ type config struct {
 	toolMaxParallel    int    // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
 	toolTimeoutSec     int    // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
 	toolRetryOnTimeout bool   // retry once on timeout (0 = disable; empty = default true)
+	debug              bool
 }
 
 type app struct {
@@ -246,6 +247,7 @@ type client struct {
 	token     string
 	model     string
 	reasoning string
+	debug     bool
 	http      *http.Client
 }
 
@@ -287,7 +289,15 @@ type apiToolSpec struct {
 	Parameters  map[string]any `json:"parameters"`
 }
 
+type apiResponseDataInner struct {
+	Choices []struct {
+		Message      apiCompletionMessage `json:"message"`
+		FinishReason string               `json:"finish_reason"`
+	} `json:"choices"`
+}
+
 type apiResponse struct {
+	Data    *apiResponseDataInner `json:"data,omitempty"`
 	Choices []struct {
 		Message      apiCompletionMessage `json:"message"`
 		FinishReason string               `json:"finish_reason"`
@@ -377,6 +387,7 @@ func newApp(cfg config) (*app, error) {
 			token:     cfg.token,
 			model:     cfg.model,
 			reasoning: cfg.reasoning,
+			debug:     cfg.debug,
 			http:      &http.Client{Timeout: requestTimeout},
 		},
 		skills:  skills,
@@ -403,6 +414,7 @@ func loadConfig(args []string) (config, error) {
 		allowedTools[name] = true
 	}
 	yolo := false
+	debug := false
 	interactive := false
 	tui := false
 	finalOnly := false
@@ -643,6 +655,8 @@ func loadConfig(args []string) (config, error) {
 			toolRetryOnTimeout = 1
 		case arg == "--no-tool-retry-on-timeout":
 			toolRetryOnTimeout = 0
+		case arg == "--debug" || arg == "-debug":
+			debug = true
 		case strings.HasPrefix(arg, "-"):
 			return config{}, fmt.Errorf("unknown flag %q", arg)
 		default:
@@ -712,14 +726,14 @@ func loadConfig(args []string) (config, error) {
 	}
 
 	// Resolve subagent reasoning effort: flag > env > file > inherit root reasoning.
-	// "none" is converted to "" so it is omitted from API requests (same as root reasoning).
+	// "nil" is converted to "" so it is omitted from API requests (same as root reasoning).
 	rawSubagentReasoning := subagentCfg.ReasoningEffort
 	if rawSubagentReasoning == "" {
 		rawSubagentReasoning = readCfg("SUBAGENT_REASONING_EFFORT", fileCfg, "")
 	}
 	if rawSubagentReasoning == "" {
 		subagentCfg.ReasoningEffort = reasoning // inherit already-resolved root reasoning
-	} else if strings.EqualFold(rawSubagentReasoning, "none") {
+	} else if strings.EqualFold(rawSubagentReasoning, "nil") {
 		subagentCfg.ReasoningEffort = ""
 	} else {
 		subagentCfg.ReasoningEffort = rawSubagentReasoning
@@ -790,6 +804,7 @@ func loadConfig(args []string) (config, error) {
 		toolMaxParallel:    toolMaxParallel,
 		toolTimeoutSec:     toolTimeoutSec,
 		toolRetryOnTimeout: toolRetryOnTimeout == 1,
+		debug:              debug,
 	}, nil
 }
 
@@ -875,7 +890,7 @@ func readBaseURL(fileCfg map[string]string) (string, error) {
 
 func readReasoningEffort(fileCfg map[string]string) (string, error) {
 	value := readCfg("REASONING_EFFORT", fileCfg, defaultReasoning)
-	if strings.EqualFold(value, "none") {
+	if strings.EqualFold(value, "nil") {
 		return "", nil
 	}
 	return value, nil
@@ -902,7 +917,7 @@ const defaultConfigFileContent = `# capelin-go configuration
 BASE_URL = https://opencode.ai/zen/v1
 MODEL = big-pickle
 TOKEN = public
-REASONING_EFFORT =
+REASONING_EFFORT = nil
 SYSTEM_PROMPT =
 MAX_ITERATIONS = 40
 
@@ -1038,8 +1053,9 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  -i / --interactive         readline REPL (multi-turn; initial question is optional)")
 	fmt.Fprintln(w, "  -tui / --tui               TUI (auto-falls back to REPL on non-TTY)")
 	fmt.Fprintln(w, "  --final-only               one-shot mode: suppress intermediate tool output, show only the final answer")
+	fmt.Fprintln(w, "  --debug                    dump HTTP request and response to stderr")
 	fmt.Fprintln(w, "  --theme light|dark|auto    force TUI theme (default: auto-detect from terminal)")
-	fmt.Fprintln(w, "Env: BASE_URL, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS")
+	fmt.Fprintln(w, "Env: BASE_URL, MODEL, TOKEN, REASONING_EFFORT (nil=exclude, none=sent), SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS")
 	fmt.Fprintln(w, "     CAPELIN_THEME, SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT")
@@ -1056,7 +1072,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  --subagent-max-iterations N         (default 20;    env SUBAGENT_MAX_ITERATIONS)")
 	fmt.Fprintln(w, "Subagent model (defaults to root MODEL if not set):")
 	fmt.Fprintln(w, "  --subagent-model MODEL              (env SUBAGENT_MODEL)")
-	fmt.Fprintln(w, "  --subagent-reasoning-effort VALUE   (env SUBAGENT_REASONING_EFFORT; set to 'none' to omit)")
+	fmt.Fprintln(w, "  --subagent-reasoning-effort VALUE   (env SUBAGENT_REASONING_EFFORT; nil=exclude, none=sent)")
 	fmt.Fprintln(w, "Tool execution (flags, env vars, or config file):")
 	fmt.Fprintln(w, "  --tool-max-parallel N               (default 8;     env TOOL_MAX_PARALLEL)")
 	fmt.Fprintln(w, "  --tool-timeout-seconds N            (default 60;    env TOOL_TIMEOUT_SECONDS)")
@@ -1963,32 +1979,59 @@ func (c *client) complete(ctx context.Context, messages []apiMessage, tools []ap
 			req.Header.Set("Authorization", "Bearer "+c.token)
 		}
 
+		if c.debug {
+			fmt.Fprintf(os.Stderr, "[capelin-go] >>> POST %s\n", endpoint)
+			for k, v := range req.Header {
+				if strings.EqualFold(k, "authorization") {
+					fmt.Fprintf(os.Stderr, "  %s: Bearer <redacted>\n", k)
+				} else {
+					fmt.Fprintf(os.Stderr, "  %s: %s\n", k, v[0])
+				}
+			}
+			fmt.Fprintf(os.Stderr, "\n%s\n\n", string(body))
+		}
+
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 
+		rawBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			raw, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			lastErr = fmt.Errorf("model request failed: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+			lastErr = fmt.Errorf("model request failed: %s: %s", resp.Status, strings.TrimSpace(string(rawBody)))
 			if isRetryableStatus(resp.StatusCode) {
 				continue
 			}
 			return nil, lastErr
 		}
 
+		if c.debug {
+			fmt.Fprintf(os.Stderr, "[capelin-go] <<< RESPONSE %s\n", resp.Status)
+			for k, v := range resp.Header {
+				fmt.Fprintf(os.Stderr, "  %s: %s\n", k, v[0])
+			}
+			fmt.Fprintf(os.Stderr, "\n%s\n\n", string(rawBody))
+		}
+
 		var decoded apiResponse
-		if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
-			resp.Body.Close()
+		if err := json.Unmarshal(rawBody, &decoded); err != nil {
 			return nil, err
 		}
-		resp.Body.Close()
-		if len(decoded.Choices) == 0 {
+		choices := decoded.Choices
+		if len(choices) == 0 && decoded.Data != nil {
+			choices = decoded.Data.Choices
+		}
+		if len(choices) == 0 {
 			return nil, errors.New("model returned no choices")
 		}
-		return &completionMessage{message: decoded.Choices[0].Message}, nil
+		return &completionMessage{message: choices[0].Message}, nil
 	}
 	return nil, lastErr
 }
