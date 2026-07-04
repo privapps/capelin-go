@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"capelin-go/internal/skills"
+	"capelin-go/internal/types"
 	"context"
 	"encoding/json"
 	"encoding/xml"
@@ -24,7 +26,8 @@ import (
 
 const (
 	browserUA        = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-	toolTimeout      = 30 * time.Second
+	toolTimeout      = 60 * time.Second
+	toolTimeoutMax   = 600 // 10 minutes – absolute cap for any tool timeout
 	maxPageChars     = 14000
 	maxSearchResults = 12
 	maxListEntries   = 300
@@ -43,8 +46,8 @@ var errListLimitReached = errors.New("list limit reached")
 // attacks where a public IP is returned during the pre-flight validateFetchURL
 // check but a private IP is returned during the actual HTTP dial.
 var safeDialer = &net.Dialer{
-	Timeout:   30 * time.Second,
-	KeepAlive: 30 * time.Second,
+	Timeout:   toolTimeout,
+	KeepAlive: toolTimeout,
 }
 
 func safeDial(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -73,11 +76,12 @@ func safeDial(ctx context.Context, network, addr string) (net.Conn, error) {
 }
 
 var toolHTTPClient = &http.Client{
-	Timeout: toolTimeout,
+	Timeout: time.Duration(toolTimeoutMax) * time.Second,
 	Transport: &http.Transport{
 		DialContext:           safeDial,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -182,10 +186,10 @@ type searchResult struct {
 	Abstract string
 }
 
-func specWebSearch() apiTool {
-	return apiTool{
+func specWebSearch() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolWebSearch,
 			Description: "Search the web using DuckDuckGo with Bing fallback and return result titles, URLs, and abstracts.",
 			Parameters: map[string]any{
@@ -200,10 +204,10 @@ func specWebSearch() apiTool {
 	}
 }
 
-func specFetchPage() apiTool {
-	return apiTool{
+func specFetchPage() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolFetchPage,
 			Description: "Fetch a URL and return content as markdown-like text.",
 			Parameters: map[string]any{
@@ -218,10 +222,10 @@ func specFetchPage() apiTool {
 	}
 }
 
-func specListFiles() apiTool {
-	return apiTool{
+func specListFiles() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolListFiles,
 			Description: "List files and directories under the local workspace.",
 			Parameters: map[string]any{
@@ -235,10 +239,10 @@ func specListFiles() apiTool {
 	}
 }
 
-func specReadFile() apiTool {
-	return apiTool{
+func specReadFile() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolReadFile,
 			Description: "Read a file from local workspace with optional line range.",
 			Parameters: map[string]any{
@@ -255,10 +259,10 @@ func specReadFile() apiTool {
 	}
 }
 
-func specWriteFile() apiTool {
-	return apiTool{
+func specWriteFile() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolWriteFile,
 			Description: "Write content to a file in local workspace (overwrites existing file).",
 			Parameters: map[string]any{
@@ -274,10 +278,10 @@ func specWriteFile() apiTool {
 	}
 }
 
-func specAppendFile() apiTool {
-	return apiTool{
+func specAppendFile() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolAppendFile,
 			Description: "Append content to a file in local workspace.",
 			Parameters: map[string]any{
@@ -293,10 +297,10 @@ func specAppendFile() apiTool {
 	}
 }
 
-func specEditFile() apiTool {
-	return apiTool{
+func specEditFile() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolEditFile,
 			Description: "Replace an exact string in a file. Fails if old_str is not found or appears more than once.",
 			Parameters: map[string]any{
@@ -313,10 +317,10 @@ func specEditFile() apiTool {
 	}
 }
 
-func specExecuteProgram() apiTool {
-	return apiTool{
+func specExecuteProgram() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolExecuteProgram,
 			Description: "Execute a local program safely with explicit command and args.",
 			Parameters: map[string]any{
@@ -338,10 +342,10 @@ func specExecuteProgram() apiTool {
 	}
 }
 
-func specExecuteSkill() apiTool {
-	return apiTool{
+func specExecuteSkill() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolExecuteSkill,
 			Description: "Execute a command that is declared by a loaded skill.",
 			Parameters: map[string]any{
@@ -364,10 +368,10 @@ func specExecuteSkill() apiTool {
 	}
 }
 
-func specListSkills() apiTool {
-	return apiTool{
+func specListSkills() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolListSkills,
 			Description: "List loaded Claude-style skills discovered from skill directories.",
 			Parameters: map[string]any{
@@ -379,10 +383,10 @@ func specListSkills() apiTool {
 	}
 }
 
-func specReadSkill() apiTool {
-	return apiTool{
+func specReadSkill() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolReadSkill,
 			Description: "Read full SKILL.md content for a loaded skill by name.",
 			Parameters: map[string]any{
@@ -397,10 +401,10 @@ func specReadSkill() apiTool {
 	}
 }
 
-func specCreateSubagent() apiTool {
-	return apiTool{
+func specCreateSubagent() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolCreateSubagent,
 			Description: "Create a worker subagent session with inherited-and-restricted tool policy. Does not start execution.",
 			Parameters: map[string]any{
@@ -440,10 +444,10 @@ func specCreateSubagent() apiTool {
 	}
 }
 
-func specRunSubagent() apiTool {
-	return apiTool{
+func specRunSubagent() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolRunSubagent,
 			Description: "Start a created subagent. For parallel execution of multiple subagents: call run_subagent with wait=false for ALL subagents first (non-blocking fire), then call await_subagent for each to collect results. Use wait=true only when running a single subagent or intentionally serializing.",
 			Parameters: map[string]any{
@@ -470,10 +474,10 @@ func specRunSubagent() apiTool {
 	}
 }
 
-func specAwaitSubagent() apiTool {
-	return apiTool{
+func specAwaitSubagent() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolAwaitSubagent,
 			Description: "Wait for a running subagent to finish and return its result envelope.",
 			Parameters: map[string]any{
@@ -492,10 +496,10 @@ func specAwaitSubagent() apiTool {
 	}
 }
 
-func specListSubagents() apiTool {
-	return apiTool{
+func specListSubagents() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolListSubagents,
 			Description: "List subagents visible to the current agent.",
 			Parameters: map[string]any{
@@ -512,10 +516,10 @@ func specListSubagents() apiTool {
 	}
 }
 
-func specReadSubagent() apiTool {
-	return apiTool{
+func specReadSubagent() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolReadSubagent,
 			Description: "Read one subagent envelope or aggregate multiple subagent results by ids.",
 			Parameters: map[string]any{
@@ -538,10 +542,10 @@ func specReadSubagent() apiTool {
 	}
 }
 
-func specCancelSubagent() apiTool {
-	return apiTool{
+func specCancelSubagent() types.Tool {
+	return types.Tool{
 		Type: "function",
-		Function: apiToolSpec{
+		Function: types.ToolSpec{
 			Name:        toolCancelSubagent,
 			Description: "Cancel a pending or running subagent.",
 			Parameters: map[string]any{
@@ -985,10 +989,40 @@ func runReadFile(workspaceRoot string, yolo bool, args readFileArgs) (string, er
 	return strings.TrimRight(b.String(), "\n"), nil
 }
 
+func atomicWrite(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".capelin-write-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
 func runWriteFile(workspaceRoot string, yolo bool, args writeFileArgs) (string, error) {
 	path := strings.TrimSpace(args.Path)
 	if path == "" {
 		return "", errors.New("write_file path is required")
+	}
+	if len(args.Content) > maxFileBytes {
+		return "", fmt.Errorf("write file: content too large (%d bytes, max %d)", len(args.Content), maxFileBytes)
 	}
 	resolved, err := resolvePathForTool(workspaceRoot, path, yolo)
 	if err != nil {
@@ -997,7 +1031,8 @@ func runWriteFile(workspaceRoot string, yolo bool, args writeFileArgs) (string, 
 	if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
 		return "", fmt.Errorf("write file: %w", err)
 	}
-	if err := os.WriteFile(resolved, []byte(args.Content), 0o644); err != nil {
+	// Atomic write: write to temp file then rename.
+	if err := atomicWrite(resolved, []byte(args.Content)); err != nil {
 		return "", fmt.Errorf("write file: %w", err)
 	}
 	return fmt.Sprintf("wrote %d bytes to %s", len(args.Content), filepath.ToSlash(path)), nil
@@ -1055,7 +1090,11 @@ func runEditFile(workspaceRoot string, yolo bool, args editFileArgs) (string, er
 		return "", fmt.Errorf("edit file: old_str found %d times in %s (must be unique)", count, filepath.ToSlash(path))
 	}
 	updated := strings.Replace(content, args.OldStr, args.NewStr, 1)
-	if err := os.WriteFile(resolved, []byte(updated), 0o644); err != nil {
+	if len(updated) > maxFileBytes {
+		return "", fmt.Errorf("edit file: result too large (%d bytes)", len(updated))
+	}
+	// Atomic write: write to temp file then rename.
+	if err := atomicWrite(resolved, []byte(updated)); err != nil {
 		return "", fmt.Errorf("edit file: %w", err)
 	}
 	return fmt.Sprintf("edited %s", filepath.ToSlash(path)), nil
@@ -1105,6 +1144,7 @@ func runExecuteProgram(ctx context.Context, workspaceRoot string, yolo bool, arg
 
 	cmd := exec.CommandContext(execCtx, command, args.Args...)
 	cmd.Dir = resolvedCWD
+	setupProcessGroup(cmd)
 
 	stdout := &limitedBuffer{max: maxExecOutput}
 	stderr := &limitedBuffer{max: maxExecOutput}
@@ -1143,12 +1183,12 @@ func runExecuteProgram(ctx context.Context, workspaceRoot string, yolo bool, arg
 	return string(raw), nil
 }
 
-func runExecuteSkill(ctx context.Context, workspaceRoot string, yolo bool, skills map[string]skill, args executeSkillArgs) (string, error) {
+func runExecuteSkill(ctx context.Context, workspaceRoot string, yolo bool, skillsMap map[string]skills.Skill, args executeSkillArgs) (string, error) {
 	name := strings.TrimSpace(args.Name)
 	if name == "" {
 		return "", errors.New("execute_skill name is required")
 	}
-	sk, ok := skills[name]
+	sk, ok := skillsMap[name]
 	if !ok {
 		return "", fmt.Errorf("execute_skill: skill %q not found", name)
 	}

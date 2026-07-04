@@ -1,6 +1,7 @@
 package main
 
 import (
+	"capelin-go/internal/types"
 	"context"
 	"errors"
 	"fmt"
@@ -24,8 +25,8 @@ const (
 	defaultSubagentMaxDepth          = 1
 	defaultSubagentMaxChildren       = 8
 	defaultSubagentMaxParallel       = 4
-	defaultSubagentDefaultTimeoutSec = 300
-	defaultSubagentMaxTimeoutSec     = 600
+	defaultSubagentDefaultTimeoutSec = 600  // 10 minutes
+	defaultSubagentMaxTimeoutSec     = 1800 // 30 minutes
 	defaultSubagentToolIterations    = 20
 	defaultSubagentResultChars       = 8000
 	defaultSubagentAggregateCount    = 12
@@ -175,6 +176,28 @@ func newSubagentManager(cfg subagentRuntimeConfig, runner subagentRunner) *subag
 	}
 	m.slotCond = sync.NewCond(&m.mu)
 	return m
+}
+
+// ListAll returns a snapshot of all known subagent sessions (used by TUI agent tree panel).
+// Does NOT include the top-level agents — those are managed by the TUI model.
+func (m *subagentManager) ListAll() []types.SubagentNode {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	nodes := make([]types.SubagentNode, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		nodes = append(nodes, types.SubagentNode{
+			ID:       s.ID,
+			Name:     s.Name,
+			Question: s.Question,
+			ParentID: s.ParentID,
+			Status:   string(s.Status),
+			Depth:    s.Depth,
+		})
+	}
+	slices.SortFunc(nodes, func(a, b types.SubagentNode) int {
+		return strings.Compare(a.ID, b.ID)
+	})
+	return nodes
 }
 
 func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args createSubagentArgs) (*subagentSession, error) {

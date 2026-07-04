@@ -6,6 +6,7 @@
 
 - one-shot task execution
 - **interactive mode** (`-i` / `--interactive`): multi-turn REPL sharing a single conversation history
+- **server mode** (`--server-port PORT`): HTTP server accepting OpenAI-format requests
 - model loop with tool calling (`/chat/completions`)
 - Claude-style skill discovery from:
   - `.agents/skills` (project-local)
@@ -61,6 +62,37 @@ Interactive mode (multi-turn REPL with shared conversation history):
 ```
 
 Type `exit` or `quit` (or press Ctrl+D) to end an interactive session.
+
+**Server mode** (OpenAI-compatible proxy):
+
+```bash
+# Start server on port 8899
+./capelin-go --server-port 8899
+
+# Option 1: URL-encoded path (recommended)
+curl -X POST "http://localhost:8899/https%3A%2F%2Fopencode.ai/zen/v1/chat/completions" \
+  -H "Authorization: Bearer public" \
+  -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"search for go http best practices"}]}'
+
+# Option 2: Hex-encoded path (useful for obfuscating the endpoint)
+# Generate hex: echo -n "https://opencode.ai/zen/v1/chat/completions" | xxd -p
+curl -X POST "http://localhost:8899/~68747470733a2f2f6f70656e636f64652e61692f7a656e2f76312f636861742f636f6d706c6574696f6e73" \
+  -H "Authorization: Bearer public" \
+  -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"search for go http best practices"}]}'
+
+# Option 3: Query parameter
+curl -X POST "http://localhost:8899/?endpoint=https://opencode.ai/zen/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer public" \
+  -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"search for go http best practices"}]}'
+```
+
+In server mode:
+- Endpoint: full URL including `/chat/completions` — use URL-encoded path (`%3A%2F%2F` for `://`), hex-encoded path (`~<hex>` for obfuscated endpoints), or `?endpoint=` query parameter
+- API token: standard `Authorization: Bearer <token>` header
+- Only `web_search` and `fetch_page` tools are available (no file, execute, or skill tools)
+- Connection stays open until the agent completes (may take several minutes)
+- Returns OpenAI-format response with the final result
 
 **Keybindings:**
 
@@ -124,6 +156,7 @@ Enable everything (all tools + unrestricted paths):
 
 ## Environment variables
 
+- `--server-port PORT` — start HTTP server on given port (server mode)
 - `BASE_URL` — model server base URL (default: `http://localhost:8235/v1`)
 - `MODEL` — model ID (default: `gpt-5-mini`)
 - `TOKEN` — optional API token

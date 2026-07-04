@@ -1,4 +1,4 @@
-package main
+package skills
 
 import (
 	"fmt"
@@ -11,7 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type skill struct {
+type Skill struct {
 	Name        string
 	Description string
 	Path        string
@@ -27,48 +27,48 @@ type skillFrontMatter struct {
 	Runs        string `yaml:"runs"`
 }
 
-func loadSkills(workspaceRoot string) (map[string]skill, error) {
+func Load(workspaceRoot string) (map[string]Skill, error) {
 	dirs := []struct {
-		path   string
-		source string
+		Path   string
+		Source string
 	}{
-		{path: filepath.Join(workspaceRoot, ".agents", "skills"), source: "project"},
+		{Path: filepath.Join(workspaceRoot, ".agents", "skills"), Source: "project"},
 	}
 
 	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
 		dirs = append(dirs, struct {
-			path   string
-			source string
-		}{path: filepath.Join(home, ".agents", "skills"), source: "user"})
+			Path   string
+			Source string
+		}{Path: filepath.Join(home, ".agents", "skills"), Source: "user"})
 	}
-	return loadSkillsFromDirs(dirs)
+	return LoadFromDirs(dirs)
 }
 
-func loadSkillsFromDirs(dirs []struct {
-	path   string
-	source string
-}) (map[string]skill, error) {
-	skills := map[string]skill{}
+func LoadFromDirs(dirs []struct {
+	Path   string
+	Source string
+}) (map[string]Skill, error) {
+	skills := map[string]Skill{}
 
 	// Load user first, then project to make project precedence deterministic.
 	for _, pass := range []string{"user", "project"} {
 		for _, dir := range dirs {
-			if dir.source != pass {
+			if dir.Source != pass {
 				continue
 			}
-			entries, err := os.ReadDir(dir.path)
+			entries, err := os.ReadDir(dir.Path)
 			if err != nil {
 				if os.IsNotExist(err) {
 					continue
 				}
-				return nil, fmt.Errorf("reading skills dir %s: %w", dir.path, err)
+				return nil, fmt.Errorf("reading skills dir %s: %w", dir.Path, err)
 			}
 			for _, entry := range entries {
 				if !entry.IsDir() {
 					continue
 				}
-				skillPath := filepath.Join(dir.path, entry.Name(), "SKILL.md")
-				sk, err := parseSkillFile(skillPath, dir.source)
+				skillPath := filepath.Join(dir.Path, entry.Name(), "SKILL.md")
+				sk, err := ParseFile(skillPath, dir.Source)
 				if err != nil {
 					if os.IsNotExist(err) {
 						continue
@@ -82,34 +82,34 @@ func loadSkillsFromDirs(dirs []struct {
 	return skills, nil
 }
 
-func parseSkillFile(path, source string) (skill, error) {
+func ParseFile(path, source string) (Skill, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return skill{}, err
+		return Skill{}, err
 	}
 	content := string(raw)
 
 	header, err := extractFrontMatter(content)
 	if err != nil {
-		return skill{}, fmt.Errorf("parsing skill file %s: %w", path, err)
+		return Skill{}, fmt.Errorf("parsing skill file %s: %w", path, err)
 	}
 
 	var meta skillFrontMatter
 	if err := yaml.Unmarshal([]byte(header), &meta); err != nil {
-		return skill{}, fmt.Errorf("parsing skill front matter %s: %w", path, err)
+		return Skill{}, fmt.Errorf("parsing skill front matter %s: %w", path, err)
 	}
 	name := strings.TrimSpace(meta.Name)
 	if name == "" {
 		name = filepath.Base(filepath.Dir(path))
 	}
-	return skill{
+	return Skill{
 		Name:        name,
 		Description: strings.TrimSpace(meta.Description),
 		Path:        path,
 		Source:      source,
 		Content:     content,
 		Runs:        strings.TrimSpace(meta.Runs),
-		Commands:    extractExecutableCommands(content, meta.Runs),
+		Commands:    ExtractExecutableCommands(content, meta.Runs),
 	}, nil
 }
 
@@ -125,7 +125,7 @@ func extractFrontMatter(content string) (string, error) {
 	return rest[:idx], nil
 }
 
-func extractExecutableCommands(content, runs string) []string {
+func ExtractExecutableCommands(content, runs string) []string {
 	commands := map[string]struct{}{}
 
 	addCommand := func(line string) {
@@ -133,13 +133,25 @@ func extractExecutableCommands(content, runs string) []string {
 		if line == "" || strings.HasPrefix(line, "#") {
 			return
 		}
-		token := strings.Fields(line)
-		if len(token) == 0 {
+		// Expand environment variables ($HOME, $USER, etc.) so that paths like
+		// "$HOME/bin/exec-cli" become "/Users/jing/.../exec-cli" and are accepted.
+		expanded := os.ExpandEnv(line)
+		tokens := strings.Fields(expanded)
+		if len(tokens) == 0 {
 			return
 		}
-		cmd := token[0]
+		cmd := tokens[0]
+		// Skip lines that start with a flag (e.g. "--api-path") — those are CLI
+		// options, not executable names.
+		if strings.HasPrefix(cmd, "-") {
+			return
+		}
 		if isSimpleCommandToken(cmd) {
 			commands[cmd] = struct{}{}
+			// Also register the basename so the LLM can use the short form.
+			if base := filepath.Base(cmd); base != cmd && isSimpleCommandToken(base) {
+				commands[base] = struct{}{}
+			}
 		}
 	}
 

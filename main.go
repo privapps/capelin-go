@@ -3,11 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"capelin-go/internal/skills"
+	"capelin-go/internal/types"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,20 +19,25 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/chzyer/readline"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
-	defaultBaseURL       = "http://localhost:8235/v1"
-	defaultModel         = "gpt-5-mini"
-	defaultToken         = ""
-	defaultReasoning     = "medium"
-	defaultMaxIterations = 40
-	requestTimeout       = 10 * time.Minute
-	usageMessageTemplate = "Usage: %s [--allow-tool TOOL] \"your task\"\n"
+	defaultBaseURL            = "http://localhost:8235/v1"
+	defaultModel              = "gpt-5-mini"
+	defaultToken              = ""
+	defaultReasoning          = "medium"
+	defaultMaxIterations      = 40
+	defaultToolMaxParallel    = 8
+	defaultToolTimeoutSec     = 60
+	defaultToolRetryOnTimeout = true
+	requestTimeout            = 10 * time.Minute
+	usageMessageTemplate      = "Usage: %s [--allow-tool TOOL] \"your task\"\n"
 )
 
 var version = "dev"
@@ -127,27 +135,34 @@ var optInTools = map[string]struct{}{
 }
 
 type config struct {
-	baseURL         string
-	model           string
-	token           string
-	reasoning       string
-	systemPrompt    string
-	showVersion     bool
-	interactive     bool
-	initialQuestion string
-	workspaceRoot   string
-	allowedTools    map[string]bool
-	yolo            bool // enables all tools and unrestricted paths
-	maxIterations   int
-	subagents       subagentRuntimeConfig
+	baseURL            string
+	model              string
+	token              string
+	reasoning          string
+	systemPrompt       string
+	showVersion        bool
+	interactive        bool
+	finalOnly          bool
+	initialQuestion    string
+	workspaceRoot      string
+	allowedTools       map[string]bool
+	yolo               bool // enables all tools and unrestricted paths
+	maxIterations      int
+	subagents          subagentRuntimeConfig
+	serverPort         int
+	toolMaxParallel    int  // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
+	toolTimeoutSec     int  // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
+	toolRetryOnTimeout bool // retry once on timeout (0 = disable; empty = default true)
+	debug              bool
 }
 
 type app struct {
-	cfg       config
-	client    *client
-	skills    map[string]skill
-	toolset   []apiTool
-	subagents *subagentManager
+	cfg        config
+	client     *client
+	skills     map[string]skills.Skill
+	toolset    []types.Tool
+	subagents  *subagentManager
+	sink       types.OutputSink
 }
 
 type client struct {
@@ -155,58 +170,74 @@ type client struct {
 	token     string
 	model     string
 	reasoning string
+	debug     bool
 	http      *http.Client
 }
 
-type apiMessage struct {
-	Role       string        `json:"role"`
-	Content    string        `json:"content,omitempty"`
-	ToolCallID string        `json:"tool_call_id,omitempty"`
-	Name       string        `json:"name,omitempty"`
-	ToolCalls  []apiToolCall `json:"tool_calls,omitempty"`
+type stdioSink struct {
+	mu sync.Mutex
 }
 
-type apiToolCall struct {
-	ID       string          `json:"id"`
-	Type     string          `json:"type"`
-	Function apiFunctionCall `json:"function"`
+func (s *stdioSink) WriteContent(_ string, content string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fmt.Fprintln(os.Stdout, content)
 }
 
-type apiFunctionCall struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
+func (s *stdioSink) WriteToolCall(_ string, toolName, args string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "[tool] %s(%s)\n", toolName, args)
 }
 
-type apiRequest struct {
-	Model           string       `json:"model"`
-	Messages        []apiMessage `json:"messages"`
-	Tools           []apiTool    `json:"tools,omitempty"`
-	ToolChoice      string       `json:"tool_choice,omitempty"`
-	ReasoningEffort string       `json:"reasoning_effort,omitempty"`
+func (s *stdioSink) WriteToolResult(_ string, toolName string, isError bool, detail string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if isError {
+		fmt.Fprintf(os.Stderr, "[tool] %s error: %s\n", toolName, detail)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[tool] %s done\n", toolName)
 }
 
-type apiTool struct {
-	Type     string      `json:"type"`
-	Function apiToolSpec `json:"function"`
+func (s *stdioSink) WriteSystem(_ string, msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fmt.Fprintln(os.Stderr, msg)
 }
 
-type apiToolSpec struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters"`
+// finalOnlySink wraps another sink and suppresses all output except the
+// last content message. It is used for --final-only one-shot mode.
+type finalOnlySink struct {
+	wrapped     types.OutputSink
+	mu          sync.Mutex
+	lastContent string
 }
 
-type apiResponse struct {
-	Choices []struct {
-		Message      apiCompletionMessage `json:"message"`
-		FinishReason string               `json:"finish_reason"`
-	} `json:"choices"`
+func (s *finalOnlySink) WriteContent(agentID string, content string) {
+	if agentID != rootAgentID && agentID != "" {
+		return
+	}
+	s.mu.Lock()
+	s.lastContent = content
+	s.mu.Unlock()
 }
 
-type apiCompletionMessage struct {
-	Role      string        `json:"role"`
-	Content   *string       `json:"content"`
-	ToolCalls []apiToolCall `json:"tool_calls,omitempty"`
+func (s *finalOnlySink) WriteToolCall(_, _, _ string) {}
+
+func (s *finalOnlySink) WriteToolResult(_, _ string, _ bool, _ string) {}
+
+func (s *finalOnlySink) WriteSystem(_, _ string) {}
+
+// FlushContent writes the last buffered content, if any, through the wrapped sink.
+func (s *finalOnlySink) FlushContent() {
+	s.mu.Lock()
+	content := s.lastContent
+	s.lastContent = ""
+	s.mu.Unlock()
+	if content != "" {
+		s.wrapped.WriteContent(rootAgentID, content)
+	}
 }
 
 func main() {
@@ -226,6 +257,13 @@ func run() int {
 
 	if cfg.showVersion {
 		fmt.Fprintf(os.Stdout, "%s %s\n", filepath.Base(os.Args[0]), version)
+		return 0
+	}
+	if cfg.serverPort > 0 {
+		if err := startServer(cfg); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
 		return 0
 	}
 	if !cfg.interactive && cfg.initialQuestion == "" {
@@ -258,11 +296,15 @@ func run() int {
 }
 
 func newApp(cfg config) (*app, error) {
-	skills, err := loadSkills(cfg.workspaceRoot)
+	skillsMap, err := skills.Load(cfg.workspaceRoot)
 	if err != nil {
 		return nil, err
 	}
 
+	var sink types.OutputSink = &stdioSink{}
+	if cfg.finalOnly {
+		sink = &finalOnlySink{wrapped: &stdioSink{}}
+	}
 	instance := &app{
 		cfg: cfg,
 		client: &client{
@@ -270,10 +312,22 @@ func newApp(cfg config) (*app, error) {
 			token:     cfg.token,
 			model:     cfg.model,
 			reasoning: cfg.reasoning,
-			http:      &http.Client{Timeout: requestTimeout},
+			debug:     cfg.debug,
+			http: &http.Client{
+				Timeout: requestTimeout,
+				Transport: &http.Transport{
+					ForceAttemptHTTP2:     true,
+					MaxIdleConns:          100,
+					MaxIdleConnsPerHost:   10,
+					IdleConnTimeout:       90 * time.Second,
+					TLSHandshakeTimeout:   10 * time.Second,
+					ExpectContinueTimeout: 1 * time.Second,
+				},
+			},
 		},
-		skills:  skills,
+		skills:  skillsMap,
 		toolset: buildAgentTools(cfg.allowedTools),
+		sink:    sink,
 	}
 	subagentCfg := cfg.subagents
 	instance.subagents = newSubagentManager(subagentCfg, instance.runSubagentSession)
@@ -295,9 +349,15 @@ func loadConfig(args []string) (config, error) {
 		allowedTools[name] = true
 	}
 	yolo := false
+	debug := false
 	interactive := false
+	finalOnly := false
 	maxIter := 0
+	serverPort := 0
 	subagentCfg := subagentRuntimeConfig{} // zero = "not set by flag"; env/file/normalize fills gaps
+	toolMaxParallel := 0                   // zero = "not set by flag"
+	toolTimeoutSec := 0                    // zero = "not set by flag"
+	toolRetryOnTimeout := -1               // -1 = "not set by flag"; 0 = explicitly false; 1 = explicitly true
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -457,6 +517,22 @@ func loadConfig(args []string) (config, error) {
 			subagentCfg.ReasoningEffort = strings.TrimSpace(args[i])
 		case strings.HasPrefix(arg, "--subagent-reasoning-effort="):
 			subagentCfg.ReasoningEffort = strings.TrimSpace(strings.TrimPrefix(arg, "--subagent-reasoning-effort="))
+		case arg == "--server-port":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--server-port requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--server-port")
+			if err != nil {
+				return config{}, err
+			}
+			serverPort = value
+		case strings.HasPrefix(arg, "--server-port="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--server-port="), "--server-port")
+			if err != nil {
+				return config{}, err
+			}
+			serverPort = value
 		case arg == "--max-iterations":
 			if i+1 >= len(args) {
 				return config{}, errors.New("--max-iterations requires a value")
@@ -473,6 +549,46 @@ func loadConfig(args []string) (config, error) {
 				return config{}, err
 			}
 			maxIter = value
+		case arg == "--final-only":
+			finalOnly = true
+		case arg == "--tool-max-parallel":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--tool-max-parallel requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--tool-max-parallel")
+			if err != nil {
+				return config{}, err
+			}
+			toolMaxParallel = value
+		case strings.HasPrefix(arg, "--tool-max-parallel="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--tool-max-parallel="), "--tool-max-parallel")
+			if err != nil {
+				return config{}, err
+			}
+			toolMaxParallel = value
+		case arg == "--tool-timeout-seconds":
+			if i+1 >= len(args) {
+				return config{}, errors.New("--tool-timeout-seconds requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--tool-timeout-seconds")
+			if err != nil {
+				return config{}, err
+			}
+			toolTimeoutSec = value
+		case strings.HasPrefix(arg, "--tool-timeout-seconds="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--tool-timeout-seconds="), "--tool-timeout-seconds")
+			if err != nil {
+				return config{}, err
+			}
+			toolTimeoutSec = value
+		case arg == "--tool-retry-on-timeout":
+			toolRetryOnTimeout = 1
+		case arg == "--no-tool-retry-on-timeout":
+			toolRetryOnTimeout = 0
+		case arg == "--debug" || arg == "-debug":
+			debug = true
 		case strings.HasPrefix(arg, "-"):
 			return config{}, fmt.Errorf("unknown flag %q", arg)
 		default:
@@ -567,19 +683,50 @@ func loadConfig(args []string) (config, error) {
 		maxIter = defaultMaxIterations
 	}
 
+	// Resolve tool config: flag (non-zero) > env > file > built-in default.
+	if toolMaxParallel == 0 {
+		if env := readCfg("TOOL_MAX_PARALLEL", fileCfg, ""); env != "" {
+			if v, err := parsePositiveInt(env, "TOOL_MAX_PARALLEL"); err == nil {
+				toolMaxParallel = v
+			}
+		}
+	}
+	if toolMaxParallel == 0 {
+		toolMaxParallel = defaultToolMaxParallel
+	}
+	if toolTimeoutSec == 0 {
+		if env := readCfg("TOOL_TIMEOUT_SECONDS", fileCfg, ""); env != "" {
+			if v, err := parsePositiveInt(env, "TOOL_TIMEOUT_SECONDS"); err == nil {
+				toolTimeoutSec = v
+			}
+		}
+	}
+	if toolTimeoutSec == 0 {
+		toolTimeoutSec = defaultToolTimeoutSec
+	}
+	if toolRetryOnTimeout == -1 {
+		toolRetryOnTimeout = boolToInt(readBoolCfg("TOOL_RETRY_ON_TIMEOUT", fileCfg, defaultToolRetryOnTimeout))
+	}
+
 	return config{
-		baseURL:         baseURL,
-		model:           rootModel,
-		token:           readCfg("TOKEN", fileCfg, defaultToken),
-		reasoning:       reasoning,
-		systemPrompt:    readSystemPrompt(fileCfg),
-		interactive:     interactive,
-		initialQuestion: strings.TrimSpace(strings.Join(filtered, " ")),
-		workspaceRoot:   workspaceRoot,
-		allowedTools:    allowedTools,
-		yolo:            yolo,
-		maxIterations:   maxIter,
-		subagents:       subagentCfg,
+		baseURL:            baseURL,
+		model:              rootModel,
+		token:              readCfg("TOKEN", fileCfg, defaultToken),
+		reasoning:          reasoning,
+		systemPrompt:       readSystemPrompt(fileCfg),
+		interactive:        interactive,
+		finalOnly:          finalOnly,
+		initialQuestion:    strings.TrimSpace(strings.Join(filtered, " ")),
+		workspaceRoot:      workspaceRoot,
+		allowedTools:       allowedTools,
+		yolo:               yolo,
+		maxIterations:      maxIter,
+		subagents:          subagentCfg,
+		serverPort:         serverPort,
+		toolMaxParallel:    toolMaxParallel,
+		toolTimeoutSec:     toolTimeoutSec,
+		toolRetryOnTimeout: toolRetryOnTimeout != 0,
+		debug:              debug,
 	}, nil
 }
 
@@ -593,6 +740,28 @@ func parsePositiveInt(raw, flagName string) (int, error) {
 		return 0, fmt.Errorf("%s expects a positive integer, got %q", flagName, value)
 	}
 	return parsed, nil
+}
+
+func readBoolCfg(key string, fileCfg map[string]string, fallback bool) bool {
+	value := readCfg(key, fileCfg, "")
+	if value == "" {
+		return fallback
+	}
+	switch strings.ToLower(value) {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func readEnv(key, fallback string) string {
@@ -677,7 +846,7 @@ MAX_ITERATIONS = 40
 SUBAGENT_MAX_DEPTH = 1
 SUBAGENT_MAX_CHILDREN = 8
 SUBAGENT_MAX_PARALLEL = 4
-SUBAGENT_TIMEOUT_SECONDS = 300
+SUBAGENT_TIMEOUT_SECONDS = 600
 SUBAGENT_MAX_RESULT_CHARS = 8000
 SUBAGENT_MAX_AGGREGATE_CHARS = 12000
 SUBAGENT_MAX_ITERATIONS = 20
@@ -686,6 +855,12 @@ SUBAGENT_MAX_ITERATIONS = 20
 # env vars: SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT; also settable via CLI flags
 SUBAGENT_MODEL =
 SUBAGENT_REASONING_EFFORT =
+
+# Parallel tool execution (env vars: TOOL_MAX_PARALLEL, TOOL_TIMEOUT_SECONDS, TOOL_RETRY_ON_TIMEOUT)
+# Empty = default (8). Also settable via CLI flags.
+TOOL_MAX_PARALLEL = 8
+TOOL_TIMEOUT_SECONDS = 60
+TOOL_RETRY_ON_TIMEOUT = true
 `
 
 // ensureConfigFile creates the config file with defaults if it does not exist,
@@ -793,38 +968,52 @@ func readConfigFile(path string) (map[string]string, error) {
 
 func printUsage(w io.Writer) {
 	fmt.Fprintf(w, usageMessageTemplate, filepath.Base(os.Args[0]))
-	fmt.Fprintln(w, "Interactive mode: -i / --interactive  (keep session alive for follow-up turns; initial question is optional)")
+	fmt.Fprintln(w, "Modes:")
+	fmt.Fprintln(w, "  -i / --interactive         readline REPL (multi-turn; initial question is optional)")
+	fmt.Fprintln(w, "  --final-only               one-shot mode: suppress intermediate tool output, show only the final answer")
+	fmt.Fprintln(w, "  --debug                    dump HTTP request and response to stderr")
 	fmt.Fprintln(w, "Env: BASE_URL, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT")
+	fmt.Fprintln(w, "     TOOL_MAX_PARALLEL, TOOL_TIMEOUT_SECONDS, TOOL_RETRY_ON_TIMEOUT")
 	fmt.Fprintln(w, "Opt-in tools (repeatable): --allow-tool write_file --allow-tool edit_file --allow-tool append_file --allow-tool execute_program --allow-tool execute_skill")
 	fmt.Fprintln(w, "Iteration limit: --max-iterations N (default 40; env MAX_ITERATIONS; always wraps up gracefully on limit)")
 	fmt.Fprintln(w, "Subagent limits (flags, env vars, or config file):")
 	fmt.Fprintln(w, "  --subagent-max-depth N              (default 1;     env SUBAGENT_MAX_DEPTH)")
 	fmt.Fprintln(w, "  --subagent-max-children N           (default 8 active children; env SUBAGENT_MAX_CHILDREN)")
 	fmt.Fprintln(w, "  --subagent-max-parallel N           (default 4;     env SUBAGENT_MAX_PARALLEL)")
-	fmt.Fprintln(w, "  --subagent-timeout-seconds N        (default 300;   env SUBAGENT_TIMEOUT_SECONDS)")
+	fmt.Fprintln(w, "  --subagent-timeout-seconds N        (default 600;   env SUBAGENT_TIMEOUT_SECONDS)")
 	fmt.Fprintln(w, "  --subagent-max-result-chars N       (default 8000;  env SUBAGENT_MAX_RESULT_CHARS)")
 	fmt.Fprintln(w, "  --subagent-max-aggregate-chars N    (default 12000; env SUBAGENT_MAX_AGGREGATE_CHARS)")
 	fmt.Fprintln(w, "  --subagent-max-iterations N         (default 20;    env SUBAGENT_MAX_ITERATIONS)")
 	fmt.Fprintln(w, "Subagent model (defaults to root MODEL if not set):")
 	fmt.Fprintln(w, "  --subagent-model MODEL              (env SUBAGENT_MODEL)")
 	fmt.Fprintln(w, "  --subagent-reasoning-effort VALUE   (env SUBAGENT_REASONING_EFFORT; set to 'none' to omit)")
+	fmt.Fprintln(w, "Tool execution (flags, env vars, or config file):")
+	fmt.Fprintln(w, "  --tool-max-parallel N               (default 8;     env TOOL_MAX_PARALLEL)")
+	fmt.Fprintln(w, "  --tool-timeout-seconds N            (default 60;    env TOOL_TIMEOUT_SECONDS)")
+	fmt.Fprintln(w, "  --tool-retry-on-timeout             (default true;  env TOOL_RETRY_ON_TIMEOUT)")
+	fmt.Fprintln(w, "  --no-tool-retry-on-timeout          (disable retry)")
 	fmt.Fprintln(w, "All tools + unrestricted paths:  --yolo")
 }
 
 func (a *app) runQuestion(ctx context.Context, question string) error {
-	fmt.Fprintf(os.Stderr, "[capelin-go] Task: %s\n\n", question)
-	messages := []apiMessage{
+	if !a.cfg.finalOnly {
+		fmt.Fprintf(os.Stderr, "[capelin-go] Task: %s\n\n", question)
+	}
+	messages := []types.Message{
 		{Role: "system", Content: a.systemPromptWithSkills()},
 	}
 	_, _, err := a.runTurnLoop(ctx, messages, question, a.rootRuntime(), a.toolset, true)
+	if fs, ok := a.sink.(*finalOnlySink); ok {
+		fs.FlushContent()
+	}
 	return err
 }
 
-func (a *app) runConversation(ctx context.Context, question string, runtime *agentRuntime, toolset []apiTool, emitOutput bool) (string, error) {
-	messages := []apiMessage{
+func (a *app) runConversation(ctx context.Context, question string, runtime *agentRuntime, toolset []types.Tool, emitOutput bool) (string, error) {
+	messages := []types.Message{
 		{Role: "system", Content: a.systemPromptWithSkills()},
 	}
 	_, result, err := a.runTurnLoop(ctx, messages, question, runtime, toolset, emitOutput)
@@ -834,8 +1023,8 @@ func (a *app) runConversation(ctx context.Context, question string, runtime *age
 // runTurnLoop appends a user message to messages and runs the tool-call loop for
 // one turn, returning the updated message slice and the last text content produced
 // by the model. It is the shared core used by one-shot, subagent, and interactive modes.
-func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question string, runtime *agentRuntime, toolset []apiTool, emitOutput bool) ([]apiMessage, string, error) {
-	messages = append(messages, apiMessage{Role: "user", Content: question})
+func (a *app) runTurnLoop(ctx context.Context, messages []types.Message, question string, runtime *agentRuntime, toolset []types.Tool, emitOutput bool) ([]types.Message, string, error) {
+	messages = append(messages, types.Message{Role: "user", Content: question})
 
 	maxIterations := defaultMaxIterations
 	if runtime != nil && runtime.maxToolIterations > 0 {
@@ -848,61 +1037,154 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 		runtimeReasoning = runtime.reasoning
 	}
 	lastContent := ""
+	agentID := rootAgentID
+	if runtime != nil && strings.TrimSpace(runtime.sessionID) != "" {
+		agentID = runtime.sessionID
+	}
+	sink := a.sink
+	if sink == nil {
+		sink = &stdioSink{}
+	}
+
+	// Turn-level retry constants for transient errors (429, 5xx).
+	const (
+		turnMaxAttempts = 3
+		turnRetryBase   = 2 * time.Second
+	)
 
 	for iter := 0; iter < maxIterations; iter++ {
 		// Warn the model when it's 3 iterations from the cap so it can wrap up gracefully.
 		if iter == maxIterations-3 && maxIterations > 3 {
-			messages = append(messages, apiMessage{
+			messages = append(messages, types.Message{
 				Role:    "user",
 				Content: fmt.Sprintf("[SYSTEM] You have %d iterations remaining. Wrap up and produce a final answer now.", maxIterations-iter),
 			})
 		}
 
-		resp, err := a.client.complete(ctx, messages, toolset, runtimeModel, runtimeReasoning)
-		if err != nil {
-			return messages, "", err
+		// Retry the model request on transient errors (429/5xx).
+		var resp *completionMessage
+		var lastTurnErr error
+		for attempt := 0; attempt < turnMaxAttempts; attempt++ {
+			if attempt > 0 {
+				delay := turnRetryBase * time.Duration(1<<(attempt-1))
+				delay += time.Duration(rand.Int63n(int64(delay) / 2)) // add jitter
+				if emitOutput {
+					sink.WriteSystem(agentID, fmt.Sprintf("[tool] model request failed (429/5xx), retrying in %v…", delay))
+				}
+				select {
+				case <-ctx.Done():
+					return messages, "", ctx.Err()
+				case <-time.After(delay):
+				}
+			}
+			resp, lastTurnErr = a.client.complete(ctx, messages, toolset, runtimeModel, runtimeReasoning)
+			if lastTurnErr == nil {
+				break
+			}
+			// Only retry on transient (retryable) errors.
+			if !isRetryableError(lastTurnErr) {
+				return messages, "", lastTurnErr
+			}
+		}
+		if lastTurnErr != nil {
+			return messages, "", lastTurnErr
 		}
 
 		if content := strings.TrimSpace(resp.Content()); content != "" {
 			lastContent = content
 			if emitOutput {
-				fmt.Fprintln(os.Stdout, content)
+				sink.WriteContent(agentID, content)
 			}
 		}
 
 		messages = append(messages, resp.asMessage())
 		if len(resp.ToolCalls()) == 0 {
 			if emitOutput {
-				fmt.Fprintln(os.Stdout)
+				sink.WriteSystem(agentID, "")
 			}
 			return messages, lastContent, nil
 		}
 
-		for _, call := range resp.ToolCalls() {
-			if emitOutput {
-				fmt.Fprintf(os.Stderr, "[tool] %s(%s)\n", call.Function.Name, call.Function.Arguments)
-			}
-			out, err := a.runToolForRuntime(ctx, runtime, call)
-			if err != nil {
+		// Parallel tool execution: run up to toolMaxParallel tools concurrently,
+		// each with its own toolTimeoutSec deadline. Results are collected in
+		// original call order and appended to messages after all complete.
+		type toolResult struct {
+			idx     int
+			call    types.ToolCall
+			out     string
+			isError bool
+		}
+		toolCalls := resp.ToolCalls()
+		results := make([]toolResult, len(toolCalls))
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(a.cfg.toolMaxParallel)
+		for i, call := range toolCalls {
+			i, call := i, call
+			g.Go(func() error {
 				if emitOutput {
-					fmt.Fprintf(os.Stderr, "[tool] %s error: %v\n", call.Function.Name, err)
+					sink.WriteToolCall(agentID, call.Function.Name, call.Function.Arguments)
 				}
-				out = fmt.Sprintf("Tool error: %v", err)
-			} else if emitOutput {
-				fmt.Fprintf(os.Stderr, "[tool] %s done\n", call.Function.Name)
+				// Determine per-tool timeout: use the tool's declared timeout if present,
+				// otherwise use the default. The per-tool timeout is capped at toolTimeoutMax.
+				timeoutSec := a.cfg.toolTimeoutSec
+				if toolTimeout := parseToolTimeout(call); toolTimeout > 0 {
+					timeoutSec = toolTimeout
+				}
+				for attempt := 0; attempt <= 1; attempt++ {
+					toolCtx, cancel := context.WithTimeout(gctx, time.Duration(timeoutSec)*time.Second)
+					out, err := a.runToolForRuntime(toolCtx, runtime, call)
+					cancel()
+					if err != nil {
+						if attempt == 0 && a.cfg.toolRetryOnTimeout && errors.Is(err, context.DeadlineExceeded) {
+							if emitOutput {
+								sink.WriteSystem(agentID, fmt.Sprintf("[tool] %s timed out, retrying…", call.Function.Name))
+							}
+							continue
+						}
+					results[i] = toolResult{
+						idx:     i,
+						call:    call,
+						out:     fmt.Sprintf("Tool error: %v", err),
+						isError: true,
+					}
+					return nil
+				}
+				results[i] = toolResult{
+					idx:     i,
+					call:    call,
+					out:     out,
+					isError: false,
+				}
+				return nil
 			}
+			return nil
+			})
+		}
+		g.Wait()
 
-			messages = append(messages, apiMessage{
+		// Emit results in original call order
+		for i := range results {
+			r := &results[i]
+			if emitOutput {
+				if r.isError {
+					sink.WriteToolResult(agentID, r.call.Function.Name, true, r.out)
+				} else {
+					sink.WriteToolResult(agentID, r.call.Function.Name, false, "")
+				}
+			}
+			messages = append(messages, types.Message{
 				Role:       "tool",
-				ToolCallID: call.ID,
-				Content:    out,
+				ToolCallID: r.call.ID,
+				Content:    r.out,
 			})
 		}
 	}
 
 	// Maximum iterations reached: force a final answer with no tools available.
-	fmt.Fprintf(os.Stderr, "[capelin-go] Maximum tool iterations (%d) reached; requesting final answer.\n", maxIterations)
-	messages = append(messages, apiMessage{
+	if !a.cfg.finalOnly {
+		fmt.Fprintf(os.Stderr, "[capelin-go] Maximum tool iterations (%d) reached; requesting final answer.\n", maxIterations)
+	}
+	messages = append(messages, types.Message{
 		Role:    "user",
 		Content: "[SYSTEM] Maximum tool iterations reached. Based on everything you have gathered so far, provide your best final answer now. Do not request any more tools.",
 	})
@@ -910,15 +1192,17 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 	if err != nil {
 		// Fall back to whatever content we collected so far.
 		if lastContent != "" {
-			fmt.Fprintf(os.Stderr, "[capelin-go] Final-answer call failed (%v); returning partial result.\n", err)
+			if !a.cfg.finalOnly {
+				fmt.Fprintf(os.Stderr, "[capelin-go] Final-answer call failed (%v); returning partial result.\n", err)
+			}
 			return messages, lastContent, nil
 		}
 		return messages, "", fmt.Errorf("exceeded maximum tool iterations (%d) and final-answer call failed: %w", maxIterations, err)
 	}
 	if content := strings.TrimSpace(resp.Content()); content != "" {
 		if emitOutput {
-			fmt.Fprintln(os.Stdout, content)
-			fmt.Fprintln(os.Stdout)
+			sink.WriteContent(agentID, content)
+			sink.WriteSystem(agentID, "")
 		}
 		messages = append(messages, resp.asMessage())
 		return messages, content, nil
@@ -929,7 +1213,7 @@ func (a *app) runTurnLoop(ctx context.Context, messages []apiMessage, question s
 // runInteractive runs a REPL loop, maintaining conversation history across turns.
 // An optional initialQuestion is handled as the first turn before prompting stdin.
 func (a *app) runInteractive(ctx context.Context) error {
-	messages := []apiMessage{
+	messages := []types.Message{
 		{Role: "system", Content: a.systemPromptWithSkills()},
 	}
 	runtime := a.rootRuntime()
@@ -1007,7 +1291,7 @@ func (a *app) runInteractive(ctx context.Context) error {
 
 // runInteractiveFallback is a minimal line-reader used when readline cannot initialise
 // (e.g. on unsupported platforms or in restricted environments).
-func (a *app) runInteractiveFallback(ctx context.Context, messages []apiMessage, runtime *agentRuntime) error {
+func (a *app) runInteractiveFallback(ctx context.Context, messages []types.Message, runtime *agentRuntime) error {
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		if ctx.Err() != nil {
@@ -1063,11 +1347,11 @@ func (a *app) systemPromptWithSkills() string {
 	return b.String()
 }
 
-func (a *app) runTool(ctx context.Context, call apiToolCall) (string, error) {
+func (a *app) runTool(ctx context.Context, call types.ToolCall) (string, error) {
 	return a.runToolForRuntime(ctx, a.rootRuntime(), call)
 }
 
-func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call apiToolCall) (string, error) {
+func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call types.ToolCall) (string, error) {
 	if runtime == nil {
 		runtime = a.rootRuntime()
 	}
@@ -1300,11 +1584,47 @@ func isRetryableStatus(code int) bool {
 	return code == 429 || code >= 500
 }
 
-func (c *client) complete(ctx context.Context, messages []apiMessage, tools []apiTool, model, reasoning string) (*completionMessage, error) {
+func parseToolTimeout(call types.ToolCall) int {
+	type timeoutArgs struct {
+		TimeoutSeconds int `json:"timeout_seconds"`
+	}
+	var args timeoutArgs
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil || args.TimeoutSeconds <= 0 {
+		return 0
+	}
+	if args.TimeoutSeconds > toolTimeoutMax {
+		return toolTimeoutMax
+	}
+	return args.TimeoutSeconds
+}
+
+// retryableHTTPError wraps an HTTP status code that is safe to retry (429, 5xx).
+type retryableHTTPError struct {
+	StatusCode int
+	msg        string
+}
+
+func (e *retryableHTTPError) Error() string { return e.msg }
+
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var httpErr *retryableHTTPError
+	if errors.As(err, &httpErr) {
+		return true
+	}
+	return false
+}
+
+func (c *client) complete(ctx context.Context, messages []types.Message, tools []types.Tool, model, reasoning string) (*completionMessage, error) {
 	if model == "" {
 		model = c.model
 	}
-	reqBody := apiRequest{
+	reqBody := types.Request{
 		Model:           model,
 		Messages:        messages,
 		Tools:           tools,
@@ -1324,6 +1644,7 @@ func (c *client) complete(ctx context.Context, messages []apiMessage, tools []ap
 	for attempt := 0; attempt < completeMaxAttempts; attempt++ {
 		if attempt > 0 {
 			delay := completeRetryBase * time.Duration(1<<(attempt-1))
+			delay += time.Duration(rand.Int63n(int64(delay) / 2)) // add jitter
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -1340,38 +1661,66 @@ func (c *client) complete(ctx context.Context, messages []apiMessage, tools []ap
 			req.Header.Set("Authorization", "Bearer "+c.token)
 		}
 
+		if c.debug {
+			fmt.Fprintf(os.Stderr, "[capelin-go] >>> POST %s\n", endpoint)
+			for k, v := range req.Header {
+				if strings.EqualFold(k, "authorization") {
+					fmt.Fprintf(os.Stderr, "  %s: Bearer <redacted>\n", k)
+				} else {
+					fmt.Fprintf(os.Stderr, "  %s: %s\n", k, v[0])
+				}
+			}
+			fmt.Fprintf(os.Stderr, "\n%s\n\n", string(body))
+		}
+
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			raw, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			lastErr = fmt.Errorf("model request failed: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
-			if isRetryableStatus(resp.StatusCode) {
-				continue
-			}
-			return nil, lastErr
+		rawBody, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
 		}
 
-		var decoded apiResponse
-		if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
-			resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			msg := fmt.Sprintf("model request failed: %s: %s", resp.Status, strings.TrimSpace(string(rawBody)))
+			if isRetryableStatus(resp.StatusCode) {
+				lastErr = &retryableHTTPError{StatusCode: resp.StatusCode, msg: msg}
+				continue
+			}
+			return nil, fmt.Errorf("%s", msg)
+		}
+
+		if c.debug {
+			fmt.Fprintf(os.Stderr, "[capelin-go] <<< RESPONSE %s\n", resp.Status)
+			for k, v := range resp.Header {
+				fmt.Fprintf(os.Stderr, "  %s: %s\n", k, v[0])
+			}
+			fmt.Fprintf(os.Stderr, "\n%s\n\n", string(rawBody))
+		}
+
+		var decoded types.Response
+		if err := json.Unmarshal(rawBody, &decoded); err != nil {
 			return nil, err
 		}
-		resp.Body.Close()
-		if len(decoded.Choices) == 0 {
+		choices := decoded.Choices
+		if len(choices) == 0 && decoded.Data != nil {
+			choices = decoded.Data.Choices
+		}
+		if len(choices) == 0 {
 			return nil, errors.New("model returned no choices")
 		}
-		return &completionMessage{message: decoded.Choices[0].Message}, nil
+		return &completionMessage{message: choices[0].Message}, nil
 	}
 	return nil, lastErr
 }
 
 type completionMessage struct {
-	message apiCompletionMessage
+	message types.CompletionMessage
 }
 
 func (m *completionMessage) Content() string {
@@ -1381,20 +1730,20 @@ func (m *completionMessage) Content() string {
 	return *m.message.Content
 }
 
-func (m *completionMessage) ToolCalls() []apiToolCall {
+func (m *completionMessage) ToolCalls() []types.ToolCall {
 	return m.message.ToolCalls
 }
 
-func (m *completionMessage) asMessage() apiMessage {
-	msg := apiMessage{Role: m.message.Role, ToolCalls: m.message.ToolCalls}
+func (m *completionMessage) asMessage() types.Message {
+	msg := types.Message{Role: m.message.Role, ToolCalls: m.message.ToolCalls}
 	if m.message.Content != nil {
 		msg.Content = *m.message.Content
 	}
 	return msg
 }
 
-func buildAgentTools(enabled map[string]bool) []apiTool {
-	tools := []apiTool{}
+func buildAgentTools(enabled map[string]bool) []types.Tool {
+	tools := []types.Tool{}
 	if enabled[toolWebSearch] {
 		tools = append(tools, specWebSearch())
 	}
@@ -1446,25 +1795,25 @@ func buildAgentTools(enabled map[string]bool) []apiTool {
 	if enabled[toolCancelSubagent] {
 		tools = append(tools, specCancelSubagent())
 	}
-	slices.SortFunc(tools, func(a, b apiTool) int {
+	slices.SortFunc(tools, func(a, b types.Tool) int {
 		return strings.Compare(a.Function.Name, b.Function.Name)
 	})
 	return tools
 }
 
-func runListSkills(skills map[string]skill) string {
-	if len(skills) == 0 {
+func runListSkills(skillsMap map[string]skills.Skill) string {
+	if len(skillsMap) == 0 {
 		return "(no skills found)"
 	}
-	keys := make([]string, 0, len(skills))
-	for name := range skills {
+	keys := make([]string, 0, len(skillsMap))
+	for name := range skillsMap {
 		keys = append(keys, name)
 	}
 	slices.Sort(keys)
 
 	var b strings.Builder
 	for i, name := range keys {
-		sk := skills[name]
+		sk := skillsMap[name]
 		if i > 0 {
 			b.WriteString("\n\n")
 		}
@@ -1485,12 +1834,12 @@ type readSkillArgs struct {
 	Name string `json:"name"`
 }
 
-func runReadSkill(skills map[string]skill, args readSkillArgs) (string, error) {
+func runReadSkill(skillsMap map[string]skills.Skill, args readSkillArgs) (string, error) {
 	name := strings.TrimSpace(args.Name)
 	if name == "" {
 		return "", errors.New("skill name is required")
 	}
-	sk, ok := skills[name]
+	sk, ok := skillsMap[name]
 	if !ok {
 		return "", fmt.Errorf("skill %q not found", name)
 	}

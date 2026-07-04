@@ -1,6 +1,8 @@
 package main
 
 import (
+	"capelin-go/internal/skills"
+	"capelin-go/internal/types"
 	"context"
 	"encoding/json"
 	"errors"
@@ -284,18 +286,18 @@ func TestLoadSkillsPrecedence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	skills, err := loadSkillsFromDirs([]struct {
-		path   string
-		source string
+	skillsMap, err := skills.LoadFromDirs([]struct {
+		Path   string
+		Source string
 	}{
-		{path: filepath.Join(project, ".agents", "skills"), source: "project"},
-		{path: filepath.Join(userHome, ".agents", "skills"), source: "user"},
+		{Path: filepath.Join(project, ".agents", "skills"), Source: "project"},
+		{Path: filepath.Join(userHome, ".agents", "skills"), Source: "user"},
 	})
 	if err != nil {
-		t.Fatalf("loadSkillsFromDirs: %v", err)
+		t.Fatalf("LoadFromDirs: %v", err)
 	}
-	if skills["demo"].Description != "project desc" {
-		t.Fatalf("expected project override, got: %q", skills["demo"].Description)
+	if skillsMap["demo"].Description != "project desc" {
+		t.Fatalf("expected project override, got: %q", skillsMap["demo"].Description)
 	}
 }
 
@@ -358,9 +360,9 @@ func TestParseSkillFileNameFallback(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	sk, err := parseSkillFile(filepath.Join(skillDir, "SKILL.md"), "project")
+	sk, err := skills.ParseFile(filepath.Join(skillDir, "SKILL.md"), "project")
 	if err != nil {
-		t.Fatalf("parseSkillFile: %v", err)
+		t.Fatalf("ParseFile: %v", err)
 	}
 	if sk.Name != "my-skill" {
 		t.Fatalf("expected dir-name fallback, got: %q", sk.Name)
@@ -376,10 +378,10 @@ func TestDisabledToolReturnsError(t *testing.T) {
 	}
 	a := &app{cfg: cfg}
 
-	_, err = a.runTool(context.Background(), apiToolCall{
+	_, err = a.runTool(context.Background(), types.ToolCall{
 		ID:   "1",
 		Type: "function",
-		Function: apiFunctionCall{
+		Function: types.FunctionCall{
 			Name:      toolWriteFile,
 			Arguments: `{"path":"x.txt","content":"hi"}`,
 		},
@@ -391,10 +393,10 @@ func TestDisabledToolReturnsError(t *testing.T) {
 		t.Fatalf("expected hint in error message, got: %v", err)
 	}
 
-	_, err = a.runTool(context.Background(), apiToolCall{
+	_, err = a.runTool(context.Background(), types.ToolCall{
 		ID:   "2",
 		Type: "function",
-		Function: apiFunctionCall{
+		Function: types.FunctionCall{
 			Name:      toolExecuteProgram,
 			Arguments: `{"command":"echo"}`,
 		},
@@ -403,10 +405,10 @@ func TestDisabledToolReturnsError(t *testing.T) {
 		t.Fatal("expected disabled-tool error for execute_program")
 	}
 
-	_, err = a.runTool(context.Background(), apiToolCall{
+	_, err = a.runTool(context.Background(), types.ToolCall{
 		ID:   "3",
 		Type: "function",
-		Function: apiFunctionCall{
+		Function: types.FunctionCall{
 			Name:      toolExecuteSkill,
 			Arguments: `{"name":"vPass","command":"opencli"}`,
 		},
@@ -415,10 +417,10 @@ func TestDisabledToolReturnsError(t *testing.T) {
 		t.Fatal("expected disabled-tool error for execute_skill")
 	}
 
-	_, err = a.runTool(context.Background(), apiToolCall{
+	_, err = a.runTool(context.Background(), types.ToolCall{
 		ID:   "4",
 		Type: "function",
-		Function: apiFunctionCall{
+		Function: types.FunctionCall{
 			Name:      toolEditFile,
 			Arguments: `{"path":"x.txt","old_str":"hello","new_str":"world"}`,
 		},
@@ -514,7 +516,7 @@ runs: |
 
 ## Commands
 ` + "```bash\nopencli secretshare share \"x\"\necho done\n```\n"
-	cmds := extractExecutableCommands(content, "#!/bin/bash\nopencli thing \"$1\"")
+	cmds := skills.ExtractExecutableCommands(content, "#!/bin/bash\nopencli thing \"$1\"")
 	if !slices.Contains(cmds, "opencli") {
 		t.Fatalf("expected opencli parsed from skill commands, got: %v", cmds)
 	}
@@ -525,7 +527,7 @@ runs: |
 
 func TestRunExecuteSkill(t *testing.T) {
 	root := t.TempDir()
-	skills := map[string]skill{
+	skills := map[string]skills.Skill{
 		"demo": {
 			Name:     "demo",
 			Commands: []string{"echo"},
@@ -546,7 +548,7 @@ func TestRunExecuteSkill(t *testing.T) {
 
 func TestRunExecuteSkillRejectsUndeclaredCommand(t *testing.T) {
 	root := t.TempDir()
-	skills := map[string]skill{
+	skills := map[string]skills.Skill{
 		"demo": {Name: "demo", Commands: []string{"echo"}},
 	}
 	_, err := runExecuteSkill(context.Background(), root, false, skills, executeSkillArgs{
@@ -594,10 +596,10 @@ func TestSubagentLifecycleAndAggregation(t *testing.T) {
 		return "done: " + session.Question, nil
 	}
 
-	createCall := apiToolCall{
+	createCall := types.ToolCall{
 		ID:   "1",
 		Type: "function",
-		Function: apiFunctionCall{
+		Function: types.FunctionCall{
 			Name:      toolCreateSubagent,
 			Arguments: `{"name":"worker-a","question":"inspect repo","execution_mode":"sequential"}`,
 		},
@@ -614,10 +616,10 @@ func TestSubagentLifecycleAndAggregation(t *testing.T) {
 		t.Fatalf("unexpected initial status: %s", created.Status)
 	}
 
-	runCall := apiToolCall{
+	runCall := types.ToolCall{
 		ID:   "2",
 		Type: "function",
-		Function: apiFunctionCall{
+		Function: types.FunctionCall{
 			Name:      toolRunSubagent,
 			Arguments: `{"id":"` + created.ID + `","wait":true}`,
 		},
@@ -637,10 +639,10 @@ func TestSubagentLifecycleAndAggregation(t *testing.T) {
 		t.Fatalf("unexpected output: %q", ran.Output)
 	}
 
-	readAggregate := apiToolCall{
+	readAggregate := types.ToolCall{
 		ID:   "3",
 		Type: "function",
-		Function: apiFunctionCall{
+		Function: types.FunctionCall{
 			Name:      toolReadSubagent,
 			Arguments: `{"ids":["` + created.ID + `"]}`,
 		},
@@ -940,10 +942,10 @@ func TestRunToolForRuntimeRejectsRestrictedAlwaysTool(t *testing.T) {
 		maxToolIterations: 5,
 	}
 
-	_, err = a.runToolForRuntime(context.Background(), runtime, apiToolCall{
+	_, err = a.runToolForRuntime(context.Background(), runtime, types.ToolCall{
 		ID:   "x",
 		Type: "function",
-		Function: apiFunctionCall{
+		Function: types.FunctionCall{
 			Name:      toolWebSearch,
 			Arguments: `{"query":"test"}`,
 		},
@@ -1109,7 +1111,7 @@ func TestReasoningEffortNoneOmitted(t *testing.T) {
 	}
 
 	// Ensure omitempty actually omits the field when empty.
-	req := apiRequest{Model: "m", ReasoningEffort: v}
+	req := types.Request{Model: "m", ReasoningEffort: v}
 	b, _ := json.Marshal(req)
 	if strings.Contains(string(b), "reasoning_effort") {
 		t.Fatalf("expected reasoning_effort to be omitted from JSON, got %s", string(b))
@@ -1545,5 +1547,380 @@ func TestRootRuntimeCarriesModelAndReasoning(t *testing.T) {
 	}
 	if rt.reasoning != "low" {
 		t.Fatalf("expected rootRuntime.reasoning=low, got %q", rt.reasoning)
+	}
+}
+
+func TestLoadConfigServerPort(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	cfg, err := loadConfig([]string{"--server-port", "8899"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.serverPort != 8899 {
+		t.Fatalf("expected serverPort=8899, got %d", cfg.serverPort)
+	}
+}
+
+func TestLoadConfigServerPortEqualForm(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	cfg, err := loadConfig([]string{"--server-port=9090"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.serverPort != 9090 {
+		t.Fatalf("expected serverPort=9090, got %d", cfg.serverPort)
+	}
+}
+
+func TestLoadConfigServerPortRejectsZero(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	_, err := loadConfig([]string{"--server-port", "0"})
+	if err == nil {
+		t.Fatal("expected error for --server-port=0")
+	}
+}
+
+func TestLoadConfigServerPortRejectsNegative(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	_, err := loadConfig([]string{"--server-port", "-1"})
+	if err == nil {
+		t.Fatal("expected error for --server-port=-1")
+	}
+}
+
+func TestLoadConfigServerPortRejectsNonNumeric(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	_, err := loadConfig([]string{"--server-port", "abc"})
+	if err == nil {
+		t.Fatal("expected error for --server-port=abc")
+	}
+}
+
+func TestServerRequiresEndpoint(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+	}
+
+	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
+	// No path URL and no ?endpoint= query parameter
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	a.handleChatCompletion(w, req, serverAllowedTools)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "endpoint required") {
+		t.Fatalf("expected endpoint required error, got: %s", w.Body.String())
+	}
+}
+
+func TestServerRequiresBearerToken(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+	}
+
+	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/?endpoint=https://example.com/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	// No Authorization header
+	w := httptest.NewRecorder()
+
+	a.handleChatCompletion(w, req, serverAllowedTools)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "Bearer") {
+		t.Fatalf("expected Bearer token error, got: %s", w.Body.String())
+	}
+}
+
+func TestServerRejectsMalformedBearerToken(t *testing.T) {
+	isolateConfigFile(t)
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+	}
+	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
+
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{"missing prefix", "Token sk-test"},
+		{"lowercase prefix", "bearer sk-test"},
+		{"extra spaces", "Bearer   "},
+		{"no space", "Bearersk-test"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost,
+				"/?endpoint=https://example.com/v1/chat/completions",
+				strings.NewReader(body))
+			req.Header.Set("Authorization", tc.value)
+			w := httptest.NewRecorder()
+			a.handleChatCompletion(w, req, serverAllowedTools)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for %q, got %d", tc.name, w.Code)
+			}
+		})
+	}
+}
+
+func TestServerAcceptsTrimmedBearerToken(t *testing.T) {
+	isolateConfigFile(t)
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+	}
+	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
+
+	req := httptest.NewRequest(http.MethodPost,
+		"/?endpoint=https://example.com/v1/chat/completions",
+		strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer  sk-test ") // extra spaces
+	w := httptest.NewRecorder()
+
+	// This should NOT return 400 (it will fail downstream with a dial error,
+	// but that means the token was accepted and forwarded correctly).
+	a.handleChatCompletion(w, req, serverAllowedTools)
+	if w.Code == http.StatusBadRequest {
+		t.Fatalf("trimmed bearer token should be accepted, got 400: %s", w.Body.String())
+	}
+}
+
+func TestServerRejectsMethodGet(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/?endpoint=https://example.com/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+
+	a.handleChatCompletion(w, req, serverAllowedTools)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", w.Code)
+	}
+}
+
+func TestServerRejectsEmptyMessages(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+	}
+
+	body := `{"model":"test","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/?endpoint=https://example.com/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-test")
+	w := httptest.NewRecorder()
+
+	a.handleChatCompletion(w, req, serverAllowedTools)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "messages") {
+		t.Fatalf("expected messages error, got: %s", w.Body.String())
+	}
+}
+
+func TestServerRejectsInvalidJSON(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/?endpoint=https://example.com/v1/chat/completions", strings.NewReader("not json"))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-test")
+	w := httptest.NewRecorder()
+
+	a.handleChatCompletion(w, req, serverAllowedTools)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "invalid JSON") {
+		t.Fatalf("expected JSON error, got: %s", w.Body.String())
+	}
+}
+
+func TestServerOnlyAllowsSearchAndFetchTools(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+	}
+
+	// Verify toolset only has web_search and fetch_page
+	if len(a.toolset) != 2 {
+		t.Fatalf("expected exactly 2 tools in server mode, got %d", len(a.toolset))
+	}
+	toolNames := map[string]bool{}
+	for _, tool := range a.toolset {
+		toolNames[tool.Function.Name] = true
+	}
+	if !toolNames[toolWebSearch] || !toolNames[toolFetchPage] {
+		t.Fatalf("expected web_search and fetch_page tools, got: %v", toolNames)
+	}
+	if toolNames[toolReadFile] || toolNames[toolWriteFile] || toolNames[toolExecuteProgram] {
+		t.Fatalf("expected no file/exec tools in server mode, got: %v", toolNames)
+	}
+}
+
+func TestServerModeSystemPromptIsStripped(t *testing.T) {
+	if !strings.Contains(serverModeSystemPrompt, "web_search") {
+		t.Fatal("expected serverModeSystemPrompt to reference web_search")
+	}
+	if strings.Contains(serverModeSystemPrompt, "skill") {
+		t.Fatal("expected serverModeSystemPrompt to not reference skills")
+	}
+	if strings.Contains(serverModeSystemPrompt, "subagent") {
+		t.Fatal("expected serverModeSystemPrompt to not reference subagents")
+	}
+}
+
+func TestIsRetryableError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"deadline exceeded", context.DeadlineExceeded, false},
+		{"context canceled", context.Canceled, false},
+		{"retryable 429", &retryableHTTPError{StatusCode: 429, msg: "429 too many"}, true},
+		{"retryable 500", &retryableHTTPError{StatusCode: 500, msg: "500 internal"}, true},
+		{"retryable 502", &retryableHTTPError{StatusCode: 502, msg: "502 bad gateway"}, true},
+		{"non-retryable 400", fmt.Errorf("model request failed: 400 Bad Request: bad input"), false},
+		{"non-retryable 401", fmt.Errorf("model request failed: 401 Unauthorized: no token"), false},
+		{"wrapped retryable", fmt.Errorf("outer: %w", &retryableHTTPError{StatusCode: 429, msg: "429"}), true},
+		{"wrapped non-retryable", fmt.Errorf("outer: %w", context.DeadlineExceeded), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRetryableError(tt.err); got != tt.want {
+				t.Fatalf("isRetryableError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFinalOnlySinkBuffersLastContent(t *testing.T) {
+	var last string
+	wrapped := &spySink{onContent: func(s string) { last = s }}
+	sink := &finalOnlySink{wrapped: wrapped}
+
+	sink.WriteContent(rootAgentID, "first")
+	sink.WriteContent(rootAgentID, "second")
+	sink.WriteContent(rootAgentID, "third")
+
+	if last != "" {
+		t.Fatalf("expected nothing flushed yet, got: %q", last)
+	}
+	sink.FlushContent()
+	if last != "third" {
+		t.Fatalf("expected last content flushed, got: %q", last)
+	}
+}
+
+func TestFinalOnlySinkSuppressesSubagentContent(t *testing.T) {
+	var last string
+	wrapped := &spySink{onContent: func(s string) { last = s }}
+	sink := &finalOnlySink{wrapped: wrapped}
+
+	sink.WriteContent("subagent-1", "subagent output")
+	sink.WriteContent(rootAgentID, "root output")
+	sink.FlushContent()
+
+	if last != "root output" {
+		t.Fatalf("expected only root content, got: %q", last)
+	}
+}
+
+func TestFinalOnlySinkSuppressesToolAndSystemOutput(t *testing.T) {
+	var toolCalls, toolResults, systems int
+	wrapped := &spySink{
+		onToolCall:   func(string, string) { toolCalls++ },
+		onToolResult: func(string, bool, string) { toolResults++ },
+		onSystem:     func(string) { systems++ },
+	}
+	sink := &finalOnlySink{wrapped: wrapped}
+
+	sink.WriteToolCall(rootAgentID, "web_search", "{}")
+	sink.WriteToolResult(rootAgentID, "web_search", false, "")
+	sink.WriteSystem(rootAgentID, "msg")
+
+	if toolCalls != 0 || toolResults != 0 || systems != 0 {
+		t.Fatalf("expected all suppressed, got calls=%d results=%d systems=%d", toolCalls, toolResults, systems)
+	}
+}
+
+// spySink is a minimal OutputSink for testing.
+type spySink struct {
+	onContent    func(string)
+	onToolCall   func(string, string)
+	onToolResult func(string, bool, string)
+	onSystem     func(string)
+}
+
+func (s *spySink) WriteContent(_ string, content string) {
+	if s.onContent != nil {
+		s.onContent(content)
+	}
+}
+func (s *spySink) WriteToolCall(_ string, toolName, args string) {
+	if s.onToolCall != nil {
+		s.onToolCall(toolName, args)
+	}
+}
+func (s *spySink) WriteToolResult(_ string, toolName string, isError bool, detail string) {
+	if s.onToolResult != nil {
+		s.onToolResult(toolName, isError, detail)
+	}
+}
+func (s *spySink) WriteSystem(_ string, msg string) {
+	if s.onSystem != nil {
+		s.onSystem(msg)
 	}
 }
