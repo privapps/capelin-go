@@ -58,10 +58,16 @@ Output policy:
 - Use markdown formatting for readability.`
 
 func startServer(cfg config) error {
-	// In server mode, only web_search and fetch_page are available.
+	// In server mode, web_search, fetch_page, and subagent tools are available.
 	serverAllowedTools := map[string]bool{
-		toolWebSearch: true,
-		toolFetchPage: true,
+		toolWebSearch:      true,
+		toolFetchPage:      true,
+		toolCreateSubagent: true,
+		toolRunSubagent:    true,
+		toolAwaitSubagent:  true,
+		toolListSubagents:  true,
+		toolReadSubagent:   true,
+		toolCancelSubagent: true,
 	}
 
 	a := &app{
@@ -74,10 +80,10 @@ func startServer(cfg config) error {
 			debug:     cfg.debug,
 			http:      serverHTTPClient,
 		},
-		skills:    nil,
-		toolset:   buildAgentTools(serverAllowedTools),
-		subagents: nil,
+		skills:  nil,
+		toolset: buildAgentTools(serverAllowedTools),
 	}
+	a.subagents = newSubagentManager(cfg.subagents, a.runSubagentSession)
 
 	mux := http.NewServeMux()
 	// Catch-all pattern: any POST to /<remoteURL> is handled
@@ -233,12 +239,12 @@ func (a *app) handleChatCompletion(w http.ResponseWriter, r *http.Request, serve
 
 	// Build server-mode app with the remote client.
 	serverApp := &app{
-		cfg:       a.cfg,
-		client:    remoteClient,
-		skills:    a.skills,
-		toolset:   buildAgentTools(serverAllowedTools),
-		subagents: nil,
+		cfg:     a.cfg,
+		client:  remoteClient,
+		skills:  a.skills,
+		toolset: buildAgentTools(serverAllowedTools),
 	}
+	serverApp.subagents = newSubagentManager(a.cfg.subagents, serverApp.runSubagentSession)
 
 	// Create runtime with the model from the request (overrides default config model).
 	runtime := serverApp.rootRuntime()
@@ -262,16 +268,24 @@ func (a *app) handleChatCompletion(w http.ResponseWriter, r *http.Request, serve
 		question = messages[len(messages)-1].Content
 		messages = messages[:len(messages)-1]
 	}
-	_, result, err := serverApp.runTurnLoop(r.Context(), messages, question, runtime, serverApp.toolset, false)
+	_, result, reasoning, err := serverApp.runTurnLoop(r.Context(), messages, question, runtime, serverApp.toolset, false)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	writeChatCompletionResponse(w, model, result)
+	writeChatCompletionResponse(w, model, result, reasoning)
 }
 
-func writeChatCompletionResponse(w http.ResponseWriter, model, content string) {
+func writeChatCompletionResponse(w http.ResponseWriter, model, content, reasoning string) {
+	message := map[string]string{
+		"role":    "assistant",
+		"content": content,
+	}
+	if reasoning != "" {
+		message["reasoning"] = reasoning
+	}
+
 	resp := map[string]any{
 		"id":      fmt.Sprintf("capelin-%d", time.Now().UnixNano()),
 		"object":  "chat.completion",
@@ -280,10 +294,7 @@ func writeChatCompletionResponse(w http.ResponseWriter, model, content string) {
 		"choices": []map[string]any{
 			{
 				"index": 0,
-				"message": map[string]string{
-					"role":    "assistant",
-					"content": content,
-				},
+				"message": message,
 				"finish_reason": "stop",
 			},
 		},

@@ -1005,7 +1005,7 @@ func (a *app) runQuestion(ctx context.Context, question string) error {
 	messages := []types.Message{
 		{Role: "system", Content: a.systemPromptWithSkills()},
 	}
-	_, _, err := a.runTurnLoop(ctx, messages, question, a.rootRuntime(), a.toolset, true)
+	_, _, _, err := a.runTurnLoop(ctx, messages, question, a.rootRuntime(), a.toolset, true)
 	if fs, ok := a.sink.(*finalOnlySink); ok {
 		fs.FlushContent()
 	}
@@ -1016,14 +1016,15 @@ func (a *app) runConversation(ctx context.Context, question string, runtime *age
 	messages := []types.Message{
 		{Role: "system", Content: a.systemPromptWithSkills()},
 	}
-	_, result, err := a.runTurnLoop(ctx, messages, question, runtime, toolset, emitOutput)
+	_, result, _, err := a.runTurnLoop(ctx, messages, question, runtime, toolset, emitOutput)
 	return result, err
 }
 
 // runTurnLoop appends a user message to messages and runs the tool-call loop for
-// one turn, returning the updated message slice and the last text content produced
-// by the model. It is the shared core used by one-shot, subagent, and interactive modes.
-func (a *app) runTurnLoop(ctx context.Context, messages []types.Message, question string, runtime *agentRuntime, toolset []types.Tool, emitOutput bool) ([]types.Message, string, error) {
+// one turn, returning the updated message slice, the last text content produced
+// by the model, and an accumulated reasoning trace. It is the shared core used
+// by one-shot, subagent, and interactive modes.
+func (a *app) runTurnLoop(ctx context.Context, messages []types.Message, question string, runtime *agentRuntime, toolset []types.Tool, emitOutput bool) ([]types.Message, string, string, error) {
 	messages = append(messages, types.Message{Role: "user", Content: question})
 
 	maxIterations := defaultMaxIterations
@@ -1037,6 +1038,7 @@ func (a *app) runTurnLoop(ctx context.Context, messages []types.Message, questio
 		runtimeReasoning = runtime.reasoning
 	}
 	lastContent := ""
+	var reasoningBuf strings.Builder
 	agentID := rootAgentID
 	if runtime != nil && strings.TrimSpace(runtime.sessionID) != "" {
 		agentID = runtime.sessionID
@@ -1073,7 +1075,7 @@ func (a *app) runTurnLoop(ctx context.Context, messages []types.Message, questio
 				}
 				select {
 				case <-ctx.Done():
-					return messages, "", ctx.Err()
+					return messages, "", "", ctx.Err()
 				case <-time.After(delay):
 				}
 			}
@@ -1083,11 +1085,11 @@ func (a *app) runTurnLoop(ctx context.Context, messages []types.Message, questio
 			}
 			// Only retry on transient (retryable) errors.
 			if !isRetryableError(lastTurnErr) {
-				return messages, "", lastTurnErr
+				return messages, "", "", lastTurnErr
 			}
 		}
 		if lastTurnErr != nil {
-			return messages, "", lastTurnErr
+			return messages, "", "", lastTurnErr
 		}
 
 		if content := strings.TrimSpace(resp.Content()); content != "" {
@@ -1097,12 +1099,20 @@ func (a *app) runTurnLoop(ctx context.Context, messages []types.Message, questio
 			}
 		}
 
+		// Accumulate reasoning from LLM response.
+		if reasoning := strings.TrimSpace(resp.ReasoningContent()); reasoning != "" {
+			if reasoningBuf.Len() > 0 {
+				reasoningBuf.WriteString("\n\n")
+			}
+			fmt.Fprintf(&reasoningBuf, "[Turn %d]\nThinking: %s", iter+1, reasoning)
+		}
+
 		messages = append(messages, resp.asMessage())
 		if len(resp.ToolCalls()) == 0 {
 			if emitOutput {
 				sink.WriteSystem(agentID, "")
 			}
-			return messages, lastContent, nil
+			return messages, lastContent, reasoningBuf.String(), nil
 		}
 
 		// Parallel tool execution: run up to toolMaxParallel tools concurrently,
@@ -1178,6 +1188,29 @@ func (a *app) runTurnLoop(ctx context.Context, messages []types.Message, questio
 				Content:    r.out,
 			})
 		}
+
+		// Accumulate tool call details in reasoning trace.
+		if reasoningBuf.Len() > 0 || len(toolCalls) > 0 {
+			if reasoningBuf.Len() > 0 {
+				reasoningBuf.WriteString("\n\n")
+			} else {
+				fmt.Fprintf(&reasoningBuf, "[Turn %d]\n", iter+1)
+			}
+			reasoningBuf.WriteString("Tool calls:\n")
+			for i := range results {
+				r := &results[i]
+				args := r.call.Function.Arguments
+				if len(args) > 200 {
+					args = args[:200] + "..."
+				}
+				fmt.Fprintf(&reasoningBuf, "  %s(%s)\n", r.call.Function.Name, args)
+				// Show concise summary of tool results.
+				summary := extractToolSummary(r.call.Function.Name, r.out, r.isError)
+				if summary != "" {
+					fmt.Fprintf(&reasoningBuf, "  > %s\n", summary)
+				}
+			}
+		}
 	}
 
 	// Maximum iterations reached: force a final answer with no tools available.
@@ -1195,19 +1228,25 @@ func (a *app) runTurnLoop(ctx context.Context, messages []types.Message, questio
 			if !a.cfg.finalOnly {
 				fmt.Fprintf(os.Stderr, "[capelin-go] Final-answer call failed (%v); returning partial result.\n", err)
 			}
-			return messages, lastContent, nil
+			return messages, lastContent, reasoningBuf.String(), nil
 		}
-		return messages, "", fmt.Errorf("exceeded maximum tool iterations (%d) and final-answer call failed: %w", maxIterations, err)
+		return messages, "", "", fmt.Errorf("exceeded maximum tool iterations (%d) and final-answer call failed: %w", maxIterations, err)
 	}
 	if content := strings.TrimSpace(resp.Content()); content != "" {
 		if emitOutput {
 			sink.WriteContent(agentID, content)
 			sink.WriteSystem(agentID, "")
 		}
+		if reasoning := strings.TrimSpace(resp.ReasoningContent()); reasoning != "" {
+			if reasoningBuf.Len() > 0 {
+				reasoningBuf.WriteString("\n\n")
+			}
+			fmt.Fprintf(&reasoningBuf, "[Turn %d]\nThinking: %s", maxIterations+1, reasoning)
+		}
 		messages = append(messages, resp.asMessage())
-		return messages, content, nil
+		return messages, content, reasoningBuf.String(), nil
 	}
-	return messages, lastContent, nil
+	return messages, lastContent, reasoningBuf.String(), nil
 }
 
 // runInteractive runs a REPL loop, maintaining conversation history across turns.
@@ -1221,7 +1260,7 @@ func (a *app) runInteractive(ctx context.Context) error {
 	if a.cfg.initialQuestion != "" {
 		fmt.Fprintf(os.Stderr, "[capelin-go] Task: %s\n\n", a.cfg.initialQuestion)
 		var err error
-		messages, _, err = a.runTurnLoop(ctx, messages, a.cfg.initialQuestion, runtime, a.toolset, true)
+		messages, _, _, err = a.runTurnLoop(ctx, messages, a.cfg.initialQuestion, runtime, a.toolset, true)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -1277,7 +1316,7 @@ func (a *app) runInteractive(ctx context.Context) error {
 		}
 
 		preTurnLen := len(messages)
-		messages, _, err = a.runTurnLoop(ctx, messages, input, runtime, a.toolset, true)
+		messages, _, _, err = a.runTurnLoop(ctx, messages, input, runtime, a.toolset, true)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -1311,7 +1350,7 @@ func (a *app) runInteractiveFallback(ctx context.Context, messages []types.Messa
 		}
 		preTurnLen := len(messages)
 		var runErr error
-		messages, _, runErr = a.runTurnLoop(ctx, messages, input, runtime, a.toolset, true)
+		messages, _, _, runErr = a.runTurnLoop(ctx, messages, input, runtime, a.toolset, true)
 		if runErr != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -1604,6 +1643,67 @@ type retryableHTTPError struct {
 	msg        string
 }
 
+// extractToolSummary returns a concise summary of tool results for the reasoning trace.
+func extractToolSummary(toolName, output string, isError bool) string {
+	if isError {
+		return "Error: " + truncateStr(output, 200)
+	}
+	switch toolName {
+	case "web_search":
+		return extractSearchSummary(output)
+	case "fetch_page":
+		return extractPageSummary(output)
+	default:
+		return truncateStr(output, 200)
+	}
+}
+
+// extractSearchSummary extracts the first few result titles from web_search output.
+func extractSearchSummary(output string) string {
+	lines := strings.Split(output, "\n")
+	var titles []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		// Match lines like "1. **Title**" or "1. Title"
+		if len(titles) >= 3 {
+			break
+		}
+		if strings.HasPrefix(line, "1.") || strings.HasPrefix(line, "2.") || strings.HasPrefix(line, "3.") ||
+			strings.HasPrefix(line, "4.") || strings.HasPrefix(line, "5.") {
+			// Extract title: remove number prefix and bold markers
+			title := line
+			if idx := strings.Index(title, ". "); idx >= 0 {
+				title = title[idx+2:]
+			}
+			title = strings.ReplaceAll(title, "**", "")
+			if len(title) > 80 {
+				title = title[:80] + "..."
+			}
+			titles = append(titles, title)
+		}
+	}
+	if len(titles) == 0 {
+		return truncateStr(output, 200)
+	}
+	return strings.Join(titles, "; ")
+}
+
+// extractPageSummary returns a brief summary of fetch_page output.
+func extractPageSummary(output string) string {
+	if len(output) == 0 {
+		return "(empty)"
+	}
+	// Return first 200 chars of page content
+	return truncateStr(output, 200)
+}
+
+func truncateStr(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
+
 func (e *retryableHTTPError) Error() string { return e.msg }
 
 func isRetryableError(err error) bool {
@@ -1728,6 +1828,13 @@ func (m *completionMessage) Content() string {
 		return ""
 	}
 	return *m.message.Content
+}
+
+func (m *completionMessage) ReasoningContent() string {
+	if m.message.ReasoningContent == nil {
+		return ""
+	}
+	return *m.message.ReasoningContent
 }
 
 func (m *completionMessage) ToolCalls() []types.ToolCall {

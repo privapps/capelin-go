@@ -63,9 +63,10 @@ type Response struct {
 
 // CompletionMessage is the assistant message inside an API response.
 type CompletionMessage struct {
-	Role      string     `json:"role"`
-	Content   *string    `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role             string     `json:"role"`
+	Content          *string    `json:"content"`
+	ReasoningContent *string    `json:"reasoning,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // SubagentNode is a snapshot of one agent node for TUI display.

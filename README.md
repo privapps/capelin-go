@@ -90,9 +90,32 @@ curl -X POST "http://localhost:8899/?endpoint=https://opencode.ai/zen/v1/chat/co
 In server mode:
 - Endpoint: full URL including `/chat/completions` — use URL-encoded path (`%3A%2F%2F` for `://`), hex-encoded path (`~<hex>` for obfuscated endpoints), or `?endpoint=` query parameter
 - API token: standard `Authorization: Bearer <token>` header
-- Only `web_search` and `fetch_page` tools are available (no file, execute, or skill tools)
+- Available tools: `web_search`, `fetch_page`, and subagent orchestration (`create_subagent`, `run_subagent`, `await_subagent`, `list_subagents`, `read_subagent`, `cancel_subagent`)
+- Response includes a `reasoning` field with LLM thinking, tool call traces, and subagent results
 - Connection stays open until the agent completes (may take several minutes)
 - Returns OpenAI-format response with the final result
+
+**Response format:**
+
+The response follows the OpenAI chat completion format with an additional `reasoning` field:
+
+```json
+{
+  "id": "capelin-...",
+  "object": "chat.completion",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "The final answer...",
+      "reasoning": "[Turn 1]\nThinking: ...\n\nTool calls:\n  web_search(query=\"...\")\n  > ..."
+    },
+    "finish_reason": "stop"
+  }]
+}
+```
+
+The `reasoning` field is omitted when the model doesn't provide reasoning content and no tools are used.
 
 **Keybindings:**
 

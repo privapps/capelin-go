@@ -1785,16 +1785,25 @@ func TestServerRejectsInvalidJSON(t *testing.T) {
 func TestServerOnlyAllowsSearchAndFetchTools(t *testing.T) {
 	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
-	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	serverAllowedTools := map[string]bool{
+		toolWebSearch:      true,
+		toolFetchPage:      true,
+		toolCreateSubagent: true,
+		toolRunSubagent:    true,
+		toolAwaitSubagent:  true,
+		toolListSubagents:  true,
+		toolReadSubagent:   true,
+		toolCancelSubagent: true,
+	}
 	a := &app{
 		cfg:    config{workspaceRoot: t.TempDir()},
 		client: &client{http: &http.Client{}},
 		toolset: buildAgentTools(serverAllowedTools),
 	}
 
-	// Verify toolset only has web_search and fetch_page
-	if len(a.toolset) != 2 {
-		t.Fatalf("expected exactly 2 tools in server mode, got %d", len(a.toolset))
+	// Verify toolset has web_search, fetch_page, and subagent tools
+	if len(a.toolset) != 8 {
+		t.Fatalf("expected 8 tools in server mode, got %d", len(a.toolset))
 	}
 	toolNames := map[string]bool{}
 	for _, tool := range a.toolset {
@@ -1802,6 +1811,9 @@ func TestServerOnlyAllowsSearchAndFetchTools(t *testing.T) {
 	}
 	if !toolNames[toolWebSearch] || !toolNames[toolFetchPage] {
 		t.Fatalf("expected web_search and fetch_page tools, got: %v", toolNames)
+	}
+	if !toolNames[toolCreateSubagent] || !toolNames[toolRunSubagent] || !toolNames[toolAwaitSubagent] {
+		t.Fatalf("expected subagent tools in server mode, got: %v", toolNames)
 	}
 	if toolNames[toolReadFile] || toolNames[toolWriteFile] || toolNames[toolExecuteProgram] {
 		t.Fatalf("expected no file/exec tools in server mode, got: %v", toolNames)
@@ -1814,9 +1826,6 @@ func TestServerModeSystemPromptIsStripped(t *testing.T) {
 	}
 	if strings.Contains(serverModeSystemPrompt, "skill") {
 		t.Fatal("expected serverModeSystemPrompt to not reference skills")
-	}
-	if strings.Contains(serverModeSystemPrompt, "subagent") {
-		t.Fatal("expected serverModeSystemPrompt to not reference subagents")
 	}
 }
 
@@ -1923,4 +1932,255 @@ func (s *spySink) WriteSystem(_ string, msg string) {
 	if s.onSystem != nil {
 		s.onSystem(msg)
 	}
+}
+
+func TestWriteChatCompletionResponseWithReasoning(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeChatCompletionResponse(w, "gpt-4o", "final answer", "thinking about stuff")
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+
+	choices, ok := resp["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		t.Fatalf("expected choices array, got: %v", resp["choices"])
+	}
+	choice := choices[0].(map[string]any)
+	msg := choice["message"].(map[string]any)
+
+	if msg["reasoning"] != "thinking about stuff" {
+		t.Fatalf("expected reasoning in response, got: %v", msg["reasoning"])
+	}
+	if msg["content"] != "final answer" {
+		t.Fatalf("expected content in response, got: %v", msg["content"])
+	}
+	if msg["role"] != "assistant" {
+		t.Fatalf("expected role assistant, got: %v", msg["role"])
+	}
+}
+
+func TestWriteChatCompletionResponseWithoutReasoning(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeChatCompletionResponse(w, "gpt-4o", "final answer", "")
+
+	body := w.Body.String()
+	if strings.Contains(body, "reasoning") {
+		t.Fatalf("expected no reasoning key when empty, got: %s", body)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	choices := resp["choices"].([]any)
+	choice := choices[0].(map[string]any)
+	msg := choice["message"].(map[string]any)
+
+	if msg["content"] != "final answer" {
+		t.Fatalf("expected content in response, got: %v", msg["content"])
+	}
+}
+
+func TestRunTurnLoopReturnsReasoning(t *testing.T) {
+	// Mock LLM that returns reasoning_content in its response.
+	mockResp := types.Response{
+		Choices: []struct {
+			Message      types.CompletionMessage `json:"message"`
+			FinishReason string                   `json:"finish_reason"`
+		}{{
+			Message: types.CompletionMessage{
+				Role:             "assistant",
+				Content:          ptrString("Here is the answer"),
+				ReasoningContent: ptrString("I thought about this carefully"),
+			},
+			FinishReason: "stop",
+		}},
+	}
+	mockBody, _ := json.Marshal(mockResp)
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(mockBody)
+	}))
+	defer mockServer.Close()
+
+	a := &app{
+		cfg: config{
+			workspaceRoot:  t.TempDir(),
+			toolTimeoutSec: 30,
+		},
+		client: &client{
+			baseURL: mockServer.URL,
+			token:   "test-token",
+			model:   "test-model",
+			http:    &http.Client{},
+		},
+		toolset: []types.Tool{},
+	}
+
+	messages := []types.Message{
+		{Role: "system", Content: "You are a test assistant."},
+	}
+	runtime := a.rootRuntime()
+
+	_, _, reasoning, err := a.runTurnLoop(context.Background(), messages, "hello", runtime, a.toolset, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(reasoning, "I thought about this carefully") {
+		t.Fatalf("expected reasoning to contain LLM thinking, got: %q", reasoning)
+	}
+	if !strings.Contains(reasoning, "[Turn 1]") {
+		t.Fatalf("expected reasoning to contain turn header, got: %q", reasoning)
+	}
+	if !strings.Contains(reasoning, "Thinking:") {
+		t.Fatalf("expected reasoning to contain Thinking label, got: %q", reasoning)
+	}
+}
+
+func TestRunTurnLoopReasoningWithToolCalls(t *testing.T) {
+	callCount := 0
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var resp types.Response
+		if callCount == 1 {
+			// First call: return a tool call
+			resp = types.Response{
+				Choices: []struct {
+					Message      types.CompletionMessage `json:"message"`
+					FinishReason string                   `json:"finish_reason"`
+				}{{
+					Message: types.CompletionMessage{
+						Role:    "assistant",
+						Content: ptrString(""),
+						ReasoningContent: ptrString("I need to search for info"),
+						ToolCalls: []types.ToolCall{{
+							ID:   "call-1",
+							Type: "function",
+							Function: types.FunctionCall{
+								Name:      "web_search",
+								Arguments: `{"query":"test query"}`,
+							},
+						}},
+					},
+					FinishReason: "tool_calls",
+				}},
+			}
+		} else {
+			// Second call: return final answer
+			resp = types.Response{
+				Choices: []struct {
+					Message      types.CompletionMessage `json:"message"`
+					FinishReason string                   `json:"finish_reason"`
+				}{{
+					Message: types.CompletionMessage{
+						Role:             "assistant",
+						Content:          ptrString("Here are the results"),
+						ReasoningContent: ptrString("Based on the search results"),
+					},
+					FinishReason: "stop",
+				}},
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer mockServer.Close()
+
+	// Mock the search URL so web_search doesn't make real HTTP requests.
+	mockSearchServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><body><div class="result"><a class="result__a" href="https://example.com">Test Result</a><a class="result__snippet">Test snippet</a></div></body></html>`)
+	}))
+	defer mockSearchServer.Close()
+	origDDG := ddgSearchURL
+	origBing := bingSearchURL
+	ddgSearchURL = mockSearchServer.URL
+	bingSearchURL = mockSearchServer.URL
+	defer func() {
+		ddgSearchURL = origDDG
+		bingSearchURL = origBing
+	}()
+
+	a := &app{
+		cfg: config{
+			workspaceRoot:   t.TempDir(),
+			toolTimeoutSec:  30,
+			toolMaxParallel: 4,
+		},
+		client: &client{
+			baseURL: mockServer.URL,
+			token:   "test-token",
+			model:   "test-model",
+			http:    &http.Client{},
+		},
+		toolset: buildAgentTools(map[string]bool{toolWebSearch: true}),
+	}
+
+	messages := []types.Message{
+		{Role: "system", Content: "You are a test assistant."},
+	}
+	runtime := a.rootRuntime()
+
+	_, _, reasoning, err := a.runTurnLoop(context.Background(), messages, "search for test", runtime, a.toolset, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(reasoning, "I need to search for info") {
+		t.Fatalf("expected reasoning to contain first turn thinking, got: %q", reasoning)
+	}
+	if !strings.Contains(reasoning, "Based on the search results") {
+		t.Fatalf("expected reasoning to contain second turn thinking, got: %q", reasoning)
+	}
+	if !strings.Contains(reasoning, "web_search") {
+		t.Fatalf("expected reasoning to contain tool call name, got: %q", reasoning)
+	}
+	if !strings.Contains(reasoning, "Tool calls:") {
+		t.Fatalf("expected reasoning to contain tool calls section, got: %q", reasoning)
+	}
+	if !strings.Contains(reasoning, "[Turn 1]") {
+		t.Fatalf("expected reasoning to contain [Turn 1], got: %q", reasoning)
+	}
+	if !strings.Contains(reasoning, "[Turn 2]") {
+		t.Fatalf("expected reasoning to contain [Turn 2], got: %q", reasoning)
+	}
+}
+
+func TestServerModeToolsetIncludesSubagents(t *testing.T) {
+	serverAllowedTools := map[string]bool{
+		toolWebSearch:      true,
+		toolFetchPage:      true,
+		toolCreateSubagent: true,
+		toolRunSubagent:    true,
+		toolAwaitSubagent:  true,
+		toolListSubagents:  true,
+		toolReadSubagent:   true,
+		toolCancelSubagent: true,
+	}
+	toolset := buildAgentTools(serverAllowedTools)
+
+	if len(toolset) != 8 {
+		t.Fatalf("expected 8 tools in server mode, got %d", len(toolset))
+	}
+	toolNames := map[string]bool{}
+	for _, tool := range toolset {
+		toolNames[tool.Function.Name] = true
+	}
+	expectedTools := []string{
+		toolWebSearch, toolFetchPage,
+		toolCreateSubagent, toolRunSubagent, toolAwaitSubagent,
+		toolListSubagents, toolReadSubagent, toolCancelSubagent,
+	}
+	for _, name := range expectedTools {
+		if !toolNames[name] {
+			t.Fatalf("expected tool %q in server mode toolset", name)
+		}
+	}
+}
+
+func ptrString(s string) *string {
+	return &s
 }
