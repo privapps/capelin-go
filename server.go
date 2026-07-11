@@ -177,7 +177,7 @@ func (a *app) handleChatCompletion(w http.ResponseWriter, r *http.Request, serve
 	}
 
 	if remoteBase == "" {
-		writeError(w, http.StatusBadRequest, "endpoint required: use path /https%3A%2F%2Fexample.com/v1/chat/completions, /~<hex-encoded-URL>, or ?endpoint=https://example.com/v1/chat/completions")
+		writeError(w, http.StatusBadRequest, "endpoint required: use path /https%3A%2F%2Fexample.com/v1/chat/completions (or http), /~<hex-encoded-URL>, or ?endpoint=https://example.com/v1/chat/completions")
 		return
 	}
 
@@ -244,7 +244,12 @@ func (a *app) handleChatCompletion(w http.ResponseWriter, r *http.Request, serve
 		skills:  a.skills,
 		toolset: buildAgentTools(serverAllowedTools),
 	}
-	serverApp.subagents = newSubagentManager(a.cfg.subagents, serverApp.runSubagentSession)
+
+	// Create subagent manager with model from request (overrides default config model).
+	subagentCfg := a.cfg.subagents
+	subagentCfg.Model = model
+	subagentCfg.ReasoningEffort = reasoning
+	serverApp.subagents = newSubagentManager(subagentCfg, serverApp.runSubagentSession)
 
 	// Create runtime with the model from the request (overrides default config model).
 	runtime := serverApp.rootRuntime()
