@@ -7,7 +7,7 @@
 - one-shot task execution
 - **interactive mode** (`-i` / `--interactive`): multi-turn REPL sharing a single conversation history
 - **server mode** (`--server-port PORT`): HTTP server accepting OpenAI-format requests
-- model loop with tool calling (`/chat/completions`)
+- model loop with tool calling (`/chat/completions` and `/responses`)
 - Claude-style skill discovery from:
   - `.agents/skills` (project-local)
   - `~/.agents/skills` (user-level)
@@ -88,6 +88,7 @@ curl -X POST "http://localhost:8899/?endpoint=https://opencode.ai/zen/v1/chat/co
 ```
 
 In server mode:
+- CORS: browser requests are allowed from any origin; `GET`, `POST`, and `OPTIONS` are supported for local proxy access
 - Endpoint: full URL including `/chat/completions` — use URL-encoded path (`%3A%2F%2F` for `://`), hex-encoded path (`~<hex>` for obfuscated endpoints), or `?endpoint=` query parameter
 - API token: standard `Authorization: Bearer <token>` header
 - Available tools: `web_search`, `fetch_page`, and subagent orchestration (`create_subagent`, `run_subagent`, `await_subagent`, `list_subagents`, `read_subagent`, `cancel_subagent`)
@@ -180,10 +181,10 @@ Enable everything (all tools + unrestricted paths):
 ## Environment variables
 
 - `--server-port PORT` — start HTTP server on given port (server mode)
-- `BASE_URL` — model server base URL (default: `http://localhost:8235/v1`)
+- `ENDPOINT` — complete model URL (default: `http://localhost:8235/v1/chat/completions`). When its URL path ends with `/responses` (with an optional trailing slash), capelin-go uses the official OpenAI Responses API schema; all other paths use Chat Completions.
 - `MODEL` — model ID (default: `gpt-5-mini`)
 - `TOKEN` — optional API token
-- `REASONING_EFFORT` — passed through to the model backend; set to `none` to omit the field entirely from the request
+- `REASONING_EFFORT` — passed through to the model backend; set to `none` or `nil` to omit the field entirely from the request
 - `SYSTEM_PROMPT` (or `systemPrompt`) — prompt override
 - `MAX_ITERATIONS` — root agent tool-call iteration cap (default: 40; overridden by `--max-iterations`); always wraps up gracefully on limit
 - `SUBAGENT_MAX_DEPTH` — maximum subagent nesting depth (default: 1; overridden by `--subagent-max-depth`)
@@ -194,7 +195,7 @@ Enable everything (all tools + unrestricted paths):
 - `SUBAGENT_MAX_AGGREGATE_CHARS` — maximum total characters across all subagent results in a single turn (default: 12000; overridden by `--subagent-max-aggregate-chars`)
 - `SUBAGENT_MAX_ITERATIONS` — maximum tool-call iterations per subagent (default: 20; overridden by `--subagent-max-iterations`)
 - `SUBAGENT_MODEL` — model ID used for subagents (default: inherits `MODEL`; overridden by `--subagent-model`)
-- `SUBAGENT_REASONING_EFFORT` — reasoning effort for subagents (default: inherits `REASONING_EFFORT`; set to `none` to omit; overridden by `--subagent-reasoning-effort`)
+- `SUBAGENT_REASONING_EFFORT` — reasoning effort for subagents (default: inherits `REASONING_EFFORT`; set to `none` or `nil` to omit; overridden by `--subagent-reasoning-effort`)
 
 ## Config file
 
@@ -205,7 +206,7 @@ On first run capelin-go creates `~/.local/capelin-go/config.ini` with default va
 # Edit this file to set persistent defaults.
 # Priority: CLI flags > environment variables > this file > built-in defaults.
 
-BASE_URL = http://localhost:8235/v1
+ENDPOINT = http://localhost:8235/v1/chat/completions
 MODEL = gpt-5-mini
 TOKEN =
 REASONING_EFFORT = medium
@@ -223,10 +224,23 @@ SUBAGENT_MAX_RESULT_CHARS = 8000
 SUBAGENT_MAX_AGGREGATE_CHARS = 12000
 SUBAGENT_MAX_ITERATIONS = 20
 
-# Subagent model and reasoning effort (leave blank to inherit root MODEL and REASONING_EFFORT)
+# Subagent model and reasoning effort (leave blank to inherit root MODEL and REASONING_EFFORT;
+# set reasoning effort to none or nil to omit it from requests)
 # env vars: SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT; also settable via CLI flags
 SUBAGENT_MODEL =
 SUBAGENT_REASONING_EFFORT =
 ```
 
 Edit that file to set your preferred model, server URL, or other defaults without needing environment variables every time. Environment variables and CLI flags still take priority over config file values.
+
+### Responses API mode
+
+Set `ENDPOINT` to an OpenAI Responses endpoint such as:
+
+```ini
+ENDPOINT = https://api.openai.com/v1/responses
+```
+
+When the endpoint path ends with `/responses`, capelin-go sends the official Responses API format, including `input`, flat function tools, and `reasoning.effort`. Function calls are continued with matching `function_call_output` items, and requests are stateless: capelin-go does not use `previous_response_id`.
+
+Endpoints that do not end with `/responses` continue to use Chat Completions. Provider-specific Responses variants and streaming are not supported.

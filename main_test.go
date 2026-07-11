@@ -38,8 +38,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig returned error: %v", err)
 	}
-	if cfg.baseURL != defaultBaseURL {
-		t.Fatalf("unexpected baseURL: %q", cfg.baseURL)
+	if cfg.endpoint != defaultEndpoint {
+		t.Fatalf("unexpected endpoint: %q", cfg.endpoint)
 	}
 	if cfg.model != defaultModel {
 		t.Fatalf("unexpected model: %q", cfg.model)
@@ -1058,8 +1058,8 @@ func TestConfigFileCreatedWithDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readConfigFile: %v", err)
 	}
-	if cfg["BASE_URL"] != "http://localhost:8235/v1" {
-		t.Fatalf("unexpected BASE_URL: %q", cfg["BASE_URL"])
+	if cfg["ENDPOINT"] != "http://localhost:8235/v1/chat/completions" {
+		t.Fatalf("unexpected ENDPOINT: %q", cfg["ENDPOINT"])
 	}
 	if cfg["MODEL"] != "gpt-5-mini" {
 		t.Fatalf("unexpected MODEL: %q", cfg["MODEL"])
@@ -1070,7 +1070,7 @@ func TestConfigFileCreatedWithDefaults(t *testing.T) {
 }
 
 func TestConfigFileEnvOverridesFile(t *testing.T) {
-	t.Setenv("BASE_URL", "http://override:9999/v1")
+	t.Setenv("ENDPOINT", "http://override:9999/v1/chat/completions")
 	t.Setenv("MODEL", "")
 	t.Setenv("TOKEN", "")
 	t.Setenv("REASONING_EFFORT", "")
@@ -1080,7 +1080,7 @@ func TestConfigFileEnvOverridesFile(t *testing.T) {
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.ini")
-	content := "BASE_URL = http://file-url:1234/v1\nMODEL = file-model\n"
+	content := "ENDPOINT = http://file-url:1234/v1/chat/completions\nMODEL = file-model\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -1088,15 +1088,66 @@ func TestConfigFileEnvOverridesFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readConfigFile: %v", err)
 	}
-	// Env var "BASE_URL" is set to override; file has a different value.
-	got := readCfg("BASE_URL", fileCfg, defaultBaseURL)
-	if got != "http://override:9999/v1" {
+	// Env var "ENDPOINT" is set to override; file has a different value.
+	got := readCfg("ENDPOINT", fileCfg, defaultEndpoint)
+	if got != "http://override:9999/v1/chat/completions" {
 		t.Fatalf("expected env to win over file, got %q", got)
 	}
+
 	// MODEL has no env override; file value should be used.
 	got = readCfg("MODEL", fileCfg, defaultModel)
 	if got != "file-model" {
 		t.Fatalf("expected file MODEL to be used, got %q", got)
+	}
+}
+
+func TestLegacyBaseURLConfigIsIgnored(t *testing.T) {
+	t.Setenv("ENDPOINT", "")
+	fileCfg := map[string]string{"BASE_URL": "http://legacy:1234/v1"}
+
+	endpoint, err := readEndpoint(fileCfg)
+	if err != nil {
+		t.Fatalf("readEndpoint: %v", err)
+	}
+	if endpoint != defaultEndpoint {
+		t.Fatalf("expected legacy BASE_URL to be ignored, got %q", endpoint)
+	}
+}
+
+func TestExistingConfigMissingEndpointReturnsError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.ini")
+	if err := os.WriteFile(path, []byte("BASE_URL = http://legacy:1234/v1\nMODEL = test-model\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv("CAPELIN_CONFIG_FILE", path)
+
+	_, err := ensureConfigFile()
+	if err == nil {
+		t.Fatal("expected missing ENDPOINT error")
+	}
+	if !strings.Contains(err.Error(), "missing ENDPOINT") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestClientUsesCompleteEndpointWithoutAppendingPath(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	client := &client{
+		endpoint: server.URL + "/custom/chat/completions",
+		http:     server.Client(),
+	}
+	if _, err := client.complete(context.Background(), []types.Message{{Role: "user", Content: "hello"}}, nil, "model", ""); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if gotPath != "/custom/chat/completions" {
+		t.Fatalf("expected complete endpoint path, got %q", gotPath)
 	}
 }
 
@@ -1119,13 +1170,13 @@ func TestReasoningEffortNoneOmitted(t *testing.T) {
 }
 
 func TestReasoningEffortNoneCaseInsensitive(t *testing.T) {
-	for _, val := range []string{"none", "None", "NONE", "nOnE"} {
+	for _, val := range []string{"none", "None", "NONE", "nOnE", "nil", "NIL"} {
 		v, err := readReasoningEffort(map[string]string{"REASONING_EFFORT": val})
 		if err != nil {
 			t.Fatalf("readReasoningEffort(%q): %v", val, err)
 		}
 		if v != "" {
-			t.Fatalf("readReasoningEffort(%q) expected empty, got %q", val, v)
+			t.Fatalf("readReasoningEffort(%q) expected unset, got %q", val, v)
 		}
 	}
 }
@@ -1224,7 +1275,10 @@ func TestUpsertConfigFileKeys(t *testing.T) {
 
 	// Pre-existing values must be unchanged.
 	if cfg["BASE_URL"] != "http://localhost:8235/v1" {
-		t.Fatalf("upsert changed existing BASE_URL: %q", cfg["BASE_URL"])
+		t.Fatalf("upsert changed existing legacy BASE_URL: %q", cfg["BASE_URL"])
+	}
+	if cfg["ENDPOINT"] != defaultEndpoint {
+		t.Fatalf("expected ENDPOINT=%q after upsert, got %q", defaultEndpoint, cfg["ENDPOINT"])
 	}
 
 	// New keys must have been added with their defaults.
@@ -1431,7 +1485,10 @@ func TestUpsertConfigFileKeysIncludesSubagentModelKeys(t *testing.T) {
 	}
 	// Pre-existing values must be unchanged.
 	if cfg["BASE_URL"] != "http://localhost:8235/v1" {
-		t.Fatalf("upsert changed existing BASE_URL: %q", cfg["BASE_URL"])
+		t.Fatalf("upsert changed existing legacy BASE_URL: %q", cfg["BASE_URL"])
+	}
+	if cfg["ENDPOINT"] != defaultEndpoint {
+		t.Fatalf("expected ENDPOINT=%q after upsert, got %q", defaultEndpoint, cfg["ENDPOINT"])
 	}
 }
 
@@ -1606,8 +1663,8 @@ func TestServerRequiresEndpoint(t *testing.T) {
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
 	a := &app{
-		cfg:    config{workspaceRoot: t.TempDir()},
-		client: &client{http: &http.Client{}},
+		cfg:     config{workspaceRoot: t.TempDir()},
+		client:  &client{http: &http.Client{}},
 		toolset: buildAgentTools(serverAllowedTools),
 	}
 
@@ -1627,13 +1684,62 @@ func TestServerRequiresEndpoint(t *testing.T) {
 	}
 }
 
+func TestWithCORSHandlesPreflight(t *testing.T) {
+	called := false
+	handler := withCORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	req := httptest.NewRequest(http.MethodOptions, "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", w.Code)
+	}
+	if called {
+		t.Fatal("expected preflight request not to reach wrapped handler")
+	}
+	assertCORSHeaders(t, w)
+}
+
+func TestWithCORSAddsHeadersToResponses(t *testing.T) {
+	handler := withCORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	assertCORSHeaders(t, w)
+}
+
+func assertCORSHeaders(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	expected := map[string]string{
+		"Access-Control-Allow-Origin":  "*",
+		"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+		"Access-Control-Allow-Headers": "Content-Type, Authorization",
+		"Access-Control-Max-Age":       "600",
+	}
+	for key, want := range expected {
+		if got := w.Header().Get(key); got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+}
+
 func TestServerRequiresBearerToken(t *testing.T) {
 	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
 	a := &app{
-		cfg:    config{workspaceRoot: t.TempDir()},
-		client: &client{http: &http.Client{}},
+		cfg:     config{workspaceRoot: t.TempDir()},
+		client:  &client{http: &http.Client{}},
 		toolset: buildAgentTools(serverAllowedTools),
 	}
 
@@ -1657,8 +1763,8 @@ func TestServerRejectsMalformedBearerToken(t *testing.T) {
 	isolateConfigFile(t)
 	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
 	a := &app{
-		cfg:    config{workspaceRoot: t.TempDir()},
-		client: &client{http: &http.Client{}},
+		cfg:     config{workspaceRoot: t.TempDir()},
+		client:  &client{http: &http.Client{}},
 		toolset: buildAgentTools(serverAllowedTools),
 	}
 	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
@@ -1691,8 +1797,8 @@ func TestServerAcceptsTrimmedBearerToken(t *testing.T) {
 	isolateConfigFile(t)
 	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
 	a := &app{
-		cfg:    config{workspaceRoot: t.TempDir()},
-		client: &client{http: &http.Client{}},
+		cfg:     config{workspaceRoot: t.TempDir()},
+		client:  &client{http: &http.Client{}},
 		toolset: buildAgentTools(serverAllowedTools),
 	}
 	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
@@ -1716,8 +1822,8 @@ func TestServerRejectsMethodGet(t *testing.T) {
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
 	a := &app{
-		cfg:    config{workspaceRoot: t.TempDir()},
-		client: &client{http: &http.Client{}},
+		cfg:     config{workspaceRoot: t.TempDir()},
+		client:  &client{http: &http.Client{}},
 		toolset: buildAgentTools(serverAllowedTools),
 	}
 
@@ -1736,8 +1842,8 @@ func TestServerRejectsEmptyMessages(t *testing.T) {
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
 	a := &app{
-		cfg:    config{workspaceRoot: t.TempDir()},
-		client: &client{http: &http.Client{}},
+		cfg:     config{workspaceRoot: t.TempDir()},
+		client:  &client{http: &http.Client{}},
 		toolset: buildAgentTools(serverAllowedTools),
 	}
 
@@ -1762,8 +1868,8 @@ func TestServerRejectsInvalidJSON(t *testing.T) {
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
 	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
 	a := &app{
-		cfg:    config{workspaceRoot: t.TempDir()},
-		client: &client{http: &http.Client{}},
+		cfg:     config{workspaceRoot: t.TempDir()},
+		client:  &client{http: &http.Client{}},
 		toolset: buildAgentTools(serverAllowedTools),
 	}
 
@@ -1796,8 +1902,8 @@ func TestServerOnlyAllowsSearchAndFetchTools(t *testing.T) {
 		toolCancelSubagent: true,
 	}
 	a := &app{
-		cfg:    config{workspaceRoot: t.TempDir()},
-		client: &client{http: &http.Client{}},
+		cfg:     config{workspaceRoot: t.TempDir()},
+		client:  &client{http: &http.Client{}},
 		toolset: buildAgentTools(serverAllowedTools),
 	}
 
@@ -1988,7 +2094,7 @@ func TestRunTurnLoopReturnsReasoning(t *testing.T) {
 	mockResp := types.Response{
 		Choices: []struct {
 			Message      types.CompletionMessage `json:"message"`
-			FinishReason string                   `json:"finish_reason"`
+			FinishReason string                  `json:"finish_reason"`
 		}{{
 			Message: types.CompletionMessage{
 				Role:             "assistant",
@@ -2011,10 +2117,10 @@ func TestRunTurnLoopReturnsReasoning(t *testing.T) {
 			toolTimeoutSec: 30,
 		},
 		client: &client{
-			baseURL: mockServer.URL,
-			token:   "test-token",
-			model:   "test-model",
-			http:    &http.Client{},
+			endpoint: mockServer.URL + "/chat/completions",
+			token:    "test-token",
+			model:    "test-model",
+			http:     &http.Client{},
 		},
 		toolset: []types.Tool{},
 	}
@@ -2050,11 +2156,11 @@ func TestRunTurnLoopReasoningWithToolCalls(t *testing.T) {
 			resp = types.Response{
 				Choices: []struct {
 					Message      types.CompletionMessage `json:"message"`
-					FinishReason string                   `json:"finish_reason"`
+					FinishReason string                  `json:"finish_reason"`
 				}{{
 					Message: types.CompletionMessage{
-						Role:    "assistant",
-						Content: ptrString(""),
+						Role:             "assistant",
+						Content:          ptrString(""),
 						ReasoningContent: ptrString("I need to search for info"),
 						ToolCalls: []types.ToolCall{{
 							ID:   "call-1",
@@ -2073,7 +2179,7 @@ func TestRunTurnLoopReasoningWithToolCalls(t *testing.T) {
 			resp = types.Response{
 				Choices: []struct {
 					Message      types.CompletionMessage `json:"message"`
-					FinishReason string                   `json:"finish_reason"`
+					FinishReason string                  `json:"finish_reason"`
 				}{{
 					Message: types.CompletionMessage{
 						Role:             "assistant",
@@ -2111,10 +2217,10 @@ func TestRunTurnLoopReasoningWithToolCalls(t *testing.T) {
 			toolMaxParallel: 4,
 		},
 		client: &client{
-			baseURL: mockServer.URL,
-			token:   "test-token",
-			model:   "test-model",
-			http:    &http.Client{},
+			endpoint: mockServer.URL + "/chat/completions",
+			token:    "test-token",
+			model:    "test-model",
+			http:     &http.Client{},
 		},
 		toolset: buildAgentTools(map[string]bool{toolWebSearch: true}),
 	}
@@ -2178,6 +2284,154 @@ func TestServerModeToolsetIncludesSubagents(t *testing.T) {
 		if !toolNames[name] {
 			t.Fatalf("expected tool %q in server mode toolset", name)
 		}
+	}
+}
+
+func TestResponsesEndpointDetection(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		want     bool
+	}{
+		{"https://example.com/responses", true},
+		{"https://example.com/responses/", true},
+		{"https://example.com/v1/responses", true},
+		{"https://example.com/chat/completions", false},
+		{"https://example.com/responses-extra", false},
+		{"https://example.com/chat/responses/v1", false},
+	}
+	for _, tc := range tests {
+		if got := (&client{endpoint: tc.endpoint}).isResponsesEndpoint(); got != tc.want {
+			t.Errorf("isResponsesEndpoint(%q) = %v, want %v", tc.endpoint, got, tc.want)
+		}
+	}
+}
+
+func TestResponsesExactPayloadAndText(t *testing.T) {
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses/" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}`))
+	}))
+	defer server.Close()
+
+	tool := types.Tool{Type: "function", Function: types.ToolSpec{
+		Name: "lookup", Description: "Look something up",
+		Parameters: map[string]any{"type": "object", "properties": map[string]any{}},
+	}}
+	c := &client{endpoint: server.URL + "/responses/", http: server.Client()}
+	resp, err := c.complete(context.Background(), []types.Message{{Role: "user", Content: "hi"}}, []types.Tool{tool}, "gpt-test", "")
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if got := resp.Content(); got != "hello" {
+		t.Fatalf("content = %q, want hello", got)
+	}
+	if _, ok := payload["messages"]; ok {
+		t.Fatal("Responses request must not contain messages")
+	}
+	if _, ok := payload["previous_response_id"]; ok {
+		t.Fatal("Responses request must not contain previous_response_id")
+	}
+	if got := payload["model"]; got != "gpt-test" {
+		t.Fatalf("model = %v", got)
+	}
+	input, ok := payload["input"].([]any)
+	if !ok || len(input) != 1 || input[0].(map[string]any)["content"] != "hi" {
+		t.Fatalf("unexpected input: %#v", payload["input"])
+	}
+	tools, ok := payload["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("unexpected tools: %#v", payload["tools"])
+	}
+	toolPayload := tools[0].(map[string]any)
+	if toolPayload["type"] != "function" || toolPayload["name"] != "lookup" {
+		t.Fatalf("unexpected flat function tool: %#v", toolPayload)
+	}
+	if _, ok := toolPayload["function"]; ok {
+		t.Fatal("Responses function tools must be flat")
+	}
+	if _, ok := payload["reasoning"]; ok {
+		t.Fatal("unset reasoning must be omitted")
+	}
+}
+
+func TestResponsesReasoningAndToolContinuation(t *testing.T) {
+	var requests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requests = append(requests, payload)
+		w.Header().Set("Content-Type", "application/json")
+		if len(requests) == 1 {
+			_, _ = w.Write([]byte(`{"output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"checking"}]},{"type":"function_call","call_id":"call-1","name":"list_files","arguments":"{\"path\":\".\"}"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"done"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"finished"}]}]}`))
+	}))
+	defer server.Close()
+
+	a := &app{
+		cfg: config{
+			workspaceRoot:      t.TempDir(),
+			toolMaxParallel:    1,
+			toolTimeoutSec:     5,
+			toolRetryOnTimeout: false,
+			allowedTools:       map[string]bool{toolListFiles: true},
+		},
+		client: &client{
+			endpoint:  server.URL + "/responses",
+			model:     "test-model",
+			reasoning: "high",
+			http:      server.Client(),
+		},
+		toolset: buildAgentTools(map[string]bool{toolListFiles: true}),
+	}
+	_, result, reasoning, err := a.runTurnLoop(context.Background(), nil, "inspect", a.rootRuntime(), a.toolset, false)
+	if err != nil {
+		t.Fatalf("runTurnLoop: %v", err)
+	}
+	if result != "finished" || !strings.Contains(reasoning, "checking") || !strings.Contains(reasoning, "done") {
+		t.Fatalf("unexpected result/reasoning: %q / %q", result, reasoning)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("request count = %d, want 2", len(requests))
+	}
+	if _, ok := requests[0]["reasoning"].(map[string]any); !ok {
+		t.Fatalf("expected reasoning object in request: %#v", requests[0])
+	}
+	secondInput := requests[1]["input"].([]any)
+	if len(secondInput) != 4 {
+		t.Fatalf("second input length = %d, want 4: %#v", len(secondInput), secondInput)
+	}
+	if secondInput[1].(map[string]any)["type"] != "reasoning" || secondInput[2].(map[string]any)["type"] != "function_call" {
+		t.Fatalf("native output items were not preserved: %#v", secondInput)
+	}
+	output := secondInput[3].(map[string]any)
+	if output["type"] != "function_call_output" || output["call_id"] != "call-1" {
+		t.Fatalf("unexpected function output: %#v", output)
+	}
+}
+
+func TestResponsesMalformedAndEmptyOutput(t *testing.T) {
+	if _, err := parseResponsesResponse([]byte(`not json`)); err == nil {
+		t.Fatal("expected malformed response error")
+	}
+	if _, err := parseResponsesResponse([]byte(`{"output":[]}`)); err == nil {
+		t.Fatal("expected empty output error")
+	}
+	if _, err := parseResponsesResponse([]byte(`{"output":[{"type":"reasoning","summary":[]}]}`)); err == nil {
+		t.Fatal("expected unusable output error")
+	}
+	if _, err := parseResponsesResponse([]byte(`{"output":[{"type":"function_call","call_id":"","name":"lookup","arguments":"{}"}]}`)); err == nil {
+		t.Fatal("expected malformed function call error")
 	}
 }
 

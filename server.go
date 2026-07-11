@@ -73,7 +73,7 @@ func startServer(cfg config) error {
 	a := &app{
 		cfg: cfg,
 		client: &client{
-			baseURL:   strings.TrimRight(cfg.baseURL, "/"),
+			endpoint:  strings.TrimRight(cfg.endpoint, "/"),
 			token:     cfg.token,
 			model:     cfg.model,
 			reasoning: cfg.reasoning,
@@ -102,7 +102,7 @@ func startServer(cfg config) error {
 	addr := ":" + strconv.Itoa(cfg.serverPort)
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           withCORS(mux),
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      requestTimeout, // generous: LLM turn-loop can take minutes
@@ -127,11 +127,25 @@ func startServer(cfg config) error {
 	return nil
 }
 
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "600")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // serverRequest wraps the incoming OpenAI-format request with extracted header info.
 type serverRequest struct {
-	Model    string          `json:"model"`
-	Messages []types.Message `json:"messages"`
-	Stream   bool            `json:"stream"`
+	Model     string          `json:"model"`
+	Messages  []types.Message `json:"messages"`
+	Stream    bool            `json:"stream"`
 	Reasoning struct {
 		Effort string `json:"effort"`
 	} `json:"reasoning,omitempty"`
@@ -226,10 +240,8 @@ func (a *app) handleChatCompletion(w http.ResponseWriter, r *http.Request, serve
 	}
 
 	// Build a client targeting the remote LLM.
-	// Strip /chat/completions from endpoint since complete() re-appends it.
-	baseURL := strings.TrimSuffix(remoteBase, "/chat/completions")
 	remoteClient := &client{
-		baseURL:   strings.TrimRight(baseURL, "/"),
+		endpoint:  strings.TrimRight(remoteBase, "/"),
 		token:     remoteToken,
 		model:     model,
 		reasoning: reasoning,
@@ -293,8 +305,8 @@ func writeChatCompletionResponse(w http.ResponseWriter, model, content, reasonin
 		"model":   model,
 		"choices": []map[string]any{
 			{
-				"index": 0,
-				"message": message,
+				"index":         0,
+				"message":       message,
 				"finish_reason": "stop",
 			},
 		},

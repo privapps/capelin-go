@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	defaultBaseURL            = "http://localhost:8235/v1"
+	defaultEndpoint           = "http://localhost:8235/v1/chat/completions"
 	defaultModel              = "gpt-5-mini"
 	defaultToken              = ""
 	defaultReasoning          = "medium"
@@ -135,7 +135,7 @@ var optInTools = map[string]struct{}{
 }
 
 type config struct {
-	baseURL            string
+	endpoint           string
 	model              string
 	token              string
 	reasoning          string
@@ -157,16 +157,16 @@ type config struct {
 }
 
 type app struct {
-	cfg        config
-	client     *client
-	skills     map[string]skills.Skill
-	toolset    []types.Tool
-	subagents  *subagentManager
-	sink       types.OutputSink
+	cfg       config
+	client    *client
+	skills    map[string]skills.Skill
+	toolset   []types.Tool
+	subagents *subagentManager
+	sink      types.OutputSink
 }
 
 type client struct {
-	baseURL   string
+	endpoint  string
 	token     string
 	model     string
 	reasoning string
@@ -308,7 +308,7 @@ func newApp(cfg config) (*app, error) {
 	instance := &app{
 		cfg: cfg,
 		client: &client{
-			baseURL:   strings.TrimRight(cfg.baseURL, "/"),
+			endpoint:  strings.TrimRight(cfg.endpoint, "/"),
 			token:     cfg.token,
 			model:     cfg.model,
 			reasoning: cfg.reasoning,
@@ -339,8 +339,7 @@ var errHelpRequested = errors.New("help requested")
 func loadConfig(args []string) (config, error) {
 	fileCfg, err := ensureConfigFile()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[capelin-go] warning: config file: %v\n", err)
-		fileCfg = map[string]string{}
+		return config{}, fmt.Errorf("config file: %w", err)
 	}
 
 	filtered := make([]string, 0, len(args))
@@ -596,7 +595,7 @@ func loadConfig(args []string) (config, error) {
 		}
 	}
 
-	baseURL, err := readBaseURL(fileCfg)
+	endpoint, err := readEndpoint(fileCfg)
 	if err != nil {
 		return config{}, err
 	}
@@ -709,7 +708,7 @@ func loadConfig(args []string) (config, error) {
 	}
 
 	return config{
-		baseURL:            baseURL,
+		endpoint:           endpoint,
 		model:              rootModel,
 		token:              readCfg("TOKEN", fileCfg, defaultToken),
 		reasoning:          reasoning,
@@ -795,8 +794,8 @@ func readSystemPrompt(fileCfg map[string]string) string {
 	return defaultSystemPrompt
 }
 
-func readBaseURL(fileCfg map[string]string) (string, error) {
-	value := readCfg("BASE_URL", fileCfg, defaultBaseURL)
+func readEndpoint(fileCfg map[string]string) (string, error) {
+	value := readCfg("ENDPOINT", fileCfg, defaultEndpoint)
 	parsed, err := url.Parse(value)
 	if err != nil {
 		return "", fmt.Errorf("invalid URL: %w", err)
@@ -809,7 +808,7 @@ func readBaseURL(fileCfg map[string]string) (string, error) {
 
 func readReasoningEffort(fileCfg map[string]string) (string, error) {
 	value := readCfg("REASONING_EFFORT", fileCfg, defaultReasoning)
-	if strings.EqualFold(value, "none") {
+	if strings.EqualFold(value, "none") || strings.EqualFold(value, "nil") {
 		return "", nil
 	}
 	return value, nil
@@ -833,7 +832,7 @@ const defaultConfigFileContent = `# capelin-go configuration
 # Edit this file to set persistent defaults.
 # Priority: CLI flags > environment variables > this file > built-in defaults.
 
-BASE_URL = http://localhost:8235/v1
+ENDPOINT = http://localhost:8235/v1/chat/completions
 MODEL = gpt-5-mini
 TOKEN =
 REASONING_EFFORT = medium
@@ -851,7 +850,8 @@ SUBAGENT_MAX_RESULT_CHARS = 8000
 SUBAGENT_MAX_AGGREGATE_CHARS = 12000
 SUBAGENT_MAX_ITERATIONS = 20
 
-# Subagent model and reasoning effort (leave blank to inherit root MODEL and REASONING_EFFORT)
+# Subagent model and reasoning effort (leave blank to inherit root MODEL and REASONING_EFFORT;
+# set reasoning effort to none or nil to omit it from requests)
 # env vars: SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT; also settable via CLI flags
 SUBAGENT_MODEL =
 SUBAGENT_REASONING_EFFORT =
@@ -872,14 +872,27 @@ func ensureConfigFile() (map[string]string, error) {
 		return map[string]string{}, nil
 	}
 
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return map[string]string{}, fmt.Errorf("creating config dir: %w", err)
 		}
 		if err := os.WriteFile(path, []byte(defaultConfigFileContent), 0o644); err != nil {
 			return map[string]string{}, fmt.Errorf("writing default config: %w", err)
 		}
+	} else if err != nil {
+		return map[string]string{}, fmt.Errorf("checking config file: %w", err)
 	} else {
+		if !info.Mode().IsRegular() {
+			return map[string]string{}, fmt.Errorf("config path is not a regular file: %s", path)
+		}
+		existing, err := readConfigFile(path)
+		if err != nil {
+			return map[string]string{}, err
+		}
+		if strings.TrimSpace(existing["ENDPOINT"]) == "" {
+			return map[string]string{}, fmt.Errorf("config file %s is missing ENDPOINT", path)
+		}
 		// File exists: append any keys present in the default template but absent in the file.
 		if err := upsertConfigFileKeys(path); err != nil {
 			// Non-fatal: warn but continue with whatever is in the file.
@@ -972,7 +985,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  -i / --interactive         readline REPL (multi-turn; initial question is optional)")
 	fmt.Fprintln(w, "  --final-only               one-shot mode: suppress intermediate tool output, show only the final answer")
 	fmt.Fprintln(w, "  --debug                    dump HTTP request and response to stderr")
-	fmt.Fprintln(w, "Env: BASE_URL, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS")
+	fmt.Fprintln(w, "Env: ENDPOINT, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT")
@@ -989,7 +1002,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  --subagent-max-iterations N         (default 20;    env SUBAGENT_MAX_ITERATIONS)")
 	fmt.Fprintln(w, "Subagent model (defaults to root MODEL if not set):")
 	fmt.Fprintln(w, "  --subagent-model MODEL              (env SUBAGENT_MODEL)")
-	fmt.Fprintln(w, "  --subagent-reasoning-effort VALUE   (env SUBAGENT_REASONING_EFFORT; set to 'none' to omit)")
+	fmt.Fprintln(w, "  --subagent-reasoning-effort VALUE   (env SUBAGENT_REASONING_EFFORT; set to 'none' or 'nil' to omit)")
 	fmt.Fprintln(w, "Tool execution (flags, env vars, or config file):")
 	fmt.Fprintln(w, "  --tool-max-parallel N               (default 8;     env TOOL_MAX_PARALLEL)")
 	fmt.Fprintln(w, "  --tool-timeout-seconds N            (default 60;    env TOOL_TIMEOUT_SECONDS)")
@@ -1025,6 +1038,9 @@ func (a *app) runConversation(ctx context.Context, question string, runtime *age
 // by the model, and an accumulated reasoning trace. It is the shared core used
 // by one-shot, subagent, and interactive modes.
 func (a *app) runTurnLoop(ctx context.Context, messages []types.Message, question string, runtime *agentRuntime, toolset []types.Tool, emitOutput bool) ([]types.Message, string, string, error) {
+	if a.client != nil && a.client.isResponsesEndpoint() {
+		return a.runResponsesTurnLoop(ctx, messages, question, runtime, toolset, emitOutput)
+	}
 	messages = append(messages, types.Message{Role: "user", Content: question})
 
 	maxIterations := defaultMaxIterations
@@ -1151,23 +1167,23 @@ func (a *app) runTurnLoop(ctx context.Context, messages []types.Message, questio
 							}
 							continue
 						}
+						results[i] = toolResult{
+							idx:     i,
+							call:    call,
+							out:     fmt.Sprintf("Tool error: %v", err),
+							isError: true,
+						}
+						return nil
+					}
 					results[i] = toolResult{
 						idx:     i,
 						call:    call,
-						out:     fmt.Sprintf("Tool error: %v", err),
-						isError: true,
+						out:     out,
+						isError: false,
 					}
 					return nil
 				}
-				results[i] = toolResult{
-					idx:     i,
-					call:    call,
-					out:     out,
-					isError: false,
-				}
 				return nil
-			}
-			return nil
 			})
 		}
 		g.Wait()
@@ -1721,6 +1737,9 @@ func isRetryableError(err error) bool {
 }
 
 func (c *client) complete(ctx context.Context, messages []types.Message, tools []types.Tool, model, reasoning string) (*completionMessage, error) {
+	if c.isResponsesEndpoint() {
+		return c.completeResponses(ctx, messagesToResponsesInput(messages), tools, model, reasoning)
+	}
 	if model == "" {
 		model = c.model
 	}
@@ -1738,7 +1757,7 @@ func (c *client) complete(ctx context.Context, messages []types.Message, tools [
 		return nil, err
 	}
 
-	endpoint := c.baseURL + "/chat/completions"
+	endpoint := c.endpoint
 
 	var lastErr error
 	for attempt := 0; attempt < completeMaxAttempts; attempt++ {
@@ -1820,7 +1839,8 @@ func (c *client) complete(ctx context.Context, messages []types.Message, tools [
 }
 
 type completionMessage struct {
-	message types.CompletionMessage
+	message     types.CompletionMessage
+	outputItems []json.RawMessage
 }
 
 func (m *completionMessage) Content() string {
