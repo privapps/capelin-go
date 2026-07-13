@@ -163,6 +163,7 @@ type app struct {
 	toolset    []types.Tool
 	subagents  *subagentManager
 	sink       types.OutputSink
+	dataStore  *dataStore
 }
 
 type client struct {

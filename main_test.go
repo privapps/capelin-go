@@ -2184,3 +2184,170 @@ func TestServerModeToolsetIncludesSubagents(t *testing.T) {
 func ptrString(s string) *string {
 	return &s
 }
+
+func TestDataEndpointPUTAndGetRoundtrip(t *testing.T) {
+	a := &app{cfg: config{workspaceRoot: t.TempDir()}, dataStore: newDataStore()}
+
+	// PUT
+	putReq := httptest.NewRequest(http.MethodPut, "/data?key=foo", strings.NewReader("hello world"))
+	putW := httptest.NewRecorder()
+	a.dataHandler(putW, putReq)
+
+	if putW.Code != http.StatusOK {
+		t.Fatalf("PUT expected 200, got %d: %s", putW.Code, putW.Body.String())
+	}
+	var putResp map[string]any
+	if err := json.Unmarshal(putW.Body.Bytes(), &putResp); err != nil {
+		t.Fatalf("PUT response not JSON: %v", err)
+	}
+	if putResp["ok"] != true || putResp["key"] != "foo" {
+		t.Fatalf("unexpected PUT response: %v", putResp)
+	}
+
+	// GET
+	getReq := httptest.NewRequest(http.MethodGet, "/data?key=foo", nil)
+	getW := httptest.NewRecorder()
+	a.dataHandler(getW, getReq)
+
+	if getW.Code != http.StatusOK {
+		t.Fatalf("GET expected 200, got %d", getW.Code)
+	}
+	if getW.Body.String() != "hello world" {
+		t.Fatalf("GET expected 'hello world', got %q", getW.Body.String())
+	}
+	if getW.Header().Get("Content-Type") != "text/plain" {
+		t.Fatalf("expected Content-Type text/plain, got %q", getW.Header().Get("Content-Type"))
+	}
+}
+
+func TestDataEndpointGETMissingKey(t *testing.T) {
+	a := &app{cfg: config{workspaceRoot: t.TempDir()}, dataStore: newDataStore()}
+
+	req := httptest.NewRequest(http.MethodGet, "/data?key=nonexistent", nil)
+	w := httptest.NewRecorder()
+	a.dataHandler(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestDataEndpointMissingKeyParam(t *testing.T) {
+	a := &app{cfg: config{workspaceRoot: t.TempDir()}, dataStore: newDataStore()}
+
+	// GET without key
+	req := httptest.NewRequest(http.MethodGet, "/data", nil)
+	w := httptest.NewRecorder()
+	a.dataHandler(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("GET without key: expected 400, got %d", w.Code)
+	}
+
+	// PUT without key
+	req = httptest.NewRequest(http.MethodPut, "/data", strings.NewReader("val"))
+	w = httptest.NewRecorder()
+	a.dataHandler(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("PUT without key: expected 400, got %d", w.Code)
+	}
+}
+
+func TestDataEndpointKeyTooLong(t *testing.T) {
+	a := &app{cfg: config{workspaceRoot: t.TempDir()}, dataStore: newDataStore()}
+
+	longKey := strings.Repeat("a", maxDataKeyLen+1)
+	req := httptest.NewRequest(http.MethodPut, "/data?key="+longKey, strings.NewReader("val"))
+	w := httptest.NewRecorder()
+	a.dataHandler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for long key, got %d", w.Code)
+	}
+}
+
+func TestDataEndpointMethodNotAllowed(t *testing.T) {
+	a := &app{cfg: config{workspaceRoot: t.TempDir()}, dataStore: newDataStore()}
+
+	req := httptest.NewRequest(http.MethodDelete, "/data?key=foo", nil)
+	w := httptest.NewRecorder()
+	a.dataHandler(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", w.Code)
+	}
+}
+
+func TestDataEndpointPUTOverwrites(t *testing.T) {
+	a := &app{cfg: config{workspaceRoot: t.TempDir()}, dataStore: newDataStore()}
+
+	// PUT first value
+	req := httptest.NewRequest(http.MethodPut, "/data?key=ow", strings.NewReader("first"))
+	w := httptest.NewRecorder()
+	a.dataHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("first PUT: %d", w.Code)
+	}
+
+	// PUT second value
+	req = httptest.NewRequest(http.MethodPut, "/data?key=ow", strings.NewReader("second"))
+	w = httptest.NewRecorder()
+	a.dataHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("second PUT: %d", w.Code)
+	}
+
+	// GET should return second
+	req = httptest.NewRequest(http.MethodGet, "/data?key=ow", nil)
+	w = httptest.NewRecorder()
+	a.dataHandler(w, req)
+	if w.Body.String() != "second" {
+		t.Fatalf("expected 'second', got %q", w.Body.String())
+	}
+}
+
+func TestDataEndpointTTLValidation(t *testing.T) {
+	a := &app{cfg: config{workspaceRoot: t.TempDir()}, dataStore: newDataStore()}
+
+	// TTL > max should be capped
+	req := httptest.NewRequest(http.MethodPut, "/data?key=ttl1&ttl=99999", strings.NewReader("val"))
+	w := httptest.NewRecorder()
+	a.dataHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT with high TTL: %d", w.Code)
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["ttl"] != float64(maxDataTTLMinutes) {
+		t.Fatalf("expected TTL capped to %d, got %v", maxDataTTLMinutes, resp["ttl"])
+	}
+
+	// TTL 0 should use default
+	req = httptest.NewRequest(http.MethodPut, "/data?key=ttl2&ttl=0", strings.NewReader("val"))
+	w = httptest.NewRecorder()
+	a.dataHandler(w, req)
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["ttl"] != float64(defaultDataTTLMinutes) {
+		t.Fatalf("expected default TTL %d, got %v", defaultDataTTLMinutes, resp["ttl"])
+	}
+
+	// Negative TTL should error
+	req = httptest.NewRequest(http.MethodPut, "/data?key=ttl3&ttl=-1", strings.NewReader("val"))
+	w = httptest.NewRecorder()
+	a.dataHandler(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for negative TTL, got %d", w.Code)
+	}
+}
+
+func TestDataEndpointValueTooLarge(t *testing.T) {
+	a := &app{cfg: config{workspaceRoot: t.TempDir()}, dataStore: newDataStore()}
+
+	bigBody := strings.NewReader(strings.Repeat("x", maxDataValueSize+1))
+	req := httptest.NewRequest(http.MethodPut, "/data?key=big", bigBody)
+	w := httptest.NewRecorder()
+	a.dataHandler(w, req)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d", w.Code)
+	}
+}

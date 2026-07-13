@@ -95,6 +95,27 @@ In server mode:
 - Connection stays open until the agent completes (may take several minutes)
 - Returns OpenAI-format response with the final result
 
+**Data endpoint** (in-memory key-value store):
+
+```bash
+# Store a value (default TTL: 8 hours)
+curl -X PUT "http://localhost:8899/data?key=mykey" -d "myvalue"
+
+# Store with custom TTL (in minutes, max 10080 = 7 days)
+curl -X PUT "http://localhost:8899/data?key=mykey&ttl=60" -d "myvalue"
+
+# Retrieve a value
+curl "http://localhost:8899/data?key=mykey"
+```
+
+Data endpoint details:
+- **GET** `/data?key=<key>` — retrieve a value (returns `text/plain`)
+- **PUT** `/data?key=<key>` — store a value (body is the value, returns JSON with `ok`, `key`, `ttl`)
+- Optional `ttl` parameter: minutes until expiration (default 480, max 10080); `ttl=0` uses default
+- Keys: max 40 characters, must be non-empty
+- Values: max 2MB
+- Expired entries are cleaned up hourly
+
 **Response format:**
 
 The response follows the OpenAI chat completion format with an additional `reasoning` field:

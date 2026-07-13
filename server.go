@@ -80,8 +80,9 @@ func startServer(cfg config) error {
 			debug:     cfg.debug,
 			http:      serverHTTPClient,
 		},
-		skills:  nil,
-		toolset: buildAgentTools(serverAllowedTools),
+		skills:    nil,
+		toolset:   buildAgentTools(serverAllowedTools),
+		dataStore: newDataStore(),
 	}
 	a.subagents = newSubagentManager(cfg.subagents, a.runSubagentSession)
 
@@ -98,6 +99,7 @@ func startServer(cfg config) error {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, `{"status":"ok"}`)
 	})
+	mux.HandleFunc("/data", a.dataHandler)
 
 	addr := ":" + strconv.Itoa(cfg.serverPort)
 	srv := &http.Server{
