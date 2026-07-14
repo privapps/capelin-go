@@ -326,7 +326,11 @@ func (m *subagentManager) run(ctx context.Context, parent *agentRuntime, args ru
 	session.started = true
 	session.ExecutionMode = mode
 	session.Status = subagentStatusQueued
-	session.parentCtx = ctx
+	if args.Wait {
+		session.parentCtx = ctx
+	} else {
+		session.parentCtx = context.Background()
+	}
 	runSession := session
 	queued := cloneSession(session)
 	m.mu.Unlock()
@@ -379,6 +383,9 @@ func (m *subagentManager) execute(session *subagentSession) {
 		reasoning:         m.cfg.ReasoningEffort,
 	}
 	output, runErr := m.runner(execCtx, runtime, cloneSession(session))
+
+	// Capture context error BEFORE cancel() since cancel() sets execCtx.Err() to context.Canceled
+	execCtxErr := execCtx.Err()
 	cancel()
 
 	m.mu.Lock()
@@ -388,11 +395,11 @@ func (m *subagentManager) execute(session *subagentSession) {
 	session.Output, session.OutputTruncated = truncateText(output, m.cfg.MaxResultChars)
 
 	switch {
-	case errors.Is(execCtx.Err(), context.DeadlineExceeded):
+	case errors.Is(execCtxErr, context.DeadlineExceeded):
 		session.Status = subagentStatusTimedOut
 		session.Error = fmt.Sprintf("subagent timed out after %s", session.Timeout)
 	case runErr != nil:
-		if errors.Is(runErr, context.Canceled) || errors.Is(execCtx.Err(), context.Canceled) {
+		if errors.Is(runErr, context.Canceled) || errors.Is(execCtxErr, context.Canceled) {
 			session.Status = subagentStatusCancelled
 			session.Error = "subagent cancelled"
 		} else {
