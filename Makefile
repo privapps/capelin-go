@@ -8,7 +8,7 @@ LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
 # Define target platforms for 'make dist'. Can be overridden:
 PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 
-.PHONY: all build dist clean test fmt vet lint
+.PHONY: all build dist clean test fmt fmt-check vet lint
 
 .DEFAULT_GOAL := build
 
@@ -37,10 +37,18 @@ test:
 fmt:
 	go fmt ./...
 
+fmt-check:
+	@files=$$(gofmt -l .); \
+	if [ -n "$$files" ]; then \
+		echo "gofmt required for:"; \
+		echo "$$files"; \
+		exit 1; \
+	fi
+
 vet:
 	go vet ./...
 
-lint: vet
+lint: fmt-check vet
 
 clean:
 	rm -rf $(BUILD_DIR)

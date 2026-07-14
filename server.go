@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -33,6 +34,27 @@ var serverHTTPClient = &http.Client{
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+	},
+}
+
+// proxyHTTPClient uses its own Transport (rather than sharing
+// serverHTTPClient.Transport) so that DialContext can be pinned to safeDial,
+// which blocks connections to loopback, private, link-local, multicast, and
+// unspecified addresses (including cloud metadata endpoints). This prevents
+// the proxy route from being used as an SSRF vector into internal networks.
+var proxyHTTPClient = &http.Client{
+	Timeout: requestTimeout,
+	Transport: &http.Transport{
+		DialContext:           safeDial,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
 	},
 }
 
@@ -93,6 +115,8 @@ func startServer(cfg config) error {
 	a.subagents = newSubagentManager(cfg.subagents, a.runSubagentSession)
 
 	mux := http.NewServeMux()
+	// Raw CORS proxy. Register before the catch-all chat endpoint.
+	mux.HandleFunc("/-/", proxyHandler)
 	// Catch-all pattern: any POST to /<remoteURL> is handled
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -118,8 +142,12 @@ func startServer(cfg config) error {
 	// CORS middleware for browser-based clients (e.g. data.html).
 	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, PATCH, DELETE, HEAD, OPTIONS")
+		if requested := r.Header.Get("Access-Control-Request-Headers"); requested != "" {
+			w.Header().Set("Access-Control-Allow-Headers", requested)
+		} else {
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -153,6 +181,79 @@ func startServer(cfg config) error {
 		return fmt.Errorf("server error: %w", err)
 	}
 	return nil
+}
+
+var hopByHopHeaders = map[string]bool{
+	"Connection": true, "Keep-Alive": true, "Proxy-Authenticate": true,
+	"Proxy-Authorization": true, "Te": true, "Trailer": true,
+	"Transfer-Encoding": true, "Upgrade": true,
+}
+
+func copyProxyHeaders(dst, src http.Header) {
+	connectionHeaders := map[string]bool{}
+	for _, value := range src.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			connectionHeaders[http.CanonicalHeaderKey(strings.TrimSpace(name))] = true
+		}
+	}
+	for key, values := range src {
+		canonical := http.CanonicalHeaderKey(key)
+		if hopByHopHeaders[canonical] || connectionHeaders[canonical] {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func proxyTarget(r *http.Request) (string, error) {
+	path := strings.TrimPrefix(r.URL.Path, "/-/")
+	if path != "" {
+		if strings.HasPrefix(path, "~") {
+			decoded, err := hex.DecodeString(strings.TrimPrefix(path, "~"))
+			if err != nil {
+				return "", fmt.Errorf("invalid hex endpoint")
+			}
+			path = string(decoded)
+		}
+		if path != "" {
+			return path, nil
+		}
+	}
+	return strings.TrimSpace(r.URL.Query().Get("endpoint")), nil
+}
+
+func proxyHandler(w http.ResponseWriter, r *http.Request) {
+	target, err := proxyTarget(r)
+	if err != nil || target == "" {
+		writeError(w, http.StatusBadRequest, "endpoint required: use /-/https%3A%2F%2F..., /-/~<hex-encoded-URL>, or /-/?endpoint=...")
+		return
+	}
+	u, err := url.Parse(target)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		writeError(w, http.StatusBadRequest, "endpoint must be an absolute http or https URL")
+		return
+	}
+
+	upstream, err := http.NewRequestWithContext(r.Context(), r.Method, u.String(), r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid endpoint: "+err.Error())
+		return
+	}
+	copyProxyHeaders(upstream.Header, r.Header)
+	upstream.Host = u.Host
+	resp, err := proxyHTTPClient.Do(upstream)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "proxy request failed: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	copyProxyHeaders(w.Header(), resp.Header)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Expose-Headers", "*")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 func withCORS(next http.Handler) http.Handler {

@@ -4,12 +4,14 @@ import (
 	"capelin-go/internal/skills"
 	"capelin-go/internal/types"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1731,6 +1733,106 @@ func assertCORSHeaders(t *testing.T, w *httptest.ResponseRecorder) {
 		if got := w.Header().Get(key); got != want {
 			t.Errorf("%s = %q, want %q", key, got, want)
 		}
+	}
+}
+
+func TestProxyHandlerForwardsRequestAndResponse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/target" || r.URL.RawQuery != "x=1" {
+			t.Errorf("upstream request = %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+		if got := r.Header.Get("X-Test"); got != "forwarded" {
+			t.Errorf("X-Test = %q", got)
+		}
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("X-Upstream", "yes")
+		w.WriteHeader(http.StatusAccepted)
+		w.Write([]byte("echo:" + string(body)))
+	}))
+	defer upstream.Close()
+
+	origAllow := allowPrivateFetch
+	t.Cleanup(func() { allowPrivateFetch = origAllow })
+	allowPrivateFetch = true
+
+	target := url.PathEscape(upstream.URL + "/target?x=1")
+	req := httptest.NewRequest(http.MethodPut, "/-/"+target, strings.NewReader("payload"))
+	req.Header.Set("X-Test", "forwarded")
+	w := httptest.NewRecorder()
+	proxyHandler(w, req)
+
+	if w.Code != http.StatusAccepted || w.Body.String() != "echo:payload" {
+		t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
+	}
+	if w.Header().Get("X-Upstream") != "yes" || w.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("proxy headers = %#v", w.Header())
+	}
+}
+
+func TestProxyHandlerSupportsHexAndQueryTargets(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	origAllow := allowPrivateFetch
+	t.Cleanup(func() { allowPrivateFetch = origAllow })
+	allowPrivateFetch = true
+
+	cases := []string{
+		"/-/~" + hex.EncodeToString([]byte(upstream.URL)),
+		"/-/?endpoint=" + url.QueryEscape(upstream.URL),
+	}
+	for _, path := range cases {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		proxyHandler(w, req)
+		if w.Code != http.StatusNoContent {
+			t.Errorf("%s: status = %d, body = %s", path, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestProxyHandlerRelaysRedirectAndRejectsInvalidTarget(t *testing.T) {
+	upstream := httptest.NewServer(http.RedirectHandler("/next", http.StatusFound))
+	defer upstream.Close()
+
+	origAllow := allowPrivateFetch
+	t.Cleanup(func() { allowPrivateFetch = origAllow })
+	allowPrivateFetch = true
+
+	req := httptest.NewRequest(http.MethodGet, "/-/"+url.PathEscape(upstream.URL), nil)
+	w := httptest.NewRecorder()
+	proxyHandler(w, req)
+	if w.Code != http.StatusFound || w.Header().Get("Location") != "/next" {
+		t.Fatalf("redirect = %d Location=%q", w.Code, w.Header().Get("Location"))
+	}
+
+	bad := httptest.NewRequest(http.MethodGet, "/-/ftp%3A%2F%2Fexample.com", nil)
+	w = httptest.NewRecorder()
+	proxyHandler(w, bad)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid target status = %d", w.Code)
+	}
+}
+
+func TestProxyHandlerBlocksPrivateTargetsByDefault(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	// allowPrivateFetch left at its default (false): the proxy must refuse to
+	// dial loopback/private targets like this httptest server.
+	req := httptest.NewRequest(http.MethodGet, "/-/"+url.PathEscape(upstream.URL), nil)
+	w := httptest.NewRecorder()
+	proxyHandler(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected proxy to reject private target, got status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "private or local") {
+		t.Fatalf("expected SSRF-block error message, got body = %s", w.Body.String())
 	}
 }
 

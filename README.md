@@ -97,6 +97,17 @@ In server mode:
 - Connection stays open until the agent completes (may take several minutes)
 - Returns OpenAI-format response with the final result
 
+**Raw CORS proxy** (any HTTP(S) endpoint):
+
+```bash
+# The target can be URL-encoded in the path, hex-encoded, or passed as ?endpoint=
+curl -X PUT "http://localhost:8899/-/https%3A%2F%2Fexample.com%2Fapi%3Fx%3D1" \
+  -H "Content-Type: application/json" \
+  -d '{"hello":"world"}'
+```
+
+Requests to `/-/` preserve the method, body, query, and application headers. Upstream status, body, response headers, and redirects are relayed; browser `OPTIONS` preflight is answered locally with permissive CORS headers. The proxy accepts absolute `http://` and `https://` targets and does not require an Authorization header. To prevent SSRF, the proxy refuses to connect to loopback, private, link-local, multicast, and unspecified addresses (including cloud metadata endpoints); this includes hostnames that resolve to such addresses, so only public destinations are reachable.
+
 **Data endpoint** (in-memory key-value store):
 
 ```bash
