@@ -6,7 +6,8 @@
 
 - one-shot task execution
 - **interactive mode** (`-i` / `--interactive`): multi-turn REPL sharing a single conversation history
-- **server mode** (`--server-port PORT`): HTTP server accepting OpenAI-format requests
+- **server mode** (`--server-port PORT`): HTTP server accepting OpenAI-format requests (sync + async)
+- **async mode** (`/async/...`): non-blocking requests that return a UUID; poll `/data` for results
 - model loop with tool calling (`/chat/completions`)
 - Claude-style skill discovery from:
   - `.agents/skills` (project-local)
@@ -115,6 +116,29 @@ Data endpoint details:
 - Keys: max 40 characters, must be non-empty
 - Values: max 2MB
 - Expired entries are cleaned up hourly
+
+**Async endpoint** (non-blocking chat completion):
+
+```bash
+# Submit async request — returns UUID immediately (HTTP 202)
+curl -X POST "http://localhost:8899/async/https%3A%2F%2Fopencode.ai/zen/v1/chat/completions" \
+  -H "Authorization: Bearer public" \
+  -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"search for go http best practices"}]}'
+# → 202 {"id": "550e8400-e29b-41d4-a716-446655440000"}
+
+# Poll for result (404 while processing, full JSON when done)
+curl "http://localhost:8899/data?key=550e8400-e29b-41d4-a716-446655440000"
+```
+
+Async endpoint details:
+- Routes mirror the sync endpoints: `/async/https%3A%2F%2F...`, `/async/~<hex>`, `/async/?endpoint=...`
+- Returns `202 Accepted` with `{"id": "<uuid>"}` immediately
+- The request runs in the background; result is stored in `/data` with a 1-hour TTL
+- Poll `GET /data?key=<uuid>` — returns 404 while processing, full OpenAI-format JSON when complete
+- On failure (LLM error, timeout, or internal panic), an error JSON is stored: `{"error": {"message": "...", "type": "async_error"}}`
+- Background tasks have a 15-minute timeout; stuck tasks fail gracefully with an error result
+- Maximum 16 concurrent async tasks (excess requests block until a slot frees)
+- Same request format, auth, and available tools as the sync endpoint
 
 **Response format:**
 

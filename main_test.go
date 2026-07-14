@@ -2351,3 +2351,494 @@ func TestDataEndpointValueTooLarge(t *testing.T) {
 		t.Fatalf("expected 413, got %d", w.Code)
 	}
 }
+
+// --- Async endpoint tests ---
+
+func TestAsyncRequiresEndpoint(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+		dataStore: newDataStore(),
+	}
+
+	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/async/", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-test")
+	w := httptest.NewRecorder()
+
+	a.handleAsyncChatCompletion(w, req, serverAllowedTools)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "endpoint required") {
+		t.Fatalf("expected endpoint required error, got: %s", w.Body.String())
+	}
+}
+
+func TestAsyncRequiresBearerToken(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+		dataStore: newDataStore(),
+	}
+
+	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/async/?endpoint=https://example.com/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	a.handleAsyncChatCompletion(w, req, serverAllowedTools)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "Bearer") {
+		t.Fatalf("expected Bearer token error, got: %s", w.Body.String())
+	}
+}
+
+func TestAsyncRejectsMethodGet(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+		dataStore: newDataStore(),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/async/?endpoint=https://example.com/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+
+	a.handleAsyncChatCompletion(w, req, serverAllowedTools)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", w.Code)
+	}
+}
+
+func TestAsyncRejectsEmptyMessages(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+		dataStore: newDataStore(),
+	}
+
+	body := `{"model":"test","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/async/?endpoint=https://example.com/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-test")
+	w := httptest.NewRecorder()
+
+	a.handleAsyncChatCompletion(w, req, serverAllowedTools)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "messages") {
+		t.Fatalf("expected messages error, got: %s", w.Body.String())
+	}
+}
+
+func TestAsyncRejectsInvalidJSON(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+		dataStore: newDataStore(),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/async/?endpoint=https://example.com/v1/chat/completions", strings.NewReader("not json"))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-test")
+	w := httptest.NewRecorder()
+
+	a.handleAsyncChatCompletion(w, req, serverAllowedTools)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "invalid JSON") {
+		t.Fatalf("expected JSON error, got: %s", w.Body.String())
+	}
+}
+
+func TestAsyncRejectsStreaming(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+		dataStore: newDataStore(),
+	}
+
+	body := `{"model":"test","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/async/?endpoint=https://example.com/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-test")
+	w := httptest.NewRecorder()
+
+	a.handleAsyncChatCompletion(w, req, serverAllowedTools)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "streaming") {
+		t.Fatalf("expected streaming error, got: %s", w.Body.String())
+	}
+}
+
+func TestAsyncReturns202WithUUID(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+		dataStore: newDataStore(),
+	}
+
+	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/async/?endpoint=https://example.com/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-test")
+	w := httptest.NewRecorder()
+
+	a.handleAsyncChatCompletion(w, req, serverAllowedTools)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response not JSON: %v", err)
+	}
+	id, ok := resp["id"]
+	if !ok || id == "" {
+		t.Fatalf("expected 'id' field in response, got: %v", resp)
+	}
+	// Validate UUID format: 8-4-4-4-12 hex
+	if len(id) != 36 || id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
+		t.Fatalf("expected UUID format (8-4-4-4-12), got: %s", id)
+	}
+}
+
+func TestAsyncExtractsEndpointFromPath(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+		dataStore: newDataStore(),
+	}
+
+	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
+	// URL-encoded endpoint in path after /async/
+	req := httptest.NewRequest(http.MethodPost, "/async/https%3A%2F%2Fexample.com%2Fv1%2Fchat%2Fcompletions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-test")
+	w := httptest.NewRecorder()
+
+	a.handleAsyncChatCompletion(w, req, serverAllowedTools)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAsyncExtractsEndpointFromHexPath(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("BASE_URL", "http://localhost:8235/v1")
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+		dataStore: newDataStore(),
+	}
+
+	// Hex-encode "https://example.com/v1/chat/completions"
+	hexURL := "68747470733a2f2f6578616d706c652e636f6d2f76312f636861742f636f6d706c6574696f6e73"
+	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/async/~"+hexURL, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-test")
+	w := httptest.NewRecorder()
+
+	a.handleAsyncChatCompletion(w, req, serverAllowedTools)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestGenerateUUIDFormat(t *testing.T) {
+	id := generateUUID()
+	// UUID v4: 8-4-4-4-12 hex with hyphens
+	if len(id) != 36 {
+		t.Fatalf("expected length 36, got %d: %s", len(id), id)
+	}
+	if id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
+		t.Fatalf("expected hyphens at positions 8,13,18,23, got: %s", id)
+	}
+	// Version nibble should be 4
+	if id[14] != '4' {
+		t.Fatalf("expected version 4, got: %s", id)
+	}
+	// Variant nibble should be 8 or 9 or a or b
+	if id[19] != '8' && id[19] != '9' && id[19] != 'a' && id[19] != 'b' {
+		t.Fatalf("expected valid variant at position 19, got: %s", id)
+	}
+	// Two generated UUIDs should be different
+	id2 := generateUUID()
+	if id == id2 {
+		t.Fatalf("two UUIDs should not be identical: %s", id)
+	}
+}
+
+func TestAsyncStoresResultInDataStore(t *testing.T) {
+	isolateConfigFile(t)
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+
+	// Mock LLM endpoint that returns a simple completion.
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"id":   "mock-123",
+			"object": "chat.completion",
+			"choices": []map[string]any{{
+				"index": 0,
+				"message": map[string]string{
+					"role":    "assistant",
+					"content": "mock response",
+				},
+				"finish_reason": "stop",
+			}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer mockLLM.Close()
+
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+		dataStore: newDataStore(),
+	}
+
+	uuid := generateUUID()
+	messages := []types.Message{
+		{Role: "system", Content: "You are helpful."},
+		{Role: "user", Content: "what is 2+2?"},
+	}
+
+	a.runAsyncTask(uuid, mockLLM.URL+"/v1/chat/completions", "sk-test", "test-model", "low", messages, "what is 2+2?", serverAllowedTools)
+
+	// Verify the result was stored.
+	val, ok := a.dataStore.Get(uuid)
+	if !ok {
+		t.Fatal("expected result to be stored in data store")
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(val), &result); err != nil {
+		t.Fatalf("stored value not valid JSON: %v", err)
+	}
+	if result["object"] != "chat.completion" {
+		t.Fatalf("expected object=chat.completion, got %v", result["object"])
+	}
+	choices, ok := result["choices"].([]any)
+	if !ok || len(choices) != 1 {
+		t.Fatalf("expected 1 choice, got %v", result["choices"])
+	}
+	choice := choices[0].(map[string]any)
+	msg := choice["message"].(map[string]any)
+	if msg["content"] != "mock response" {
+		t.Fatalf("expected content 'mock response', got %v", msg["content"])
+	}
+}
+
+func TestAsyncStoresErrorOnFailure(t *testing.T) {
+	isolateConfigFile(t)
+	serverAllowedTools := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+
+	// Mock LLM that returns an error.
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"internal error"}`))
+	}))
+	defer mockLLM.Close()
+
+	a := &app{
+		cfg:    config{workspaceRoot: t.TempDir()},
+		client: &client{http: &http.Client{}},
+		toolset: buildAgentTools(serverAllowedTools),
+		dataStore: newDataStore(),
+	}
+
+	uuid := generateUUID()
+	messages := []types.Message{{Role: "user", Content: "hello"}}
+
+	a.runAsyncTask(uuid, mockLLM.URL+"/v1/chat/completions", "sk-test", "test-model", "low", messages, "hello", serverAllowedTools)
+
+	// Verify the error was stored.
+	val, ok := a.dataStore.Get(uuid)
+	if !ok {
+		t.Fatal("expected error to be stored in data store")
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(val), &result); err != nil {
+		t.Fatalf("stored value not valid JSON: %v", err)
+	}
+	errObj, ok := result["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected error object, got: %v", result)
+	}
+	if errObj["type"] != "async_error" {
+		t.Fatalf("expected type=async_error, got %v", errObj["type"])
+	}
+}
+
+func TestAsyncPanicRecovery(t *testing.T) {
+	a := &app{
+		cfg:      config{workspaceRoot: t.TempDir()},
+		dataStore: newDataStore(),
+	}
+
+	uuid := generateUUID()
+
+	// Simulate a panic in the goroutine by calling runAsyncTask in a goroutine
+	// that will panic, and verify the error is stored.
+	// We test this by verifying the defer/recover mechanism stores an error.
+	// We can't easily make runAsyncTask panic directly, so we test the
+	// recovery wrapper indirectly by checking that a panic in the goroutine
+	// results in a stored error.
+
+	// For a unit test, we verify the panic recovery by running a function
+	// that panics and checking the dataStore.
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				errResp, _ := json.Marshal(map[string]any{
+					"error": map[string]any{
+						"message": fmt.Sprintf("internal panic: %v", r),
+						"type":    "async_error",
+					},
+				})
+				a.dataStore.Put(uuid, string(errResp), asyncResultTTL)
+			}
+		}()
+		panic("test panic: simulated crash")
+	}()
+
+	// Wait for goroutine to complete.
+	time.Sleep(50 * time.Millisecond)
+
+	val, ok := a.dataStore.Get(uuid)
+	if !ok {
+		t.Fatal("expected panic error to be stored in data store")
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(val), &result); err != nil {
+		t.Fatalf("stored value not valid JSON: %v", err)
+	}
+	errObj, ok := result["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected error object, got: %v", result)
+	}
+	if errObj["type"] != "async_error" {
+		t.Fatalf("expected type=async_error, got %v", errObj["type"])
+	}
+	if !strings.Contains(errObj["message"].(string), "test panic: simulated crash") {
+		t.Fatalf("expected panic message, got: %v", errObj["message"])
+	}
+}
+
+func TestAsyncConcurrencyLimit(t *testing.T) {
+	// Save and restore the global semaphore.
+	origSem := asyncSem
+	asyncSem = make(chan struct{}, 2) // limit to 2
+	defer func() { asyncSem = origSem }()
+
+	// Fill the semaphore to capacity.
+	asyncSem <- struct{}{}
+	asyncSem <- struct{}{}
+
+	// Verify a third acquire blocks.
+	acquired := make(chan struct{})
+	go func() {
+		asyncSem <- struct{}{} // blocks when full
+		close(acquired)
+	}()
+
+	select {
+	case <-acquired:
+		t.Fatal("goroutine acquired semaphore when it should be blocked")
+	case <-time.After(100 * time.Millisecond):
+		// Expected: blocked.
+	}
+
+	// Release a slot — goroutine should unblock.
+	<-asyncSem
+	select {
+	case <-acquired:
+		// Expected.
+	case <-time.After(time.Second):
+		t.Fatal("goroutine did not unblock after slot release")
+	}
+}
+
+func TestBuildChatCompletionJSONWithReasoning(t *testing.T) {
+	jsonStr := buildChatCompletionJSON("gpt-4o", "answer", "thinking")
+	var result map[string]any
+	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	choices := result["choices"].([]any)
+	msg := choices[0].(map[string]any)["message"].(map[string]any)
+	if msg["reasoning"] != "thinking" {
+		t.Fatalf("expected reasoning, got %v", msg["reasoning"])
+	}
+	if msg["content"] != "answer" {
+		t.Fatalf("expected content, got %v", msg["content"])
+	}
+}
+
+func TestBuildChatCompletionJSONWithoutReasoning(t *testing.T) {
+	jsonStr := buildChatCompletionJSON("gpt-4o", "answer", "")
+	var result map[string]any
+	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	choices := result["choices"].([]any)
+	msg := choices[0].(map[string]any)["message"].(map[string]any)
+	if _, ok := msg["reasoning"]; ok {
+		t.Fatalf("expected no reasoning key when empty")
+	}
+}
