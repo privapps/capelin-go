@@ -1133,6 +1133,23 @@ func TestExistingConfigMissingEndpointReturnsError(t *testing.T) {
 	}
 }
 
+func TestServerModeAllowsConfigWithoutEndpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.ini")
+	if err := os.WriteFile(path, []byte("MODEL = test-model\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv("CAPELIN_CONFIG_FILE", path)
+	t.Setenv("ENDPOINT", "")
+
+	cfg, err := loadConfig([]string{"--server-port", "8889"})
+	if err != nil {
+		t.Fatalf("server mode should not require ENDPOINT: %v", err)
+	}
+	if cfg.serverPort != 8889 {
+		t.Fatalf("serverPort = %d, want 8889", cfg.serverPort)
+	}
+}
+
 func TestClientUsesCompleteEndpointWithoutAppendingPath(t *testing.T) {
 	var gotPath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1634,6 +1651,18 @@ func TestLoadConfigServerPortEqualForm(t *testing.T) {
 	}
 }
 
+func TestLoadConfigServerAlias(t *testing.T) {
+	isolateConfigFile(t)
+	t.Setenv("ENDPOINT", "")
+	cfg, err := loadConfig([]string{"--server", "8889"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.serverPort != 8889 {
+		t.Fatalf("expected serverPort=8889, got %d", cfg.serverPort)
+	}
+}
+
 func TestLoadConfigServerPortRejectsZero(t *testing.T) {
 	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")
@@ -1755,8 +1784,7 @@ func TestProxyHandlerForwardsRequestAndResponse(t *testing.T) {
 	t.Cleanup(func() { allowPrivateFetch = origAllow })
 	allowPrivateFetch = true
 
-	target := url.PathEscape(upstream.URL + "/target?x=1")
-	req := httptest.NewRequest(http.MethodPut, "/-/"+target, strings.NewReader("payload"))
+	req := httptest.NewRequest(http.MethodPut, "/-/?endpoint="+url.QueryEscape(upstream.URL+"/target?x=1"), strings.NewReader("payload"))
 	req.Header.Set("X-Test", "forwarded")
 	w := httptest.NewRecorder()
 	proxyHandler(w, req)
@@ -1764,8 +1792,34 @@ func TestProxyHandlerForwardsRequestAndResponse(t *testing.T) {
 	if w.Code != http.StatusAccepted || w.Body.String() != "echo:payload" {
 		t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
 	}
-	if w.Header().Get("X-Upstream") != "yes" || w.Header().Get("Access-Control-Allow-Origin") != "*" {
+	if w.Header().Get("X-Upstream") != "yes" {
 		t.Fatalf("proxy headers = %#v", w.Header())
+	}
+}
+
+type proxyRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f proxyRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestProxyHandlerUsesCanonicalizedAuthorizedTarget(t *testing.T) {
+	oldPolicy := activeServerPolicy
+	oldClient := proxyHTTPClient
+	t.Cleanup(func() {
+		activeServerPolicy = oldPolicy
+		proxyHTTPClient = oldClient
+	})
+	activeServerPolicy = &serverSecurityPolicy{AllowedTargets: map[string]bool{"https://example.com": true}}
+	var gotScheme string
+	proxyHTTPClient = &http.Client{Transport: proxyRoundTripper(func(r *http.Request) (*http.Response, error) {
+		gotScheme = r.URL.Scheme
+		return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+	})}
+
+	req := httptest.NewRequest(http.MethodGet, "/-/?endpoint="+url.QueryEscape("HTTPS://EXAMPLE.COM/path"), nil)
+	w := httptest.NewRecorder()
+	proxyHandler(w, req)
+	if w.Code != http.StatusNoContent || gotScheme != "https" {
+		t.Fatalf("status=%d scheme=%q, want 204 and canonical https", w.Code, gotScheme)
 	}
 }
 
@@ -1801,14 +1855,14 @@ func TestProxyHandlerRelaysRedirectAndRejectsInvalidTarget(t *testing.T) {
 	t.Cleanup(func() { allowPrivateFetch = origAllow })
 	allowPrivateFetch = true
 
-	req := httptest.NewRequest(http.MethodGet, "/-/"+url.PathEscape(upstream.URL), nil)
+	req := httptest.NewRequest(http.MethodGet, "/-/?endpoint="+url.QueryEscape(upstream.URL), nil)
 	w := httptest.NewRecorder()
 	proxyHandler(w, req)
 	if w.Code != http.StatusFound || w.Header().Get("Location") != "/next" {
 		t.Fatalf("redirect = %d Location=%q", w.Code, w.Header().Get("Location"))
 	}
 
-	bad := httptest.NewRequest(http.MethodGet, "/-/ftp%3A%2F%2Fexample.com", nil)
+	bad := httptest.NewRequest(http.MethodGet, "/-/?endpoint=ftp%3A%2F%2Fexample.com", nil)
 	w = httptest.NewRecorder()
 	proxyHandler(w, bad)
 	if w.Code != http.StatusBadRequest {
@@ -1824,7 +1878,7 @@ func TestProxyHandlerBlocksPrivateTargetsByDefault(t *testing.T) {
 
 	// allowPrivateFetch left at its default (false): the proxy must refuse to
 	// dial loopback/private targets like this httptest server.
-	req := httptest.NewRequest(http.MethodGet, "/-/"+url.PathEscape(upstream.URL), nil)
+	req := httptest.NewRequest(http.MethodGet, "/-/?endpoint="+url.QueryEscape(upstream.URL), nil)
 	w := httptest.NewRecorder()
 	proxyHandler(w, req)
 
@@ -2914,8 +2968,8 @@ func TestAsyncExtractsEndpointFromPath(t *testing.T) {
 	}
 
 	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
-	// URL-encoded endpoint in path after /async/
-	req := httptest.NewRequest(http.MethodPost, "/async/https%3A%2F%2Fexample.com%2Fv1%2Fchat%2Fcompletions", strings.NewReader(body))
+	// Endpoint supplied via query; literal URL paths are intentionally rejected.
+	req := httptest.NewRequest(http.MethodPost, "/async/?endpoint="+url.QueryEscape("https://example.com/v1/chat/completions"), strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer sk-test")
 	w := httptest.NewRecorder()

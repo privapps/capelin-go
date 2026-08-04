@@ -150,6 +150,7 @@ type config struct {
 	maxIterations      int
 	subagents          subagentRuntimeConfig
 	serverPort         int
+	securityPolicy     serverSecurityPolicy
 	toolMaxParallel    int  // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
 	toolTimeoutSec     int  // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
 	toolRetryOnTimeout bool // retry once on timeout (0 = disable; empty = default true)
@@ -338,7 +339,7 @@ func newApp(cfg config) (*app, error) {
 var errHelpRequested = errors.New("help requested")
 
 func loadConfig(args []string) (config, error) {
-	fileCfg, err := ensureConfigFile()
+	fileCfg, err := ensureConfigFileForMode(hasServerPortFlag(args))
 	if err != nil {
 		return config{}, fmt.Errorf("config file: %w", err)
 	}
@@ -517,7 +518,7 @@ func loadConfig(args []string) (config, error) {
 			subagentCfg.ReasoningEffort = strings.TrimSpace(args[i])
 		case strings.HasPrefix(arg, "--subagent-reasoning-effort="):
 			subagentCfg.ReasoningEffort = strings.TrimSpace(strings.TrimPrefix(arg, "--subagent-reasoning-effort="))
-		case arg == "--server-port":
+		case arg == "--server-port" || arg == "--server":
 			if i+1 >= len(args) {
 				return config{}, errors.New("--server-port requires a value")
 			}
@@ -527,8 +528,12 @@ func loadConfig(args []string) (config, error) {
 				return config{}, err
 			}
 			serverPort = value
-		case strings.HasPrefix(arg, "--server-port="):
-			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--server-port="), "--server-port")
+		case strings.HasPrefix(arg, "--server-port=") || strings.HasPrefix(arg, "--server="):
+			valueText := strings.TrimPrefix(arg, "--server-port=")
+			if valueText == arg {
+				valueText = strings.TrimPrefix(arg, "--server=")
+			}
+			value, err := parsePositiveInt(valueText, "--server-port")
 			if err != nil {
 				return config{}, err
 			}
@@ -707,6 +712,27 @@ func loadConfig(args []string) (config, error) {
 	if toolRetryOnTimeout == -1 {
 		toolRetryOnTimeout = boolToInt(readBoolCfg("TOOL_RETRY_ON_TIMEOUT", fileCfg, defaultToolRetryOnTimeout))
 	}
+	allowedOriginsRaw := readCfg("SERVER_ALLOWED_ORIGINS", fileCfg, "")
+	allowedTargetsRaw := readCfg("SERVER_ALLOWED_TARGETS", fileCfg, "")
+	origins, allOrigins, err := parseAllowlist(allowedOriginsRaw, true)
+	if err != nil {
+		return config{}, err
+	}
+	targets, allTargets, err := parseAllowlist(allowedTargetsRaw, false)
+	if err != nil {
+		return config{}, err
+	}
+	allowPrivateRaw := readCfg("SERVER_ALLOW_PRIVATE_TARGETS", fileCfg, "false")
+	allowPrivate, err := parseStrictBool(allowPrivateRaw)
+	if err != nil {
+		return config{}, fmt.Errorf("SERVER_ALLOW_PRIVATE_TARGETS: %w", err)
+	}
+	if serverPort > 0 && strings.TrimSpace(allowedOriginsRaw) == "" {
+		fmt.Fprintln(os.Stderr, "[capelin-go] warning: SERVER_ALLOWED_ORIGINS is missing; browser cross-origin access is disabled")
+	}
+	if serverPort > 0 && strings.TrimSpace(allowedTargetsRaw) == "" {
+		fmt.Fprintln(os.Stderr, "[capelin-go] warning: SERVER_ALLOWED_TARGETS is missing; dynamic outbound targets are disabled")
+	}
 
 	return config{
 		endpoint:           endpoint,
@@ -723,11 +749,21 @@ func loadConfig(args []string) (config, error) {
 		maxIterations:      maxIter,
 		subagents:          subagentCfg,
 		serverPort:         serverPort,
+		securityPolicy:     serverSecurityPolicy{AllowedOrigins: origins, AllowAllOrigins: allOrigins, AllowedTargets: targets, AllowAllTargets: allTargets, AllowPrivateTargets: allowPrivate},
 		toolMaxParallel:    toolMaxParallel,
 		toolTimeoutSec:     toolTimeoutSec,
 		toolRetryOnTimeout: toolRetryOnTimeout != 0,
 		debug:              debug,
 	}, nil
+}
+
+func hasServerPortFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "--server-port" || arg == "--server" || strings.HasPrefix(arg, "--server-port=") || strings.HasPrefix(arg, "--server=") {
+			return true
+		}
+	}
+	return false
 }
 
 func parsePositiveInt(raw, flagName string) (int, error) {
@@ -862,12 +898,21 @@ SUBAGENT_REASONING_EFFORT =
 TOOL_MAX_PARALLEL = 8
 TOOL_TIMEOUT_SECONDS = 60
 TOOL_RETRY_ON_TIMEOUT = true
+
+# Server mode security (empty means no browser or dynamic outbound access).
+SERVER_ALLOWED_ORIGINS =
+SERVER_ALLOWED_TARGETS =
+SERVER_ALLOW_PRIVATE_TARGETS = false
 `
 
 // ensureConfigFile creates the config file with defaults if it does not exist,
 // appends any keys missing from an existing file, then reads and returns its
 // key=value pairs.
 func ensureConfigFile() (map[string]string, error) {
+	return ensureConfigFileForMode(false)
+}
+
+func ensureConfigFileForMode(serverMode bool) (map[string]string, error) {
 	path := configFilePath()
 	if path == "" {
 		return map[string]string{}, nil
@@ -891,7 +936,7 @@ func ensureConfigFile() (map[string]string, error) {
 		if err != nil {
 			return map[string]string{}, err
 		}
-		if strings.TrimSpace(existing["ENDPOINT"]) == "" {
+		if !serverMode && strings.TrimSpace(existing["ENDPOINT"]) == "" {
 			return map[string]string{}, fmt.Errorf("config file %s is missing ENDPOINT", path)
 		}
 		// File exists: append any keys present in the default template but absent in the file.
@@ -1428,6 +1473,11 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 		var args fetchPageArgs
 		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
 			return "", fmt.Errorf("invalid fetch_page arguments: %w", err)
+		}
+		// Server-mode apps carry a policy-aware client on the LLM client. Use it
+		// for fetch_page so tool calls cannot bypass SERVER_ALLOWED_TARGETS.
+		if activeServerPolicy != nil && a.client != nil && a.client.http != nil {
+			return runFetchPageWithClient(ctx, args.URL, a.client.http)
 		}
 		return runFetchPage(ctx, args.URL)
 	case toolListFiles:

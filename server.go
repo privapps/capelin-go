@@ -1,15 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"capelin-go/internal/types"
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -22,6 +21,15 @@ const asyncResultTTL = 1 * time.Hour
 const asyncMaxConcurrent = 16
 
 var asyncSem = make(chan struct{}, asyncMaxConcurrent)
+
+var activeServerPolicy *serverSecurityPolicy
+
+func serverOutboundHTTPClient(cfg config) *http.Client {
+	if activeServerPolicy != nil {
+		return cfg.securityPolicy.secureHTTPClient()
+	}
+	return serverHTTPClient
+}
 
 // serverHTTPClient is reused across all server-mode requests to preserve
 // TCP connections and HTTP/2 streams.
@@ -86,6 +94,10 @@ Output policy:
 - Use markdown formatting for readability.`
 
 func startServer(cfg config) error {
+	activeServerPolicy = &cfg.securityPolicy
+	serverClient := cfg.securityPolicy.secureHTTPClient()
+	proxyHTTPClient = cfg.securityPolicy.secureHTTPClient()
+	proxyHTTPClient.CheckRedirect = func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }
 	// In server mode, web_search, fetch_page, and subagent tools are available.
 	serverAllowedTools := map[string]bool{
 		toolWebSearch:      true,
@@ -106,7 +118,7 @@ func startServer(cfg config) error {
 			model:     cfg.model,
 			reasoning: cfg.reasoning,
 			debug:     cfg.debug,
-			http:      serverHTTPClient,
+			http:      serverClient,
 		},
 		skills:    nil,
 		toolset:   buildAgentTools(serverAllowedTools),
@@ -139,21 +151,7 @@ func startServer(cfg config) error {
 		a.handleAsyncChatCompletion(w, r, serverAllowedTools)
 	})
 
-	// CORS middleware for browser-based clients (e.g. data.html).
-	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, PATCH, DELETE, HEAD, OPTIONS")
-		if requested := r.Header.Get("Access-Control-Request-Headers"); requested != "" {
-			w.Header().Set("Access-Control-Allow-Headers", requested)
-		} else {
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		}
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		mux.ServeHTTP(w, r)
-	})
+	corsHandler := withServerCORS(mux, cfg.securityPolicy)
 
 	addr := ":" + strconv.Itoa(cfg.serverPort)
 	srv := &http.Server{
@@ -198,7 +196,8 @@ func copyProxyHeaders(dst, src http.Header) {
 	}
 	for key, values := range src {
 		canonical := http.CanonicalHeaderKey(key)
-		if hopByHopHeaders[canonical] || connectionHeaders[canonical] {
+		lower := strings.ToLower(canonical)
+		if hopByHopHeaders[canonical] || connectionHeaders[canonical] || strings.HasPrefix(lower, "access-control-") || strings.HasPrefix(lower, "x-forwarded-") {
 			continue
 		}
 		for _, value := range values {
@@ -207,41 +206,63 @@ func copyProxyHeaders(dst, src http.Header) {
 	}
 }
 
+var sensitiveProxyHeaders = map[string]bool{
+	"Authorization": true, "Proxy-Authorization": true, "Cookie": true,
+	"X-Forwarded-For": true, "X-Forwarded-Host": true, "X-Forwarded-Proto": true,
+	"X-Real-IP": true, "Forwarded": true,
+}
+
 func proxyTarget(r *http.Request) (string, error) {
-	path := strings.TrimPrefix(r.URL.Path, "/-/")
-	if path != "" {
-		if strings.HasPrefix(path, "~") {
-			decoded, err := hex.DecodeString(strings.TrimPrefix(path, "~"))
-			if err != nil {
-				return "", fmt.Errorf("invalid hex endpoint")
-			}
-			path = string(decoded)
-		}
-		if path != "" {
-			return path, nil
-		}
-	}
-	return strings.TrimSpace(r.URL.Query().Get("endpoint")), nil
+	return extractServerTarget(r.URL.Path, "/-", r.URL.Query())
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	target, err := proxyTarget(r)
 	if err != nil || target == "" {
-		writeError(w, http.StatusBadRequest, "endpoint required: use /-/https%3A%2F%2F..., /-/~<hex-encoded-URL>, or /-/?endpoint=...")
+		writeError(w, http.StatusBadRequest, "endpoint required: use /-/~<hex-encoded-URL> or /-/?endpoint=...")
 		return
 	}
-	u, err := url.Parse(target)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+	parsed, err := parseAbsoluteTarget(target)
+	if activeServerPolicy != nil {
+		if authorized, authErr := activeServerPolicy.authorizeTarget(target); authErr != nil {
+			activeServerPolicy.logRejectedTarget(target)
+			writeError(w, http.StatusForbidden, "target not allowed")
+			return
+		} else {
+			parsed = authorized
+		}
+	}
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "endpoint must be an absolute http or https URL")
 		return
 	}
+	u := parsed.URL
 
-	upstream, err := http.NewRequestWithContext(r.Context(), r.Method, u.String(), r.Body)
+	if r.ContentLength > 10*1024*1024 {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	// Buffer the bounded body before contacting upstream so oversized requests
+	// are rejected without forwarding a partial payload.
+	buf, readErr := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024+1))
+	if readErr != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+	if len(buf) > 10*1024*1024 {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	body := io.NopCloser(bytes.NewReader(buf))
+	upstream, err := http.NewRequestWithContext(r.Context(), r.Method, u.String(), body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid endpoint: "+err.Error())
 		return
 	}
 	copyProxyHeaders(upstream.Header, r.Header)
+	for key := range sensitiveProxyHeaders {
+		upstream.Header.Del(key)
+	}
 	upstream.Host = u.Host
 	resp, err := proxyHTTPClient.Do(upstream)
 	if err != nil {
@@ -250,8 +271,6 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 	copyProxyHeaders(w.Header(), resp.Header)
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Expose-Headers", "*")
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }
@@ -263,6 +282,76 @@ func withCORS(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Max-Age", "600")
 		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func withServerCORS(next http.Handler, policy serverSecurityPolicy) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		canonical, ok := policy.authorizeOrigin(origin)
+		w.Header().Add("Vary", "Origin")
+		if !ok {
+			policy.logRejectedOrigin(origin)
+			writeError(w, http.StatusForbidden, "origin not allowed")
+			return
+		}
+		if policy.AllowAllOrigins {
+			w.Header().Set("Access-Control-Allow-Origin", canonical)
+		} else {
+			w.Header().Set("Access-Control-Allow-Origin", canonical)
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, PATCH, DELETE, HEAD, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "600")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withCORSOrigins enforces an exact browser-origin allowlist. Originless
+// requests (CLI/server-to-server) pass through without CORS headers.
+func withCORSOrigins(next http.Handler, allowed []string) http.Handler {
+	allow := map[string]bool{}
+	wildcard := false
+	for _, origin := range allowed {
+		origin = strings.TrimSpace(origin)
+		if origin == "*" {
+			wildcard = true
+			continue
+		}
+		if canonical, err := parseHTTPOrigin(origin); err == nil {
+			allow[canonical] = true
+		}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		canonical, err := parseHTTPOrigin(origin)
+		if err != nil || !wildcard && !allow[canonical] {
+			writeError(w, http.StatusForbidden, "origin not allowed")
+			return
+		}
+		w.Header().Add("Vary", "Origin")
+		w.Header().Set("Access-Control-Allow-Origin", strings.TrimSpace(origin))
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "600")
+		if r.Method == http.MethodOptions {
+			// Never reflect arbitrary requested headers.
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -286,41 +375,20 @@ func (a *app) handleChatCompletion(w http.ResponseWriter, r *http.Request, serve
 		return
 	}
 
-	// Extract remote URL: try path first (URL-encoded), then query parameter.
-	// Path example: /https%3A%2F%2Fexample.com/v1/chat/completions
-	// Query example: ?base-url=https://example.com/v1
-	remoteBase := ""
-
-	// Try path: URL-encoded endpoint (includes /chat/completions)
-	// Example: /https%3A%2F%2Fopencode.ai/zen/v1/chat/completions
-	path := r.URL.Path
-	if path != "/" && path != "" {
-		decoded := r.URL.Path // Go automatically decodes %XX in Path
-		decoded = strings.TrimPrefix(decoded, "/")
-		if strings.HasPrefix(decoded, "http://") || strings.HasPrefix(decoded, "https://") {
-			remoteBase = decoded
+	remoteBase, targetErr := extractServerTarget(r.URL.Path, "", r.URL.Query())
+	if targetErr != nil || strings.TrimSpace(remoteBase) == "" {
+		writeError(w, http.StatusBadRequest, "endpoint required: use /~<hex-encoded-URL> or ?endpoint=https://example.com/v1/chat/completions")
+		return
+	}
+	if activeServerPolicy != nil {
+		if _, err := activeServerPolicy.authorizeTarget(remoteBase); err != nil {
+			activeServerPolicy.logRejectedTarget(remoteBase)
+			writeError(w, http.StatusForbidden, "target not allowed")
+			return
 		}
 	}
-
-	// Try hex-encoded path: /~<hex-encoded URL>
-	// Example: /~68747470733a2f2f6f70656e636f64652e61692f7a656e2f76312f636861742f636f6d706c6574696f6e73
-	if remoteBase == "" && strings.HasPrefix(path, "/~") {
-		hexStr := strings.TrimPrefix(path, "/~")
-		if decoded, err := hex.DecodeString(hexStr); err == nil {
-			url := string(decoded)
-			if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
-				remoteBase = url
-			}
-		}
-	}
-
-	// Fall back to query parameter: ?endpoint=https://example.com/v1/chat/completions
-	if remoteBase == "" {
-		remoteBase = strings.TrimSpace(r.URL.Query().Get("endpoint"))
-	}
-
-	if remoteBase == "" {
-		writeError(w, http.StatusBadRequest, "endpoint required: use path /https%3A%2F%2Fexample.com/v1/chat/completions (or http), /~<hex-encoded-URL>, or ?endpoint=https://example.com/v1/chat/completions")
+	if _, err := parseAbsoluteTarget(remoteBase); err != nil {
+		writeError(w, http.StatusBadRequest, "endpoint must be an absolute http or https URL")
 		return
 	}
 
@@ -375,7 +443,7 @@ func (a *app) handleChatCompletion(w http.ResponseWriter, r *http.Request, serve
 		model:     model,
 		reasoning: reasoning,
 		debug:     a.cfg.debug,
-		http:      serverHTTPClient,
+		http:      serverOutboundHTTPClient(a.cfg),
 	}
 
 	// Build server-mode app with the remote client.
@@ -491,36 +559,20 @@ func (a *app) handleAsyncChatCompletion(w http.ResponseWriter, r *http.Request, 
 		asyncPath = "/"
 	}
 
-	// Extract remote URL from the path (after stripping /async).
-	remoteBase := ""
-
-	// Try path: URL-encoded endpoint
-	path := asyncPath
-	if path != "/" && path != "" {
-		decoded := strings.TrimPrefix(path, "/")
-		if strings.HasPrefix(decoded, "http://") || strings.HasPrefix(decoded, "https://") {
-			remoteBase = decoded
+	remoteBase, targetErr := extractServerTarget(r.URL.Path, "/async", r.URL.Query())
+	if targetErr != nil || strings.TrimSpace(remoteBase) == "" {
+		writeError(w, http.StatusBadRequest, "endpoint required: use /async/~<hex-encoded-URL> or /async/?endpoint=...")
+		return
+	}
+	if activeServerPolicy != nil {
+		if _, err := activeServerPolicy.authorizeTarget(remoteBase); err != nil {
+			activeServerPolicy.logRejectedTarget(remoteBase)
+			writeError(w, http.StatusForbidden, "target not allowed")
+			return
 		}
 	}
-
-	// Try hex-encoded path: /~<hex-encoded URL>
-	if remoteBase == "" && strings.HasPrefix(path, "/~") {
-		hexStr := strings.TrimPrefix(path, "/~")
-		if decoded, err := hex.DecodeString(hexStr); err == nil {
-			url := string(decoded)
-			if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
-				remoteBase = url
-			}
-		}
-	}
-
-	// Fall back to query parameter
-	if remoteBase == "" {
-		remoteBase = strings.TrimSpace(r.URL.Query().Get("endpoint"))
-	}
-
-	if remoteBase == "" {
-		writeError(w, http.StatusBadRequest, "endpoint required: use /async/https%3A%2F%2Fexample.com/v1/chat/completions, /async/~<hex-encoded-URL>, or /async/?endpoint=...")
+	if _, err := parseAbsoluteTarget(remoteBase); err != nil {
+		writeError(w, http.StatusBadRequest, "endpoint must be an absolute http or https URL")
 		return
 	}
 
@@ -630,7 +682,7 @@ func (a *app) runAsyncTask(uuid, remoteBase, remoteToken, model, reasoning strin
 		model:     model,
 		reasoning: reasoning,
 		debug:     a.cfg.debug,
-		http:      serverHTTPClient,
+		http:      serverOutboundHTTPClient(a.cfg),
 	}
 
 	serverCfg := a.cfg

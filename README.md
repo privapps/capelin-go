@@ -70,27 +70,29 @@ Type `exit` or `quit` (or press Ctrl+D) to end an interactive session.
 # Start server on port 8899
 ./capelin-go --server-port 8899
 
-# Option 1: URL-encoded path (recommended)
-curl -X POST "http://localhost:8899/https%3A%2F%2Fopencode.ai/zen/v1/chat/completions" \
-  -H "Authorization: Bearer public" \
-  -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"search for go http best practices"}]}'
-
-# Option 2: Hex-encoded path (useful for obfuscating the endpoint)
+# Option 1: Hex-encoded path (useful for obfuscating the endpoint)
 # Generate hex: echo -n "https://opencode.ai/zen/v1/chat/completions" | xxd -p
 curl -X POST "http://localhost:8899/~68747470733a2f2f6f70656e636f64652e61692f7a656e2f76312f636861742f636f6d706c6574696f6e73" \
   -H "Authorization: Bearer public" \
   -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"search for go http best practices"}]}'
 
-# Option 3: Query parameter
+# Option 2: Query parameter
 curl -X POST "http://localhost:8899/?endpoint=https://opencode.ai/zen/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer public" \
   -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"search for go http best practices"}]}'
 ```
 
-In server mode:
-- CORS: browser requests are allowed from any origin; `GET`, `POST`, and `OPTIONS` are supported for local proxy access
-- Endpoint: full URL including `/chat/completions` — use URL-encoded path (`%3A%2F%2F` for `://`), hex-encoded path (`~<hex>` for obfuscated endpoints), or `?endpoint=` query parameter
+In server mode, browser access is disabled by default. Configure exact origins and outbound targets explicitly:
+
+```bash
+SERVER_ALLOWED_ORIGINS=https://app.example.com,http://localhost:3000
+SERVER_ALLOWED_TARGETS=https://api.openai.com,https://opencode.ai
+```
+
+Use `SERVER_ALLOWED_ORIGINS=*` or `SERVER_ALLOWED_TARGETS=*` only as an explicit compatibility escape hatch. Private/self-hosted targets additionally require `SERVER_ALLOW_PRIVATE_TARGETS=true` and an exact target entry. Requests without an `Origin` header remain supported for CLI/server-to-server use.
+
+- Endpoint: full URL including `/chat/completions` — use a hex-encoded path (`~<hex>`) or `?endpoint=` query parameter. Literal or percent-encoded URL paths are not accepted.
 - API token: standard `Authorization: Bearer <token>` header
 - Available tools: `web_search`, `fetch_page`, and subagent orchestration (`create_subagent`, `run_subagent`, `await_subagent`, `list_subagents`, `read_subagent`, `cancel_subagent`)
 - Response includes a `reasoning` field with LLM thinking, tool call traces, and subagent results
@@ -100,13 +102,13 @@ In server mode:
 **Raw CORS proxy** (any HTTP(S) endpoint):
 
 ```bash
-# The target can be URL-encoded in the path, hex-encoded, or passed as ?endpoint=
-curl -X PUT "http://localhost:8899/-/https%3A%2F%2Fexample.com%2Fapi%3Fx%3D1" \
+# The target can be hex-encoded in the path or passed as ?endpoint=
+curl -X PUT "http://localhost:8899/-/?endpoint=https://example.com/api?x=1" \
   -H "Content-Type: application/json" \
   -d '{"hello":"world"}'
 ```
 
-Requests to `/-/` preserve the method, body, query, and application headers. Upstream status, body, response headers, and redirects are relayed; browser `OPTIONS` preflight is answered locally with permissive CORS headers. The proxy accepts absolute `http://` and `https://` targets and does not require an Authorization header. To prevent SSRF, the proxy refuses to connect to loopback, private, link-local, multicast, and unspecified addresses (including cloud metadata endpoints); this includes hostnames that resolve to such addresses, so only public destinations are reachable.
+Requests to `/-/` preserve the method, body, query, and safe application headers. Bodies are limited to 10 MiB. Upstream status, body, and safe response headers are relayed; redirects are not followed by the proxy. Browser `OPTIONS` preflight is answered locally only for an allowlisted origin.
 
 **Data endpoint** (in-memory key-value store):
 
@@ -133,7 +135,7 @@ Data endpoint details:
 
 ```bash
 # Submit async request — returns UUID immediately (HTTP 202)
-curl -X POST "http://localhost:8899/async/https%3A%2F%2Fopencode.ai/zen/v1/chat/completions" \
+curl -X POST "http://localhost:8899/async/?endpoint=https://opencode.ai/zen/v1/chat/completions" \
   -H "Authorization: Bearer public" \
   -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"search for go http best practices"}]}'
 # → 202 {"id": "550e8400-e29b-41d4-a716-446655440000"}
@@ -143,7 +145,7 @@ curl "http://localhost:8899/data?key=550e8400-e29b-41d4-a716-446655440000"
 ```
 
 Async endpoint details:
-- Routes mirror the sync endpoints: `/async/https%3A%2F%2F...`, `/async/~<hex>`, `/async/?endpoint=...`
+- Routes mirror the sync endpoints: `/async/~<hex>`, `/async/?endpoint=...` (literal/percent-encoded URL paths are removed)
 - Returns `202 Accepted` with `{"id": "<uuid>"}` immediately
 - The request runs in the background; result is stored in `/data` with a 1-hour TTL
 - Poll `GET /data?key=<uuid>` — returns 404 while processing, full OpenAI-format JSON when complete
@@ -236,7 +238,7 @@ Enable everything (all tools + unrestricted paths):
 
 ## Environment variables
 
-- `--server-port PORT` — start HTTP server on given port (server mode)
+- `--server-port PORT` (or `--server PORT`) — start HTTP server on given port (server mode)
 - `ENDPOINT` — complete model URL (default: `http://localhost:8235/v1/chat/completions`). When its URL path ends with `/responses` (with an optional trailing slash), capelin-go uses the official OpenAI Responses API schema; all other paths use Chat Completions.
 - `MODEL` — model ID (default: `gpt-5-mini`)
 - `TOKEN` — optional API token

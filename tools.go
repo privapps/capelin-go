@@ -790,7 +790,23 @@ func resolveDDGURL(href string) string {
 }
 
 func runFetchPage(ctx context.Context, targetURL string) (string, error) {
-	parsed, err := validateFetchURL(ctx, targetURL)
+	return runFetchPageWithClient(ctx, targetURL, toolHTTPClient)
+}
+
+// runFetchPageWithClient allows server-mode callers to supply the policy-aware
+// transport. The standalone wrapper above retains the existing safe tool
+// client and test API.
+func runFetchPageWithClient(ctx context.Context, targetURL string, client *http.Client) (string, error) {
+	allowPrivate := allowPrivateFetch
+	// Server-mode policy explicitly permits private fetches only for exact
+	// allowlisted origins. Let validation proceed; the secure client performs
+	// the final authorization and DNS/address gate.
+	if activeServerPolicy != nil {
+		if target, parseErr := parseAbsoluteTarget(targetURL); parseErr == nil {
+			allowPrivate = activeServerPolicy.AllowPrivateTargets && activeServerPolicy.AllowedTargets[target.Origin]
+		}
+	}
+	parsed, err := validateFetchURLWithPrivate(ctx, targetURL, allowPrivate)
 	if err != nil {
 		return "", err
 	}
@@ -802,7 +818,10 @@ func runFetchPage(ctx context.Context, targetURL string) (string, error) {
 	req.Header.Set("User-Agent", browserUA)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,*/*")
 
-	resp, err := toolHTTPClient.Do(req)
+	if client == nil {
+		client = toolHTTPClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("fetch page: %w", err)
 	}
@@ -843,6 +862,10 @@ func runFetchPage(ctx context.Context, targetURL string) (string, error) {
 }
 
 func validateFetchURL(ctx context.Context, raw string) (*url.URL, error) {
+	return validateFetchURLWithPrivate(ctx, raw, allowPrivateFetch)
+}
+
+func validateFetchURLWithPrivate(ctx context.Context, raw string, allowPrivate bool) (*url.URL, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("fetch page: invalid URL: %w", err)
@@ -855,7 +878,7 @@ func validateFetchURL(ctx context.Context, raw string) (*url.URL, error) {
 	if host == "" {
 		return nil, fmt.Errorf("fetch page: missing host in %q", raw)
 	}
-	if allowPrivateFetch {
+	if allowPrivate {
 		return parsed, nil
 	}
 	if isBlockedHostname(host) {
