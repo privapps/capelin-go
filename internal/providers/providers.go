@@ -238,7 +238,7 @@ func chatMessages(messages []contracts.Message) []chatMessage {
 			Role: message.Role, Content: message.Content, ToolCallID: message.ToolCallID,
 			Name: message.Name, ToolCalls: append([]contracts.ToolCall(nil), message.ToolCalls...),
 		}
-		if message.Role == "assistant" && message.ReasoningContent != nil && *message.ReasoningContent != "" {
+		if message.Role == "assistant" && message.ReasoningContent != nil {
 			value := *message.ReasoningContent
 			wire.ReasoningContent = &value
 		}

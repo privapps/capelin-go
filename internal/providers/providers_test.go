@@ -74,6 +74,48 @@ func TestChatCompletionsReplaysNativeReasoningForToolContinuation(t *testing.T) 
 	}
 }
 
+func TestChatCompletionsPreservesEmptyNativeReasoningForToolContinuation(t *testing.T) {
+	call := contracts.ToolCall{
+		ID: "call-1", Type: "function",
+		Function: contracts.FunctionCall{Name: "lookup", Arguments: `{}`},
+	}
+	var requests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		requests = append(requests, request)
+		w.Header().Set("Content-Type", "application/json")
+		if len(requests) == 1 {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}`))
+			return
+		}
+		messages := request["messages"].([]any)
+		assistant := messages[1].(map[string]any)
+		if _, present := assistant["reasoning_content"]; !present {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"The reasoning_content in the thinking mode must be passed back to the API."}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"finished"}}]}`))
+	}))
+	defer server.Close()
+
+	provider := NewChatCompletions(Config{Endpoint: server.URL, HTTP: server.Client()})
+	state := provider.Initialize(nil, "inspect")
+	response, err := provider.Complete(context.Background(), state, []contracts.Tool{{Type: "function", Function: contracts.ToolSpec{Name: "lookup"}}}, "model", "medium")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.ApplyResponse(state, response)
+	provider.ApplyToolResults(state, []contracts.ToolResult{{Call: call, Output: "tool result"}})
+	if _, err := provider.Complete(context.Background(), state, nil, "model", "medium"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestChatCompletionsReasoningAliasesPreferNativeAndOmitWhenAbsent(t *testing.T) {
 	responses := []string{
 		`{"choices":[{"message":{"role":"assistant","content":"ok","reasoning":"legacy","reasoning_content":"native"}}]}`,
