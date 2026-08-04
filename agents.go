@@ -109,6 +109,59 @@ type agentRuntime struct {
 	maxToolIterations int
 	model             string
 	reasoning         string
+
+	todosMu      sync.RWMutex
+	todos        []todoItem
+	todosChanged func([]todoItem)
+	toolErrorMu  sync.Mutex
+	toolError    error
+}
+
+func (r *agentRuntime) replaceTodos(todos []todoItem) {
+	updated := cloneTodos(todos)
+	r.todosMu.Lock()
+	r.todos = updated
+	changed := r.todosChanged
+	callbackTodos := cloneTodos(updated)
+	r.todosMu.Unlock()
+	if changed != nil {
+		changed(callbackTodos)
+	}
+}
+
+func (r *agentRuntime) snapshotTodos() []todoItem {
+	r.todosMu.RLock()
+	defer r.todosMu.RUnlock()
+	return cloneTodos(r.todos)
+}
+
+func (r *agentRuntime) resetToolError() {
+	if r == nil {
+		return
+	}
+	r.toolErrorMu.Lock()
+	r.toolError = nil
+	r.toolErrorMu.Unlock()
+}
+
+func (r *agentRuntime) recordToolError(err error) {
+	if r == nil || err == nil {
+		return
+	}
+	r.toolErrorMu.Lock()
+	if r.toolError == nil {
+		r.toolError = err
+	}
+	r.toolErrorMu.Unlock()
+}
+
+func (r *agentRuntime) recordedToolError() error {
+	if r == nil {
+		return nil
+	}
+	r.toolErrorMu.Lock()
+	defer r.toolErrorMu.Unlock()
+	return r.toolError
 }
 
 type subagentStatus string

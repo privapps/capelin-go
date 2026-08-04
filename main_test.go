@@ -4,16 +4,20 @@ import (
 	"capelin-go/internal/skills"
 	"capelin-go/internal/types"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1685,6 +1689,138 @@ func TestServerRequiresEndpoint(t *testing.T) {
 	}
 }
 
+func TestServerRequestNormalizationIsSharedAcrossDeliveryModes(t *testing.T) {
+	allowed := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{cfg: config{model: "default-model", reasoning: "medium", workspaceRoot: t.TempDir()}}
+	body := `{"model":"request-model","reasoning":{"effort":"low"},"messages":[{"role":"system","content":"be concise"},{"role":"user","content":"hello"}]}`
+
+	syncReq := httptest.NewRequest(http.MethodPost, "/https%3A%2F%2Fremote.example/v1/chat/completions", strings.NewReader(body))
+	syncReq.Header.Set("Authorization", "Bearer token")
+	asyncReq := httptest.NewRequest(http.MethodPost, "/async/https%3A%2F%2Fremote.example/v1/chat/completions", strings.NewReader(body))
+	asyncReq.Header.Set("Authorization", "Bearer token")
+
+	syncExecution, err := a.prepareServerRequest(syncReq, allowed, "")
+	if err != nil {
+		t.Fatalf("sync normalization: %v", err)
+	}
+	asyncExecution, err := a.prepareServerRequest(asyncReq, allowed, "/async")
+	if err != nil {
+		t.Fatalf("async normalization: %v", err)
+	}
+	if !reflect.DeepEqual(syncExecution, asyncExecution) {
+		t.Fatalf("sync and async normalization diverged: %#v vs %#v", syncExecution, asyncExecution)
+	}
+	if got := syncExecution.messages[0].Content; !strings.Contains(got, "Only web_search and fetch_page") {
+		t.Fatalf("expected server tool restriction in system message, got %q", got)
+	}
+	if syncExecution.model != "request-model" || syncExecution.reasoning != "low" {
+		t.Fatalf("request overrides were not preserved: model=%q reasoning=%q", syncExecution.model, syncExecution.reasoning)
+	}
+}
+
+func TestServerRequestEndpointFormsHaveSyncAsyncParity(t *testing.T) {
+	allowed := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{cfg: config{model: "default", reasoning: "medium", workspaceRoot: t.TempDir()}}
+	body := `{"messages":[{"role":"user","content":"hello"}]}`
+	hexEndpoint := "68747470733a2f2f72656d6f74652e6578616d706c652f7631"
+	cases := []struct {
+		name        string
+		syncTarget  string
+		asyncTarget string
+	}{
+		{name: "encoded path", syncTarget: "/https%3A%2F%2Fremote.example/v1", asyncTarget: "/async/https%3A%2F%2Fremote.example/v1"},
+		{name: "hex path", syncTarget: "/~" + hexEndpoint, asyncTarget: "/async/~" + hexEndpoint},
+		{name: "query", syncTarget: "/?endpoint=https://remote.example/v1", asyncTarget: "/async/?endpoint=https://remote.example/v1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			syncReq := httptest.NewRequest(http.MethodPost, tc.syncTarget, strings.NewReader(body))
+			syncReq.Header.Set("Authorization", "Bearer token")
+			asyncReq := httptest.NewRequest(http.MethodPost, tc.asyncTarget, strings.NewReader(body))
+			asyncReq.Header.Set("Authorization", "Bearer token")
+			syncExecution, err := a.prepareServerRequest(syncReq, allowed, "")
+			if err != nil {
+				t.Fatalf("sync normalization: %v", err)
+			}
+			asyncExecution, err := a.prepareServerRequest(asyncReq, allowed, "/async")
+			if err != nil {
+				t.Fatalf("async normalization: %v", err)
+			}
+			if !reflect.DeepEqual(syncExecution, asyncExecution) {
+				t.Fatalf("normalization differs between delivery modes")
+			}
+		})
+	}
+}
+
+func TestServerRequestBodyLimitIsEnforcedForBothDeliveryModes(t *testing.T) {
+	allowed := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{cfg: config{model: "default", workspaceRoot: t.TempDir()}, dataStore: newDataStore()}
+	validBody := `{"messages":[{"role":"user","content":"hello"}]}`
+	body := validBody + strings.Repeat(" ", maxServerRequestBodySize-len(validBody)+1)
+
+	tests := []struct {
+		name    string
+		target  string
+		handler func(http.ResponseWriter, *http.Request, map[string]bool)
+	}{
+		{name: "sync", target: "/?endpoint=https://remote.example/v1", handler: a.handleChatCompletion},
+		{name: "async", target: "/async/?endpoint=https://remote.example/v1", handler: a.handleAsyncChatCompletion},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.target, strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer token")
+			w := httptest.NewRecorder()
+			tc.handler(w, req, allowed)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected oversized request to be rejected with 400, got %d: %s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "maximum size") {
+				t.Fatalf("expected body-size error, got: %s", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestServerExecutionAppUsesOnlyServerToolPolicy(t *testing.T) {
+	allowed := map[string]bool{toolWebSearch: true, toolFetchPage: true}
+	a := &app{cfg: config{model: "default", workspaceRoot: t.TempDir(), allowedTools: map[string]bool{toolReadFile: true}}}
+	execution := &serverExecutionRequest{remoteBase: "http://remote.example", remoteToken: "token", model: "model", serverAllowedTools: allowed}
+	serverApp, runtime := a.newServerExecutionApp(execution)
+	if runtime.allowedTools[toolReadFile] {
+		t.Fatal("server runtime inherited a disallowed root tool")
+	}
+	if !serverApp.isToolEnabled(runtime, toolWebSearch) || serverApp.isToolEnabled(runtime, toolReadFile) {
+		t.Fatalf("unexpected server tool policy: %#v", runtime.allowedTools)
+	}
+}
+
+func TestTurnAdaptersShareNormalizedToolConversationState(t *testing.T) {
+	call := types.ToolCall{ID: "call-1", Type: "function", Function: types.FunctionCall{Name: "web_search", Arguments: `{"query":"hello"}`}}
+	content := "done"
+	response := &completionMessage{message: types.CompletionMessage{Role: "assistant", Content: &content, ToolCalls: []types.ToolCall{call}}}
+	result := []turnToolResult{{call: call, out: "result"}}
+
+	chat := chatTurnAdapter{}
+	chatState := chat.initialize([]types.Message{{Role: "system", Content: "system"}}, "question")
+	chat.applyResponse(chatState, response)
+	chat.applyToolResults(chatState, result)
+	responses := responsesTurnAdapter{}
+	responsesState := responses.initialize([]types.Message{{Role: "system", Content: "system"}}, "question")
+	responses.applyResponse(responsesState, response)
+	responses.applyToolResults(responsesState, result)
+
+	if len(chatState.messages) != len(responsesState.messages) {
+		t.Fatalf("adapter message state lengths differ: %d vs %d", len(chatState.messages), len(responsesState.messages))
+	}
+	for i := range chatState.messages {
+		if chatState.messages[i].Role != responsesState.messages[i].Role || chatState.messages[i].Content != responsesState.messages[i].Content || chatState.messages[i].ToolCallID != responsesState.messages[i].ToolCallID {
+			t.Fatalf("adapter message state differs at %d: %#v vs %#v", i, chatState.messages[i], responsesState.messages[i])
+		}
+	}
+}
+
 func TestWithCORSHandlesPreflight(t *testing.T) {
 	called := false
 	handler := withCORS(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2009,6 +2145,27 @@ func TestFinalOnlySinkSuppressesToolAndSystemOutput(t *testing.T) {
 
 	if toolCalls != 0 || toolResults != 0 || systems != 0 {
 		t.Fatalf("expected all suppressed, got calls=%d results=%d systems=%d", toolCalls, toolResults, systems)
+	}
+}
+
+func TestFormatToolCallDisplayTruncatesArgumentsTo180Characters(t *testing.T) {
+	args := strings.Repeat("é", 200)
+	got := formatToolCallDisplay("read_file", args)
+
+	want := "[tool] read_file(" + strings.Repeat("é", 177) + "...)\n"
+	if got != want {
+		t.Fatalf("unexpected tool display:\n got: %q\nwant: %q", got, want)
+	}
+
+	displayedArgs := strings.TrimSuffix(strings.TrimPrefix(got, "[tool] read_file("), ")\n")
+	if len([]rune(displayedArgs)) != toolDisplayMaxChars {
+		t.Fatalf("expected %d displayed argument characters, got %d", toolDisplayMaxChars, len([]rune(displayedArgs)))
+	}
+}
+
+func TestFormatToolCallDisplayPreservesShortArguments(t *testing.T) {
+	if got, want := formatToolCallDisplay("list_files", `{"path":"."}`), "[tool] list_files({\"path\":\".\"})\n"; got != want {
+		t.Fatalf("unexpected tool display: got %q, want %q", got, want)
 	}
 }
 
@@ -3162,4 +3319,568 @@ func TestBuildChatCompletionJSONWithoutReasoning(t *testing.T) {
 	if _, ok := msg["reasoning"]; ok {
 		t.Fatalf("expected no reasoning key when empty")
 	}
+}
+
+func TestServerIntakeParityThroughDeliveryModes(t *testing.T) {
+	isolateConfigFile(t)
+	allowed := serverParityAllowedTools()
+	var mu sync.Mutex
+	var payloads []map[string]any
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode model request: %v", err)
+			return
+		}
+		mu.Lock()
+		payloads = append(payloads, payload)
+		mu.Unlock()
+		writeServerParityCompletion(w, "done")
+	}))
+	defer mockLLM.Close()
+
+	body := "{\"messages\":[{\"role\":\"system\",\"content\":\"keep this instruction\"},{\"role\":\"user\",\"content\":\"hello\"}]}"
+	a := newServerParityApp(t, mockLLM.URL, "configured-model", "configured-reasoning")
+
+	syncReq := httptest.NewRequest(http.MethodPost, "/?endpoint="+url.QueryEscape(mockLLM.URL), strings.NewReader(body))
+	syncReq.Header.Set("Authorization", "Bearer sk-test")
+	syncW := httptest.NewRecorder()
+	a.handleChatCompletion(syncW, syncReq, allowed)
+	if syncW.Code != http.StatusOK {
+		t.Fatalf("sync status = %d: %s", syncW.Code, syncW.Body.String())
+	}
+
+	asyncReq := httptest.NewRequest(http.MethodPost, "/async/?endpoint="+url.QueryEscape(mockLLM.URL), strings.NewReader(body))
+	asyncReq.Header.Set("Authorization", "Bearer sk-test")
+	asyncW := httptest.NewRecorder()
+	a.handleAsyncChatCompletion(asyncW, asyncReq, allowed)
+	if asyncW.Code != http.StatusAccepted {
+		t.Fatalf("async status = %d: %s", asyncW.Code, asyncW.Body.String())
+	}
+	var accepted map[string]string
+	if err := json.Unmarshal(asyncW.Body.Bytes(), &accepted); err != nil {
+		t.Fatalf("decode async acceptance: %v", err)
+	}
+	asyncResult := pollServerData(t, a, accepted["id"])
+	if !strings.Contains(asyncResult, "\"content\":\"done\"") {
+		t.Fatalf("unexpected async completion: %s", asyncResult)
+	}
+
+	mu.Lock()
+	gotPayloads := append([]map[string]any(nil), payloads...)
+	mu.Unlock()
+	if len(gotPayloads) != 2 {
+		t.Fatalf("model request count = %d, want 2", len(gotPayloads))
+	}
+	for i, payload := range gotPayloads {
+		if payload["model"] != "configured-model" {
+			t.Errorf("payload %d model = %v", i, payload["model"])
+		}
+		if payload["reasoning_effort"] != "configured-reasoning" {
+			t.Errorf("payload %d reasoning = %v", i, payload["reasoning_effort"])
+		}
+		messages := payload["messages"].([]any)
+		system := messages[0].(map[string]any)["content"].(string)
+		if !strings.Contains(system, "keep this instruction") || !strings.Contains(system, "Only web_search and fetch_page tools are available") {
+			t.Errorf("payload %d lost system/tool policy: %q", i, system)
+		}
+		for _, name := range serverPayloadToolNames(payload) {
+			if name == toolReadFile || name == toolExecuteProgram || name == toolExecuteSkill {
+				t.Errorf("payload %d exposed restricted tool %q", i, name)
+			}
+		}
+	}
+	a.dataStore.mu.RLock()
+	entry := a.dataStore.entries[accepted["id"]]
+	a.dataStore.mu.RUnlock()
+	if entry == nil || time.Until(entry.expiresAt) < asyncResultTTL-time.Minute {
+		t.Fatalf("async result TTL was not preserved: %#v", entry)
+	}
+}
+
+func TestServerEndpointFormsHaveEquivalentDeliveryDecisions(t *testing.T) {
+	isolateConfigFile(t)
+	allowed := serverParityAllowedTools()
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeServerParityCompletion(w, "endpoint ok")
+	}))
+	defer mockLLM.Close()
+
+	for _, form := range []string{"encoded", "hex", "query"} {
+		t.Run(form, func(t *testing.T) {
+			syncApp := newServerParityApp(t, mockLLM.URL, "model", "reasoning")
+			syncReq := httptest.NewRequest(http.MethodPost, serverEndpointFormPath("", mockLLM.URL, form), strings.NewReader(serverParityBody()))
+			syncReq.Header.Set("Authorization", "Bearer sk-test")
+			syncW := httptest.NewRecorder()
+			syncApp.handleChatCompletion(syncW, syncReq, allowed)
+			if syncW.Code != http.StatusOK {
+				t.Fatalf("sync status = %d: %s", syncW.Code, syncW.Body.String())
+			}
+
+			asyncApp := newServerParityApp(t, mockLLM.URL, "model", "reasoning")
+			asyncReq := httptest.NewRequest(http.MethodPost, serverEndpointFormPath("/async", mockLLM.URL, form), strings.NewReader(serverParityBody()))
+			asyncReq.Header.Set("Authorization", "Bearer sk-test")
+			asyncW := httptest.NewRecorder()
+			asyncApp.handleAsyncChatCompletion(asyncW, asyncReq, allowed)
+			if asyncW.Code != http.StatusAccepted {
+				t.Fatalf("async status = %d: %s", asyncW.Code, asyncW.Body.String())
+			}
+			var accepted map[string]string
+			if err := json.Unmarshal(asyncW.Body.Bytes(), &accepted); err != nil {
+				t.Fatalf("decode async acceptance: %v", err)
+			}
+			if got := pollServerData(t, asyncApp, accepted["id"]); !strings.Contains(got, "\"content\":\"endpoint ok\"") {
+				t.Fatalf("unexpected async result: %s", got)
+			}
+		})
+	}
+}
+
+func TestServerEndpointPrecedenceIsSharedAcrossDeliveryModes(t *testing.T) {
+	allowed := serverParityAllowedTools()
+	a := &app{cfg: config{model: "model", reasoning: "reasoning", workspaceRoot: t.TempDir()}}
+
+	cases := []struct {
+		name      string
+		syncPath  string
+		asyncPath string
+		query     string
+		want      string
+	}{
+		{
+			name:      "valid path wins over query",
+			syncPath:  "/https%3A%2F%2Fpath.example%2Fv1",
+			asyncPath: "/async/https%3A%2F%2Fpath.example%2Fv1",
+			query:     "https://query.example/v1",
+			want:      "https://path.example/v1",
+		},
+		{
+			name:      "query is fallback for invalid path",
+			syncPath:  "/not-an-endpoint",
+			asyncPath: "/async/not-an-endpoint",
+			query:     "https://query.example/v1",
+			want:      "https://query.example/v1",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.NewReader(serverParityBody())
+			syncReq := httptest.NewRequest(http.MethodPost, tc.syncPath+"?endpoint="+url.QueryEscape(tc.query), body)
+			syncReq.Header.Set("Authorization", "Bearer token")
+			asyncReq := httptest.NewRequest(http.MethodPost, tc.asyncPath+"?endpoint="+url.QueryEscape(tc.query), strings.NewReader(serverParityBody()))
+			asyncReq.Header.Set("Authorization", "Bearer token")
+
+			syncExecution, err := a.prepareServerRequest(syncReq, allowed, "")
+			if err != nil {
+				t.Fatalf("sync normalization: %v", err)
+			}
+			asyncExecution, err := a.prepareServerRequest(asyncReq, allowed, "/async")
+			if err != nil {
+				t.Fatalf("async normalization: %v", err)
+			}
+			if syncExecution.remoteBase != tc.want || asyncExecution.remoteBase != tc.want {
+				t.Fatalf("endpoint resolution = sync %q, async %q; want %q", syncExecution.remoteBase, asyncExecution.remoteBase, tc.want)
+			}
+		})
+	}
+}
+
+func TestServerInvalidRequestsHaveEquivalentDeliveryErrors(t *testing.T) {
+	isolateConfigFile(t)
+	allowed := serverParityAllowedTools()
+	cases := []struct {
+		name string
+		body string
+		auth string
+	}{
+		{name: "missing bearer", body: serverParityBody()},
+		{name: "invalid json", body: "not json", auth: "Bearer sk-test"},
+		{name: "empty messages", body: "{\"messages\":[]}", auth: "Bearer sk-test"},
+		{name: "streaming", body: "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}", auth: "Bearer sk-test"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			syncApp := newServerParityApp(t, "http://example.com", "model", "reasoning")
+			asyncApp := newServerParityApp(t, "http://example.com", "model", "reasoning")
+			syncReq := httptest.NewRequest(http.MethodPost, "/?endpoint=http%3A%2F%2Fexample.com", strings.NewReader(tc.body))
+			asyncReq := httptest.NewRequest(http.MethodPost, "/async/?endpoint=http%3A%2F%2Fexample.com", strings.NewReader(tc.body))
+			if tc.auth != "" {
+				syncReq.Header.Set("Authorization", tc.auth)
+				asyncReq.Header.Set("Authorization", tc.auth)
+			}
+			syncW, asyncW := httptest.NewRecorder(), httptest.NewRecorder()
+			syncApp.handleChatCompletion(syncW, syncReq, allowed)
+			asyncApp.handleAsyncChatCompletion(asyncW, asyncReq, allowed)
+			if syncW.Code != asyncW.Code {
+				t.Fatalf("delivery status differs: sync=%d async=%d", syncW.Code, asyncW.Code)
+			}
+			var syncResp, asyncResp map[string]any
+			if err := json.Unmarshal(syncW.Body.Bytes(), &syncResp); err != nil {
+				t.Fatalf("sync error JSON: %v", err)
+			}
+			if err := json.Unmarshal(asyncW.Body.Bytes(), &asyncResp); err != nil {
+				t.Fatalf("async error JSON: %v", err)
+			}
+			syncMessage := syncResp["error"].(map[string]any)["message"]
+			asyncMessage := asyncResp["error"].(map[string]any)["message"]
+			if syncMessage != asyncMessage {
+				t.Fatalf("delivery error differs: sync=%v async=%v", syncResp, asyncResp)
+			}
+		})
+	}
+}
+
+func TestServerInvalidQueryEndpointHasEquivalentDeliveryErrors(t *testing.T) {
+	allowed := serverParityAllowedTools()
+	a := newServerParityApp(t, "http://example.com", "model", "reasoning")
+	body := serverParityBody()
+
+	syncReq := httptest.NewRequest(http.MethodPost, "/?endpoint=not-a-url", strings.NewReader(body))
+	syncReq.Header.Set("Authorization", "Bearer token")
+	asyncReq := httptest.NewRequest(http.MethodPost, "/async/?endpoint=not-a-url", strings.NewReader(body))
+	asyncReq.Header.Set("Authorization", "Bearer token")
+
+	syncW, asyncW := httptest.NewRecorder(), httptest.NewRecorder()
+	a.handleChatCompletion(syncW, syncReq, allowed)
+	a.handleAsyncChatCompletion(asyncW, asyncReq, allowed)
+
+	if syncW.Code != http.StatusBadRequest || asyncW.Code != http.StatusBadRequest {
+		t.Fatalf("invalid endpoint status = sync %d, async %d; want 400", syncW.Code, asyncW.Code)
+	}
+	var syncResp, asyncResp map[string]any
+	if err := json.Unmarshal(syncW.Body.Bytes(), &syncResp); err != nil {
+		t.Fatalf("sync error JSON: %v", err)
+	}
+	if err := json.Unmarshal(asyncW.Body.Bytes(), &asyncResp); err != nil {
+		t.Fatalf("async error JSON: %v", err)
+	}
+	syncMessage := syncResp["error"].(map[string]any)["message"]
+	asyncMessage := asyncResp["error"].(map[string]any)["message"]
+	if syncMessage != asyncMessage {
+		t.Fatalf("invalid endpoint error differs: sync=%v async=%v", syncResp, asyncResp)
+	}
+}
+
+func TestServerSynchronousCancellationUsesRequestContext(t *testing.T) {
+	isolateConfigFile(t)
+	allowed := serverParityAllowedTools()
+	received := make(chan struct{})
+	canceled := make(chan struct{})
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		close(received)
+		<-r.Context().Done()
+		close(canceled)
+		return nil, r.Context().Err()
+	})
+
+	a := newServerParityApp(t, "http://remote.example", "model", "reasoning")
+	a.client.http = &http.Client{Transport: transport}
+	req := httptest.NewRequest(http.MethodPost, "/?endpoint=http%3A%2F%2Fremote.example", strings.NewReader(serverParityBody()))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	ctx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		a.handleChatCompletion(w, req, allowed)
+		close(done)
+	}()
+	select {
+	case <-received:
+	case <-time.After(time.Second):
+		t.Fatal("model request was not started")
+	}
+	cancel()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("model request did not observe cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("synchronous handler did not return after cancellation")
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("canceled sync status = %d, want 500", w.Code)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func TestServerAsyncPollingCompletionAndFailure(t *testing.T) {
+	isolateConfigFile(t)
+	allowed := serverParityAllowedTools()
+	for _, tc := range []struct {
+		name      string
+		status    int
+		bodyCheck string
+	}{
+		{name: "completion", status: http.StatusOK, bodyCheck: "\"content\":\"async done\""},
+		{name: "failure", status: http.StatusBadRequest, bodyCheck: "\"type\":\"async_error\""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mockLLM *httptest.Server
+			if tc.status == http.StatusOK {
+				mockLLM = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					writeServerParityCompletion(w, "async done")
+				}))
+			} else {
+				mockLLM = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					http.Error(w, "provider rejected request", tc.status)
+				}))
+			}
+			defer mockLLM.Close()
+
+			a := newServerParityApp(t, mockLLM.URL, "model", "reasoning")
+			req := httptest.NewRequest(http.MethodPost, "/async/?endpoint="+url.QueryEscape(mockLLM.URL), strings.NewReader(serverParityBody()))
+			req.Header.Set("Authorization", "Bearer sk-test")
+			w := httptest.NewRecorder()
+			a.handleAsyncChatCompletion(w, req, allowed)
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("async status = %d: %s", w.Code, w.Body.String())
+			}
+			var accepted map[string]string
+			if err := json.Unmarshal(w.Body.Bytes(), &accepted); err != nil {
+				t.Fatalf("decode accepted response: %v", err)
+			}
+			result := pollServerData(t, a, accepted["id"])
+			if !strings.Contains(result, tc.bodyCheck) {
+				t.Fatalf("unexpected polled result: %s", result)
+			}
+		})
+	}
+}
+
+func TestServerApplicationHandlerRoutesBothDeliveryModes(t *testing.T) {
+	isolateConfigFile(t)
+	allowed := serverParityAllowedTools()
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeServerParityCompletion(w, "application seam")
+	}))
+	defer mockLLM.Close()
+
+	a := newServerParityApp(t, mockLLM.URL, "model", "reasoning")
+	handler := newServerHandler(a, allowed)
+	endpoint := url.QueryEscape(mockLLM.URL)
+
+	syncReq := httptest.NewRequest(http.MethodPost, "/?endpoint="+endpoint, strings.NewReader(serverParityBody()))
+	syncReq.Header.Set("Authorization", "Bearer token")
+	syncW := httptest.NewRecorder()
+	handler.ServeHTTP(syncW, syncReq)
+	if syncW.Code != http.StatusOK || !strings.Contains(syncW.Body.String(), "application seam") {
+		t.Fatalf("sync application response = %d: %s", syncW.Code, syncW.Body.String())
+	}
+
+	asyncReq := httptest.NewRequest(http.MethodPost, "/async/?endpoint="+endpoint, strings.NewReader(serverParityBody()))
+	asyncReq.Header.Set("Authorization", "Bearer token")
+	asyncW := httptest.NewRecorder()
+	handler.ServeHTTP(asyncW, asyncReq)
+	if asyncW.Code != http.StatusAccepted {
+		t.Fatalf("async application response = %d: %s", asyncW.Code, asyncW.Body.String())
+	}
+	var accepted map[string]string
+	if err := json.Unmarshal(asyncW.Body.Bytes(), &accepted); err != nil {
+		t.Fatalf("decode async acceptance: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		pollReq := httptest.NewRequest(http.MethodGet, "/data?key="+url.QueryEscape(accepted["id"]), nil)
+		pollW := httptest.NewRecorder()
+		handler.ServeHTTP(pollW, pollReq)
+		if pollW.Code == http.StatusOK {
+			if !strings.Contains(pollW.Body.String(), "application seam") {
+				t.Fatalf("unexpected polled result: %s", pollW.Body.String())
+			}
+			return
+		}
+		if pollW.Code != http.StatusNotFound {
+			t.Fatalf("poll status = %d: %s", pollW.Code, pollW.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out polling application handler result %q", accepted["id"])
+}
+
+func TestServerAsyncCapacityRejectsBeforeReadingBody(t *testing.T) {
+	original := asyncSem
+	asyncSem = make(chan struct{}, 1)
+	asyncSem <- struct{}{}
+	defer func() { asyncSem = original }()
+
+	a := newServerParityApp(t, "http://example.com", "model", "reasoning")
+	body := &serverTrackingBody{Reader: strings.NewReader(serverParityBody())}
+	req := httptest.NewRequest(http.MethodPost, "/async/?endpoint=http%3A%2F%2Fexample.com", body)
+	req.Header.Set("Authorization", "Bearer sk-test")
+	w := httptest.NewRecorder()
+	a.handleAsyncChatCompletion(w, req, serverParityAllowedTools())
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("capacity status = %d: %s", w.Code, w.Body.String())
+	}
+	if body.read {
+		t.Fatal("capacity rejection read the request body")
+	}
+}
+
+func TestServerAsyncTimeoutAndPanicRecoveryThroughHandler(t *testing.T) {
+	isolateConfigFile(t)
+	allowed := serverParityAllowedTools()
+	t.Run("timeout", func(t *testing.T) {
+		a := newServerParityApp(t, "http://remote.example", "model", "reasoning")
+		a.client.http = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		})}
+		a.cfg.asyncTimeout = 20 * time.Millisecond
+		req := httptest.NewRequest(http.MethodPost, "/async/?endpoint=http%3A%2F%2Fremote.example", strings.NewReader(serverParityBody()))
+		req.Header.Set("Authorization", "Bearer sk-test")
+		w := httptest.NewRecorder()
+		a.handleAsyncChatCompletion(w, req, allowed)
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("async status = %d: %s", w.Code, w.Body.String())
+		}
+		var accepted map[string]string
+		_ = json.Unmarshal(w.Body.Bytes(), &accepted)
+		result := pollServerData(t, a, accepted["id"])
+		if !strings.Contains(result, "\"type\":\"async_error\"") || !strings.Contains(result, "deadline") {
+			t.Fatalf("unexpected timeout result: %s", result)
+		}
+	})
+
+	t.Run("panic", func(t *testing.T) {
+		a := newServerParityApp(t, "http://example.com", "model", "reasoning")
+		a.asyncRunner = func(string, *serverExecutionRequest) {
+			panic("test async panic")
+		}
+		req := httptest.NewRequest(http.MethodPost, "/async/?endpoint=http%3A%2F%2Fexample.com", strings.NewReader(serverParityBody()))
+		req.Header.Set("Authorization", "Bearer sk-test")
+		w := httptest.NewRecorder()
+		a.handleAsyncChatCompletion(w, req, allowed)
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("async status = %d: %s", w.Code, w.Body.String())
+		}
+		var accepted map[string]string
+		_ = json.Unmarshal(w.Body.Bytes(), &accepted)
+		result := pollServerData(t, a, accepted["id"])
+		if !strings.Contains(result, "\"type\":\"async_error\"") || !strings.Contains(result, "test async panic") {
+			t.Fatalf("unexpected panic result: %s", result)
+		}
+	})
+}
+
+func TestServerAsyncStorageFallbackThroughHandler(t *testing.T) {
+	isolateConfigFile(t)
+	huge := strings.Repeat("x", maxDataValueSize+1)
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]string{"role": "assistant", "content": huge}}},
+		})
+	}))
+	defer mockLLM.Close()
+
+	a := newServerParityApp(t, mockLLM.URL, "model", "reasoning")
+	req := httptest.NewRequest(http.MethodPost, "/async/?endpoint="+url.QueryEscape(mockLLM.URL), strings.NewReader(serverParityBody()))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	w := httptest.NewRecorder()
+	a.handleAsyncChatCompletion(w, req, serverParityAllowedTools())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("async status = %d: %s", w.Code, w.Body.String())
+	}
+	var accepted map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &accepted)
+	if got := pollServerData(t, a, accepted["id"]); got != asyncResultStorageError {
+		t.Fatalf("unexpected storage fallback: %q", got)
+	}
+}
+
+type serverTrackingBody struct {
+	io.Reader
+	read bool
+}
+
+func (b *serverTrackingBody) Read(p []byte) (int, error) {
+	b.read = true
+	return b.Reader.Read(p)
+}
+
+func (b *serverTrackingBody) Close() error { return nil }
+
+func serverParityAllowedTools() map[string]bool {
+	return map[string]bool{
+		toolWebSearch: true, toolFetchPage: true,
+		toolCreateSubagent: true, toolRunSubagent: true,
+		toolAwaitSubagent: true, toolListSubagents: true,
+		toolReadSubagent: true, toolCancelSubagent: true,
+	}
+}
+
+func newServerParityApp(t *testing.T, endpoint, model, reasoning string) *app {
+	t.Helper()
+	return &app{
+		cfg:       config{workspaceRoot: t.TempDir(), model: model, reasoning: reasoning},
+		client:    &client{http: &http.Client{}},
+		dataStore: newDataStore(),
+	}
+}
+
+func serverParityBody() string {
+	return "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}"
+}
+
+func writeServerParityCompletion(w http.ResponseWriter, content string) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"choices": []any{map[string]any{"message": map[string]string{"role": "assistant", "content": content}}},
+	})
+}
+
+func serverEndpointFormPath(prefix, endpoint, form string) string {
+	switch form {
+	case "encoded":
+		if prefix == "/async" {
+			return prefix + "/" + url.PathEscape(endpoint)
+		}
+		return "/" + url.PathEscape(endpoint)
+	case "hex":
+		encoded := hex.EncodeToString([]byte(endpoint))
+		if prefix == "/async" {
+			return prefix + "/~" + encoded
+		}
+		return "/~" + encoded
+	default:
+		return prefix + "/?endpoint=" + url.QueryEscape(endpoint)
+	}
+}
+
+func serverPayloadToolNames(payload map[string]any) []string {
+	var names []string
+	for _, raw := range payload["tools"].([]any) {
+		tool := raw.(map[string]any)
+		names = append(names, tool["function"].(map[string]any)["name"].(string))
+	}
+	return names
+}
+
+func pollServerData(t *testing.T, a *app, key string) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		req := httptest.NewRequest(http.MethodGet, "/data?key="+url.QueryEscape(key), nil)
+		w := httptest.NewRecorder()
+		a.dataHandler(w, req)
+		if w.Code == http.StatusOK {
+			return w.Body.String()
+		}
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("poll status = %d: %s", w.Code, w.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out polling async result %q", key)
+	return ""
 }

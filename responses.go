@@ -8,14 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
-	"time"
-
-	"golang.org/x/sync/errgroup"
 )
 
 type responsesRequest struct {
@@ -116,56 +112,42 @@ func (c *client) completeResponses(ctx context.Context, input []json.RawMessage,
 		return nil, err
 	}
 
-	var lastErr error
-	for attempt := 0; attempt < completeMaxAttempts; attempt++ {
-		if attempt > 0 {
-			delay := completeRetryBase * time.Duration(1<<(attempt-1))
-			delay += time.Duration(rand.Int63n(int64(delay) / 2))
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(delay):
-			}
-		}
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if c.token != "" {
-			req.Header.Set("Authorization", "Bearer "+c.token)
-		}
-		if c.debug {
-			fmt.Fprintf(os.Stderr, "[capelin-go] >>> POST %s\n", c.endpoint)
-			fmt.Fprintf(os.Stderr, "\n%s\n\n", string(body))
-		}
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		rawBody, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			msg := fmt.Sprintf("model request failed: %s: %s", resp.Status, strings.TrimSpace(string(rawBody)))
-			if isRetryableStatus(resp.StatusCode) {
-				lastErr = &retryableHTTPError{StatusCode: resp.StatusCode, msg: msg}
-				continue
-			}
-			return nil, errors.New(msg)
-		}
-		if c.debug {
-			fmt.Fprintf(os.Stderr, "[capelin-go] <<< RESPONSE %s\n\n%s\n\n", resp.Status, string(rawBody))
-		}
-		return parseResponsesResponse(rawBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
 	}
-	return nil, lastErr
+	req.Header.Set("Content-Type", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	if c.debug {
+		fmt.Fprintf(os.Stderr, "[capelin-go] >>> POST %s\n", c.endpoint)
+		fmt.Fprintf(os.Stderr, "\n%s\n\n", string(body))
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, &retryableTransportError{err: err}
+	}
+	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+	resp.Body.Close()
+	if err != nil {
+		return nil, &retryableTransportError{err: err}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg := fmt.Sprintf("model request failed: %s: %s", resp.Status, strings.TrimSpace(string(rawBody)))
+		if isRetryableStatus(resp.StatusCode) {
+			return nil, &retryableHTTPError{StatusCode: resp.StatusCode, msg: msg}
+		}
+		return nil, errors.New(msg)
+	}
+	if c.debug {
+		fmt.Fprintf(os.Stderr, "[capelin-go] <<< RESPONSE %s\n\n%s\n\n", resp.Status, string(rawBody))
+	}
+	return parseResponsesResponse(rawBody)
 }
 
 func parseResponsesResponse(raw []byte) (*completionMessage, error) {
@@ -268,173 +250,5 @@ func stringPointer(existing *string, text string) *string {
 }
 
 func (a *app) runResponsesTurnLoop(ctx context.Context, messages []types.Message, question string, runtime *agentRuntime, toolset []types.Tool, emitOutput bool) ([]types.Message, string, string, error) {
-	input := messagesToResponsesInput(messages)
-	input = append(input, marshalResponsesItem(map[string]any{"role": "user", "content": question}))
-
-	maxIterations := defaultMaxIterations
-	if runtime != nil && runtime.maxToolIterations > 0 {
-		maxIterations = runtime.maxToolIterations
-	}
-	runtimeModel, runtimeReasoning := a.client.model, a.client.reasoning
-	if runtime != nil && runtime.model != "" {
-		runtimeModel, runtimeReasoning = runtime.model, runtime.reasoning
-	}
-	lastContent := ""
-	var reasoningBuf strings.Builder
-	agentID := rootAgentID
-	if runtime != nil && strings.TrimSpace(runtime.sessionID) != "" {
-		agentID = runtime.sessionID
-	}
-	sink := a.sink
-	if sink == nil {
-		sink = &stdioSink{}
-	}
-
-	for iter := 0; iter < maxIterations; iter++ {
-		if iter == maxIterations-3 && maxIterations > 3 {
-			input = append(input, marshalResponsesItem(map[string]any{
-				"role":    "user",
-				"content": fmt.Sprintf("[SYSTEM] You have %d iterations remaining. Wrap up and produce a final answer now.", maxIterations-iter),
-			}))
-		}
-
-		var resp *completionMessage
-		var lastErr error
-		for attempt := 0; attempt < 3; attempt++ {
-			if attempt > 0 {
-				delay := 2 * time.Second * time.Duration(1<<(attempt-1))
-				delay += time.Duration(rand.Int63n(int64(delay) / 2))
-				if emitOutput {
-					sink.WriteSystem(agentID, fmt.Sprintf("[tool] model request failed (429/5xx), retrying in %v…", delay))
-				}
-				select {
-				case <-ctx.Done():
-					return messages, "", "", ctx.Err()
-				case <-time.After(delay):
-				}
-			}
-			resp, lastErr = a.client.completeResponses(ctx, input, toolset, runtimeModel, runtimeReasoning)
-			if lastErr == nil {
-				break
-			}
-			if !isRetryableError(lastErr) {
-				return messages, "", "", lastErr
-			}
-		}
-		if lastErr != nil {
-			return messages, "", "", lastErr
-		}
-
-		input = append(input, resp.outputItems...)
-		if content := strings.TrimSpace(resp.Content()); content != "" {
-			lastContent = content
-			if emitOutput {
-				sink.WriteContent(agentID, content)
-			}
-		}
-		if reasoning := strings.TrimSpace(resp.ReasoningContent()); reasoning != "" {
-			if reasoningBuf.Len() > 0 {
-				reasoningBuf.WriteString("\n\n")
-			}
-			fmt.Fprintf(&reasoningBuf, "[Turn %d]\nThinking: %s", iter+1, reasoning)
-		}
-		messages = append(messages, resp.asMessage())
-		toolCalls := resp.ToolCalls()
-		if len(toolCalls) == 0 {
-			if emitOutput {
-				sink.WriteSystem(agentID, "")
-			}
-			return messages, lastContent, reasoningBuf.String(), nil
-		}
-
-		type toolResult struct {
-			call    types.ToolCall
-			out     string
-			isError bool
-		}
-		results := make([]toolResult, len(toolCalls))
-		g, gctx := errgroup.WithContext(ctx)
-		g.SetLimit(a.cfg.toolMaxParallel)
-		for i, call := range toolCalls {
-			i, call := i, call
-			g.Go(func() error {
-				if emitOutput {
-					sink.WriteToolCall(agentID, call.Function.Name, call.Function.Arguments)
-				}
-				timeoutSec := a.cfg.toolTimeoutSec
-				if toolTimeout := parseToolTimeout(call); toolTimeout > 0 {
-					timeoutSec = toolTimeout
-				}
-				for attempt := 0; attempt <= 1; attempt++ {
-					toolCtx, cancel := context.WithTimeout(gctx, time.Duration(timeoutSec)*time.Second)
-					out, err := a.runToolForRuntime(toolCtx, runtime, call)
-					cancel()
-					if err != nil {
-						if attempt == 0 && a.cfg.toolRetryOnTimeout && errors.Is(err, context.DeadlineExceeded) {
-							if emitOutput {
-								sink.WriteSystem(agentID, fmt.Sprintf("[tool] %s timed out, retrying…", call.Function.Name))
-							}
-							continue
-						}
-						results[i] = toolResult{call: call, out: fmt.Sprintf("Tool error: %v", err), isError: true}
-						return nil
-					}
-					results[i] = toolResult{call: call, out: out}
-					return nil
-				}
-				return nil
-			})
-		}
-		g.Wait()
-		for _, result := range results {
-			if emitOutput {
-				sink.WriteToolResult(agentID, result.call.Function.Name, result.isError, result.out)
-			}
-			input = append(input, marshalResponsesItem(map[string]any{
-				"type":    "function_call_output",
-				"call_id": result.call.ID,
-				"output":  result.out,
-			}))
-			messages = append(messages, types.Message{
-				Role:       "tool",
-				ToolCallID: result.call.ID,
-				Content:    result.out,
-			})
-		}
-		if reasoningBuf.Len() > 0 {
-			reasoningBuf.WriteString("\n\n")
-		}
-		fmt.Fprintf(&reasoningBuf, "[Turn %d]\nTool calls:\n", iter+1)
-		for _, result := range results {
-			args := truncateStr(result.call.Function.Arguments, 200)
-			fmt.Fprintf(&reasoningBuf, "  %s(%s)\n", result.call.Function.Name, args)
-			if summary := extractToolSummary(result.call.Function.Name, result.out, result.isError); summary != "" {
-				fmt.Fprintf(&reasoningBuf, "  > %s\n", summary)
-			}
-		}
-	}
-
-	if !a.cfg.finalOnly {
-		fmt.Fprintf(os.Stderr, "[capelin-go] Maximum tool iterations (%d) reached; requesting final answer.\n", maxIterations)
-	}
-	input = append(input, marshalResponsesItem(map[string]any{
-		"role":    "user",
-		"content": "[SYSTEM] Maximum tool iterations reached. Based on everything you have gathered so far, provide your best final answer now. Do not request any more tools.",
-	}))
-	resp, err := a.client.completeResponses(ctx, input, nil, runtimeModel, runtimeReasoning)
-	if err != nil {
-		if lastContent != "" {
-			return messages, lastContent, reasoningBuf.String(), nil
-		}
-		return messages, "", "", fmt.Errorf("exceeded maximum tool iterations (%d) and final-answer call failed: %w", maxIterations, err)
-	}
-	if content := strings.TrimSpace(resp.Content()); content != "" {
-		if emitOutput {
-			sink.WriteContent(agentID, content)
-			sink.WriteSystem(agentID, "")
-		}
-		messages = append(messages, resp.asMessage())
-		return messages, content, reasoningBuf.String(), nil
-	}
-	return messages, lastContent, reasoningBuf.String(), nil
+	return a.runTurnLoopWithAdapter(ctx, messages, question, runtime, toolset, emitOutput, responsesTurnAdapter{client: a.client})
 }

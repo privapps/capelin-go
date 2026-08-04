@@ -4,10 +4,8 @@ import (
 	"capelin-go/internal/types"
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -76,8 +74,10 @@ func startServer(cfg config) error {
 		toolCancelSubagent: true,
 	}
 
+	serverCfg := cfg
+	serverCfg.allowedTools = cloneAllowedTools(serverAllowedTools)
 	a := &app{
-		cfg: cfg,
+		cfg: serverCfg,
 		client: &client{
 			endpoint:  strings.TrimRight(cfg.endpoint, "/"),
 			token:     cfg.token,
@@ -92,45 +92,10 @@ func startServer(cfg config) error {
 	}
 	a.subagents = newSubagentManager(cfg.subagents, a.runSubagentSession)
 
-	mux := http.NewServeMux()
-	// Catch-all pattern: any POST to /<remoteURL> is handled
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		a.handleChatCompletion(w, r, serverAllowedTools)
-	})
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, `{"status":"ok"}`)
-	})
-	mux.HandleFunc("/data", a.dataHandler)
-	// Async variant: returns UUID immediately, result stored in /data.
-	mux.HandleFunc("/async/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		a.handleAsyncChatCompletion(w, r, serverAllowedTools)
-	})
-
-	// CORS middleware for browser-based clients (e.g. data.html).
-	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		mux.ServeHTTP(w, r)
-	})
-
 	addr := ":" + strconv.Itoa(cfg.serverPort)
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           corsHandler,
+		Handler:           newServerHandler(a, serverAllowedTools),
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      requestTimeout, // generous: LLM turn-loop can take minutes
@@ -155,6 +120,46 @@ func startServer(cfg config) error {
 	return nil
 }
 
+// newServerHandler assembles the production HTTP seam used by both delivery
+// adapters. Keeping route selection here lets application-level tests exercise
+// endpoint intake, async acceptance, and /data polling without opening a port.
+func newServerHandler(a *app, serverAllowedTools map[string]bool) http.Handler {
+	mux := http.NewServeMux()
+	// Catch-all pattern: any POST to /<remoteURL> is handled.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		a.handleChatCompletion(w, r, serverAllowedTools)
+	})
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, `{"status":"ok"}`)
+	})
+	mux.HandleFunc("/data", a.dataHandler)
+	// Async variant: returns UUID immediately, result stored in /data.
+	mux.HandleFunc("/async/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		a.handleAsyncChatCompletion(w, r, serverAllowedTools)
+	})
+
+	// CORS middleware for browser-based clients (e.g. data.html).
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -169,157 +174,20 @@ func withCORS(next http.Handler) http.Handler {
 	})
 }
 
-// serverRequest wraps the incoming OpenAI-format request with extracted header info.
-type serverRequest struct {
-	Model     string          `json:"model"`
-	Messages  []types.Message `json:"messages"`
-	Stream    bool            `json:"stream"`
-	Reasoning struct {
-		Effort string `json:"effort"`
-	} `json:"reasoning,omitempty"`
-}
-
 func (a *app) handleChatCompletion(w http.ResponseWriter, r *http.Request, serverAllowedTools map[string]bool) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-
-	// Extract remote URL: try path first (URL-encoded), then query parameter.
-	// Path example: /https%3A%2F%2Fexample.com/v1/chat/completions
-	// Query example: ?base-url=https://example.com/v1
-	remoteBase := ""
-
-	// Try path: URL-encoded endpoint (includes /chat/completions)
-	// Example: /https%3A%2F%2Fopencode.ai/zen/v1/chat/completions
-	path := r.URL.Path
-	if path != "/" && path != "" {
-		decoded := r.URL.Path // Go automatically decodes %XX in Path
-		decoded = strings.TrimPrefix(decoded, "/")
-		if strings.HasPrefix(decoded, "http://") || strings.HasPrefix(decoded, "https://") {
-			remoteBase = decoded
-		}
-	}
-
-	// Try hex-encoded path: /~<hex-encoded URL>
-	// Example: /~68747470733a2f2f6f70656e636f64652e61692f7a656e2f76312f636861742f636f6d706c6574696f6e73
-	if remoteBase == "" && strings.HasPrefix(path, "/~") {
-		hexStr := strings.TrimPrefix(path, "/~")
-		if decoded, err := hex.DecodeString(hexStr); err == nil {
-			url := string(decoded)
-			if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
-				remoteBase = url
-			}
-		}
-	}
-
-	// Fall back to query parameter: ?endpoint=https://example.com/v1/chat/completions
-	if remoteBase == "" {
-		remoteBase = strings.TrimSpace(r.URL.Query().Get("endpoint"))
-	}
-
-	if remoteBase == "" {
-		writeError(w, http.StatusBadRequest, "endpoint required: use path /https%3A%2F%2Fexample.com/v1/chat/completions (or http), /~<hex-encoded-URL>, or ?endpoint=https://example.com/v1/chat/completions")
-		return
-	}
-
-	// Extract bearer token from Authorization header
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
-		writeError(w, http.StatusBadRequest, "Authorization: Bearer <token> header is required")
-		return
-	}
-	remoteToken := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
-	if remoteToken == "" {
-		writeError(w, http.StatusBadRequest, "Authorization: Bearer <token> header is required")
-		return
-	}
-
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+	execution, err := a.prepareServerRequest(r, serverAllowedTools, "")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+		writeServerRequestError(w, err)
 		return
 	}
-
-	var req serverRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
-		return
-	}
-
-	if len(req.Messages) == 0 {
-		writeError(w, http.StatusBadRequest, "messages array is required and must not be empty")
-		return
-	}
-
-	if req.Stream {
-		writeError(w, http.StatusBadRequest, "streaming is not supported; set stream to false")
-		return
-	}
-
-	model := strings.TrimSpace(req.Model)
-	if model == "" {
-		model = a.cfg.model
-	}
-
-	reasoning := a.cfg.reasoning
-	if req.Reasoning.Effort != "" {
-		reasoning = req.Reasoning.Effort
-	}
-
-	// Build a client targeting the remote LLM.
-	remoteClient := &client{
-		endpoint:  strings.TrimRight(remoteBase, "/"),
-		token:     remoteToken,
-		model:     model,
-		reasoning: reasoning,
-		debug:     a.cfg.debug,
-		http:      serverHTTPClient,
-	}
-
-	// Build server-mode app with the remote client.
-	serverApp := &app{
-		cfg:     a.cfg,
-		client:  remoteClient,
-		skills:  a.skills,
-		toolset: buildAgentTools(serverAllowedTools),
-	}
-
-	// Create subagent manager with model from request (overrides default config model).
-	subagentCfg := a.cfg.subagents
-	subagentCfg.Model = model
-	subagentCfg.ReasoningEffort = reasoning
-	serverApp.subagents = newSubagentManager(subagentCfg, serverApp.runSubagentSession)
-
-	// Create runtime with the model from the request (overrides default config model).
-	runtime := serverApp.rootRuntime()
-	runtime.model = model
-	runtime.reasoning = reasoning
-
-	// Build system prompt: use first message if it's a system message, otherwise use server default.
-	messages := make([]types.Message, len(req.Messages))
-	copy(messages, req.Messages)
-	if len(messages) > 0 && messages[0].Role == "system" {
-		// Keep the user's system prompt but append tool restriction note.
-		messages[0].Content = messages[0].Content + "\n\nOnly web_search and fetch_page tools are available. No file, code execution, or skill tools."
-	} else {
-		messages = append([]types.Message{{Role: "system", Content: serverModeSystemPrompt}}, messages...)
-	}
-
-	// Run the turn loop. Pop the last user message and pass it as the question
-	// to avoid appending an empty user message.
-	question := ""
-	if len(messages) > 0 && messages[len(messages)-1].Role == "user" {
-		question = messages[len(messages)-1].Content
-		messages = messages[:len(messages)-1]
-	}
-	_, result, reasoning, err := serverApp.runTurnLoop(r.Context(), messages, question, runtime, serverApp.toolset, false)
+	serverApp, runtime := a.newServerExecutionApp(execution)
+	_, result, reasoning, err := serverApp.runTurnLoop(r.Context(), execution.messages, execution.question, runtime, serverApp.toolset, false)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	writeChatCompletionResponse(w, model, result, reasoning)
+	writeChatCompletionResponse(w, execution.model, result, reasoning)
 }
 
 func writeChatCompletionResponse(w http.ResponseWriter, model, content, reasoning string) {
@@ -384,60 +252,13 @@ func (a *app) handleAsyncChatCompletion(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	// Strip /async prefix to get the same path shape as handleChatCompletion.
-	asyncPath := strings.TrimPrefix(r.URL.Path, "/async")
-	if asyncPath == "" {
-		asyncPath = "/"
-	}
-
-	// Extract remote URL from the path (after stripping /async).
-	remoteBase := ""
-
-	// Try path: URL-encoded endpoint
-	path := asyncPath
-	if path != "/" && path != "" {
-		decoded := strings.TrimPrefix(path, "/")
-		if strings.HasPrefix(decoded, "http://") || strings.HasPrefix(decoded, "https://") {
-			remoteBase = decoded
-		}
-	}
-
-	// Try hex-encoded path: /~<hex-encoded URL>
-	if remoteBase == "" && strings.HasPrefix(path, "/~") {
-		hexStr := strings.TrimPrefix(path, "/~")
-		if decoded, err := hex.DecodeString(hexStr); err == nil {
-			url := string(decoded)
-			if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
-				remoteBase = url
-			}
-		}
-	}
-
-	// Fall back to query parameter
-	if remoteBase == "" {
-		remoteBase = strings.TrimSpace(r.URL.Query().Get("endpoint"))
-	}
-
-	if remoteBase == "" {
-		writeError(w, http.StatusBadRequest, "endpoint required: use /async/https%3A%2F%2Fexample.com/v1/chat/completions, /async/~<hex-encoded-URL>, or /async/?endpoint=...")
-		return
-	}
-
-	// Extract bearer token
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
-		writeError(w, http.StatusBadRequest, "Authorization: Bearer <token> header is required")
-		return
-	}
-	remoteToken := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
-	if remoteToken == "" {
-		writeError(w, http.StatusBadRequest, "Authorization: Bearer <token> header is required")
-		return
-	}
-
-	// Reserve capacity before reading/parsing the potentially large body.
+	// Reserve capacity before reading/parsing the potentially large body. Keep
+	// the channel local: tests and future configuration reloads may replace the
+	// package-level semaphore, but an admitted task must release the semaphore
+	// that admitted it.
+	sem := asyncSem
 	select {
-	case asyncSem <- struct{}{}:
+	case sem <- struct{}{}:
 	default:
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusTooManyRequests, "async capacity exhausted")
@@ -446,60 +267,25 @@ func (a *app) handleAsyncChatCompletion(w http.ResponseWriter, r *http.Request, 
 	admitted := true
 	defer func() {
 		if admitted {
-			<-asyncSem
+			<-sem
 		}
 	}()
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+	execution, err := a.prepareServerRequest(r, serverAllowedTools, "/async")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
-		return
-	}
-
-	var req serverRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
-		return
-	}
-
-	if len(req.Messages) == 0 {
-		writeError(w, http.StatusBadRequest, "messages array is required and must not be empty")
-		return
-	}
-
-	if req.Stream {
-		writeError(w, http.StatusBadRequest, "streaming is not supported; set stream to false")
+		writeServerRequestError(w, err)
 		return
 	}
 
 	// Generate UUID and return immediately.
 	uuid := generateUUID()
-
-	// Prepare everything needed for background execution.
-	model := strings.TrimSpace(req.Model)
-	if model == "" {
-		model = a.cfg.model
-	}
-	reasoning := a.cfg.reasoning
-	if req.Reasoning.Effort != "" {
-		reasoning = req.Reasoning.Effort
-	}
-
-	messages := make([]types.Message, len(req.Messages))
-	copy(messages, req.Messages)
-	if len(messages) > 0 && messages[0].Role == "system" {
-		messages[0].Content = messages[0].Content + "\n\nOnly web_search and fetch_page tools are available. No file, code execution, or skill tools."
-	} else {
-		messages = append([]types.Message{{Role: "system", Content: serverModeSystemPrompt}}, messages...)
-	}
-	question := ""
-	if len(messages) > 0 && messages[len(messages)-1].Role == "user" {
-		question = messages[len(messages)-1].Content
-		messages = messages[:len(messages)-1]
-	}
+	// Transfer ownership of the admitted slot to the background task before
+	// launching it. This prevents a fast task from releasing the slot before
+	// the handler's deferred cleanup observes the transfer.
+	admitted = false
 
 	go func() {
-		defer func() { <-asyncSem }() // release admitted slot
+		defer func() { <-sem }() // release admitted slot
 
 		defer func() {
 			if r := recover(); r != nil {
@@ -513,46 +299,43 @@ func (a *app) handleAsyncChatCompletion(w http.ResponseWriter, r *http.Request, 
 			}
 		}()
 
-		a.runAsyncTask(uuid, remoteBase, remoteToken, model, reasoning, messages, question, serverAllowedTools)
+		runAsync := a.runAsyncExecution
+		if a.asyncRunner != nil {
+			runAsync = a.asyncRunner
+		}
+		runAsync(uuid, execution)
 	}()
-	admitted = false
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"id": uuid})
 }
 
+// runAsyncTask retains the narrow test seam used by existing callers while
+// delegating all runtime construction to the shared normalized request path.
 func (a *app) runAsyncTask(uuid, remoteBase, remoteToken, model, reasoning string, messages []types.Message, question string, serverAllowedTools map[string]bool) {
-	remoteClient := &client{
-		endpoint:  strings.TrimRight(remoteBase, "/"),
-		token:     remoteToken,
-		model:     model,
-		reasoning: reasoning,
-		debug:     a.cfg.debug,
-		http:      serverHTTPClient,
+	a.runAsyncExecution(uuid, &serverExecutionRequest{
+		remoteBase:         remoteBase,
+		remoteToken:        remoteToken,
+		model:              model,
+		reasoning:          reasoning,
+		messages:           messages,
+		question:           question,
+		serverAllowedTools: cloneAllowedTools(serverAllowedTools),
+	})
+}
+
+func (a *app) runAsyncExecution(uuid string, execution *serverExecutionRequest) {
+	serverApp, runtime := a.newServerExecutionApp(execution)
+
+	timeout := 15 * time.Minute
+	if a.cfg.asyncTimeout > 0 {
+		timeout = a.cfg.asyncTimeout
 	}
-
-	serverCfg := a.cfg
-	serverCfg.allowedTools = cloneAllowedTools(serverAllowedTools)
-	serverApp := &app{
-		cfg:     serverCfg,
-		client:  remoteClient,
-		skills:  a.skills,
-		toolset: buildAgentTools(serverAllowedTools),
-	}
-	subagentCfg := a.cfg.subagents
-	subagentCfg.Model = model
-	subagentCfg.ReasoningEffort = reasoning
-	serverApp.subagents = newSubagentManager(subagentCfg, serverApp.runSubagentSession)
-
-	runtime := serverApp.rootRuntime()
-	runtime.model = model
-	runtime.reasoning = reasoning
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	_, result, reasoningResult, err := serverApp.runTurnLoop(ctx, messages, question, runtime, serverApp.toolset, false)
+	_, result, reasoningResult, err := serverApp.runTurnLoop(ctx, execution.messages, execution.question, runtime, serverApp.toolset, false)
 
 	var data string
 	if err != nil {
@@ -568,7 +351,7 @@ func (a *app) runAsyncTask(uuid, remoteBase, remoteToken, model, reasoning strin
 			data = string(errResp)
 		}
 	} else {
-		data = buildChatCompletionJSON(model, result, reasoningResult)
+		data = buildChatCompletionJSON(execution.model, result, reasoningResult)
 	}
 
 	a.storeAsyncResult(uuid, data)
