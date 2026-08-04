@@ -82,9 +82,29 @@ The goal loop is bounded to 20 outer iterations by default. Set
 `--max-goal-iterations N` or `MAX_GOAL_ITERATIONS`; this is independent of the
 per-turn `--max-iterations` limit. A goal is complete only when the
 authoritative `update_todos` checklist is non-empty and every item is
-`completed`. Provider/tool failures, cancellation, cancelled or empty items,
-two unchanged incomplete snapshots, and iteration exhaustion stop it as
-explicitly incomplete outcomes. Resume with bare `/goal` after an interruption.
+`completed`. Deterministic tool errors—such as a missing path, invalid
+arguments, a disabled tool, or a failed command—are returned to the model as
+recoverable results. The model can correct the call and continue. Tool-scoped
+timeouts retain one bounded retry. Provider failures, parent cancellation,
+persistence failures, and unrecoverable runtime errors stop with an explicit
+incomplete outcome; three consecutive recoverable-error turns also activate a
+bounded recovery guard. Resume with bare `/goal` after an interruption.
+
+### Reasoning and resumed turns
+
+Set `REASONING_EFFORT` when the selected model supports provider-native
+reasoning. Chat Completions replays native `reasoning_content` with the
+assistant tool call before sending its tool result. Responses preserves the
+provider's reasoning and function-call output items in opaque continuation
+state. Interactive sessions save that state only after a successful turn, so a
+later prompt or saved-session resume can continue without losing the provider's
+reasoning contract.
+
+Older snapshots without continuation state remain valid. If saved state is
+stale, malformed, or belongs to another provider, Capelin ignores it and
+rebuilds the request from normalized conversation history. An error on the
+initial provider request remains visible; Capelin does not silently disable
+reasoning and retry with a different configuration.
 
 The command prompt supports Tab completion for slash commands and local skill names. Command history is stored at `~/.local/capelin-go/history`.
 

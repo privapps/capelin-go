@@ -1,5 +1,5 @@
 APP     := capelin-go
-BUILD_DIR := dist
+BUILD_DIR ?= dist
 GOOS    ?= $(shell go env GOOS)
 GOARCH  ?= $(shell go env GOARCH)
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")

@@ -148,9 +148,12 @@ snapshot is reported instead of silently selecting another conversation.
 `/goal` requires `--yolo` and an authoritative non-empty `update_todos`
 checklist. Success requires every checklist item to have status `completed`.
 Provider or tool errors, cancellation, cancelled items, an empty checklist, two
-unchanged incomplete checklist snapshots, and the outer iteration limit all
-produce an incomplete outcome. Use bare `/goal` to continue a saved incomplete
-checklist, or start a new objective with `/goal <objective>`.
+unchanged incomplete checklist snapshots, three consecutive recoverable-tool
+error turns, and the outer iteration limit all produce an incomplete outcome.
+Deterministic tool errors are normally returned to the model so it can correct
+the next call; persistent provider, persistence, cancellation, and runtime
+errors stop the goal immediately. Use bare `/goal` to continue a saved
+incomplete checklist, or start a new objective with `/goal <objective>`.
 
 Set the outer limit independently with `--max-goal-iterations N` or
 `MAX_GOAL_ITERATIONS`. This does not change the normal per-turn

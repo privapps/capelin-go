@@ -9,7 +9,12 @@ It is designed to be safe by default. Reading and web tools are available for or
 - [Command-line guide](cli-guide.md) — run one task, hold a conversation, save answers, select skills, and configure the assistant.
 - [Server and API guide](server-api.md) — use Capelin as a local OpenAI-compatible proxy, submit background jobs, and use the temporary data store.
 - [Tools and safety](tools-and-safety.md) — understand what the assistant can do, what is disabled by default, and how worker assistants and skills work.
+- [Architecture and source placement](architecture.md) — package ownership, dependency direction, seams, adapters, and validation rules.
 - [Troubleshooting FAQ](troubleshooting.md) — fix common startup, model, tool, server, and async-job problems.
+
+Completed feature specifications and their validation records are archived in
+the repository's `.archive/` directory after implementation. The active
+`.scratch/` directory is reserved for work that has not yet been archived.
 
 ## Quick start
 

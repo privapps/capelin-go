@@ -119,9 +119,12 @@ and `/session-rename <name>` to assign a durable label. A bare
 The `update_todos` tool replaces the complete ordered checklist. Valid statuses
 are `pending`, `in_progress`, `completed`, and `cancelled`. A YOLO `/goal`
 requires a non-empty checklist with every item completed before it reports
-success. Empty or cancelled items, provider/tool errors, cancellation, stalled
-checklists, and iteration exhaustion are reported as incomplete. Goal execution
-is bounded independently from normal tool iterations by
+success. Deterministic tool failures (for example missing paths, invalid
+arguments, disabled tools, and failed commands) are returned to the model as
+recoverable results. Provider failures, cancellation, persistence failures,
+stalled checklists, and iteration exhaustion are reported as incomplete. Three
+consecutive recoverable-error turns also activate a bounded recovery guard.
+Goal execution is bounded independently from normal tool iterations by
 `--max-goal-iterations N` or `MAX_GOAL_ITERATIONS` (default `20`). Resume an
 interrupted checklist with bare `/goal`.
 

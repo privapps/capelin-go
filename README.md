@@ -46,6 +46,8 @@ make build
 make test
 ```
 
+For package ownership, dependency direction, adapter seams, and the full source-structure validation checklist, see [Architecture and source placement](docs/architecture.md).
+
 ## Run
 
 ```bash
@@ -87,11 +89,14 @@ current UUID and a `--resume <id>` hint when it exits. Startup resume accepts
 valid snapshot).
 
 YOLO goal execution is bounded: completion requires a non-empty checklist in
-which every item is `completed`. Empty or cancelled checklists, provider/tool
-errors, cancellation, two unchanged incomplete snapshots, and iteration
-exhaustion are reported as incomplete. Configure the outer limit independently
-with `--max-goal-iterations N` or `MAX_GOAL_ITERATIONS` (default 20); this does
-not change `--max-iterations`.
+which every item is `completed`. Deterministic tool errors such as missing
+paths, invalid arguments, disabled tools, and failed commands are returned to
+the model so the goal can recover. Provider failures, cancellation, persistence
+failures, and unrecoverable runtime errors are reported as incomplete. Three
+consecutive recoverable-error turns also stop the goal with an explicit
+incomplete outcome. Configure the outer limit independently with
+`--max-goal-iterations N` or `MAX_GOAL_ITERATIONS` (default 20); this does not
+change `--max-iterations`.
 
 Press Tab after `/` or a partial command to complete or display the available
 slash commands. Bare `exit` and `quit` are ordinary prompts and are sent to
@@ -295,6 +300,13 @@ Enable everything (all tools + unrestricted paths):
 - `SUBAGENT_MAX_ITERATIONS` — maximum tool-call iterations per subagent (default: 20; overridden by `--subagent-max-iterations`)
 - `SUBAGENT_MODEL` — model ID used for subagents (default: inherits `MODEL`; overridden by `--subagent-model`)
 - `SUBAGENT_REASONING_EFFORT` — reasoning effort for subagents (default: inherits `REASONING_EFFORT`; set to `none` or `nil` to omit; overridden by `--subagent-reasoning-effort`)
+
+Reasoning-capable providers can return native reasoning metadata alongside a
+tool call. Capelin replays that metadata in the provider's required format for
+the next tool or interactive turn, and persists compatible provider-owned
+continuation state in saved sessions. Older snapshots and incompatible state
+fall back to normalized conversation history; an initial provider error remains
+visible and is not silently retried with reasoning disabled.
 
 ## Config file
 
