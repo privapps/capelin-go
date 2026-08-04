@@ -1,0 +1,139 @@
+# Tools and Safety
+
+Capelin gives the assistant tools so it can do useful work instead of only writing suggestions. You normally describe the result you want, and the assistant chooses the appropriate tool.
+
+## Web tools
+
+### Search the public web
+
+Ask for current information, sources, or comparisons. Capelin searches DuckDuckGo first and uses Bing if the first service fails. Search results include titles, links, and short descriptions.
+
+Example:
+
+```bash
+./capelin-go "find reliable sources about the current bicycle rules in Vancouver"
+```
+
+Search is limited to a manageable number of results per search. Ask for a focused question when you need better results.
+
+### Read a public page
+
+Ask the assistant to open a known public URL. HTML pages are converted into readable text; other public content is returned as text when possible.
+
+```bash
+./capelin-go "open https://example.com and summarize the pricing"
+```
+
+For safety, page fetching rejects localhost, private network addresses, and local-only hostnames. This means it cannot be used to inspect a private service running on your computer.
+
+## Workspace tools
+
+In local command-line mode, the assistant can:
+
+- list files and folders;
+- read a file, optionally using a line range;
+- inspect the current working folder while answering a question.
+
+The normal working boundary is the folder where Capelin starts. Absolute paths, parent-folder escapes, and symbolic-link escapes are rejected. Hidden folders are skipped when listing. Large files and very large directory listings are limited so one request does not overwhelm the assistant.
+
+Example:
+
+```bash
+./capelin-go "review the README and list the three clearest improvements"
+```
+
+## Optional file changes
+
+These tools are disabled unless you explicitly enable them:
+
+- `write_file` — create or replace a file;
+- `edit_file` — replace one exact piece of text;
+- `append_file` — add text to the end of a file.
+
+Enable only the tools needed for a task:
+
+```bash
+./capelin-go \
+  --allow-tool write_file \
+  --allow-tool edit_file \
+  "update the documentation and show me what changed"
+```
+
+The assistant still operates inside the working-folder boundary. `edit_file` requires the text to be found exactly once, which helps prevent an unintended broad replacement.
+
+## Optional program execution
+
+`execute_program` is disabled by default. When enabled, it runs a named program with separate arguments and a chosen working folder. It does not run a command through a shell. Unsafe command patterns, shell launchers, and malformed command names are blocked unless you use `--yolo`.
+
+```bash
+./capelin-go --allow-tool execute_program \
+  "run the project's tests and summarize the result"
+```
+
+Long-running programs can time out. Use a task-specific timeout only when necessary, and avoid enabling execution for tasks that only require reading or research.
+
+## Skills
+
+Skills are local guidance files that teach Capelin a repeatable workflow. They can be discovered and read by the assistant, or selected explicitly with `$skill-name` in local one-shot or interactive mode.
+
+Selecting a skill does not run its commands and does not grant new permissions. If a skill needs to run a command, `execute_skill` must be enabled and the command must be declared by that skill. This keeps a skill from silently bypassing the normal safety checks.
+
+Server mode does not load local skills. A `$name` sent through the server is ordinary user text.
+
+## Worker assistants
+
+Worker assistants are useful when a task contains independent parts. Ask Capelin to split the work, investigate the parts, and combine the results:
+
+```bash
+./capelin-go "ask separate workers to inspect security, usability, and missing tests, then combine the report"
+```
+
+Workers inherit the parent task's permissions and can only use a smaller set of tools, never a larger one. They can be started in parallel, monitored, read, or cancelled. Their results and combined output are length-limited.
+
+New-install defaults are:
+
+| Limit | Default |
+| --- | ---: |
+| Worker nesting depth | 1 |
+| Active workers for one parent | 8 |
+| Parallel workers | 4 |
+| Default worker timeout | 600 seconds |
+| Maximum worker result | 8000 characters |
+| Maximum combined result | 12000 characters |
+| Tool-use rounds per worker | 20 |
+
+## Interactive sessions and goals
+
+Interactive sessions are saved as UUID-named snapshots in
+`.capelin-go/sessions/` under the current workspace. A snapshot includes the
+conversation, timestamps, session metadata, and the authoritative todo list.
+Writes are atomic, and malformed snapshots are skipped when listing sessions
+or choosing the newest valid resume target.
+
+Use `/session-list` to inspect saved conversations, `/session-new` to start a
+separate conversation, `/session-resume [ID|PREFIX]` to switch conversations,
+and `/session-rename <name>` to assign a durable label. A bare
+`/session-resume` selects the newest valid snapshot. Startup resume uses
+`capelin-go -i --resume [ID|PREFIX]`.
+
+The `update_todos` tool replaces the complete ordered checklist. Valid statuses
+are `pending`, `in_progress`, `completed`, and `cancelled`. A YOLO `/goal`
+requires a non-empty checklist with every item completed before it reports
+success. Deterministic tool failures (for example missing paths, invalid
+arguments, disabled tools, and failed commands) are returned to the model as
+recoverable results. Provider failures, cancellation, persistence failures,
+stalled checklists, and iteration exhaustion are reported as incomplete. Three
+consecutive recoverable-error turns also activate a bounded recovery guard.
+Goal execution is bounded independently from normal tool iterations by
+`--max-goal-iterations N` or `MAX_GOAL_ITERATIONS` (default `20`). Resume an
+interrupted checklist with bare `/goal`.
+
+The default mode favors reading, research, and controlled workspace access. Use repeatable `--allow-tool` flags for specific actions that change files or run programs.
+
+`--yolo` enables all optional tools and removes the working-folder path restriction. It also bypasses the normal dangerous-command checks. In interactive mode it is additionally required for `/goal`; without it, `/goal` cannot reset the checklist or make a provider request. Use it only when you fully trust the task and the working environment:
+
+```bash
+./capelin-go --yolo "make the requested changes across the project"
+```
+
+In server mode, the tool set is always restricted to public web access and worker-assistant tools. `--yolo` does not expose local file or program tools through the server.

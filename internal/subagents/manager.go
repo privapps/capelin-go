@@ -1,7 +1,8 @@
-package main
+package subagents
 
 import (
-	"capelin-go/internal/types"
+	"capelin-go/internal/contracts"
+	"capelin-go/internal/policy"
 	"context"
 	"errors"
 	"fmt"
@@ -165,6 +166,129 @@ type subagentManager struct {
 	parallelSem    chan struct{}
 }
 
+// Config controls the lifecycle and resource policy for child agents. The
+// manager applies defaults for zero-valued limits so callers only need to set
+// the policy that differs from the normal runtime.
+type Config = subagentRuntimeConfig
+
+// DefaultConfig returns the production subagent limits.
+func DefaultConfig() Config { return defaultSubagentRuntimeConfig() }
+
+// Runtime is the normalized execution context passed to a subagent runner.
+// It deliberately contains no application or tool implementation details.
+type Runtime struct {
+	SessionID         string
+	Depth             int
+	Role              string
+	AllowedTools      map[string]bool
+	MaxToolIterations int
+	Model             string
+	Reasoning         string
+}
+
+func internalRuntime(runtime *Runtime) *agentRuntime {
+	if runtime == nil {
+		return nil
+	}
+	return &agentRuntime{
+		sessionID:         runtime.SessionID,
+		depth:             runtime.Depth,
+		role:              agentRole(runtime.Role),
+		allowedTools:      cloneAllowedTools(runtime.AllowedTools),
+		maxToolIterations: runtime.MaxToolIterations,
+		model:             runtime.Model,
+		reasoning:         runtime.Reasoning,
+	}
+}
+
+func publicRuntime(runtime *agentRuntime) *Runtime {
+	if runtime == nil {
+		return nil
+	}
+	return &Runtime{
+		SessionID:         runtime.sessionID,
+		Depth:             runtime.depth,
+		Role:              string(runtime.role),
+		AllowedTools:      cloneAllowedTools(runtime.allowedTools),
+		MaxToolIterations: runtime.maxToolIterations,
+		Model:             runtime.model,
+		Reasoning:         runtime.reasoning,
+	}
+}
+
+// Session and the argument/envelope aliases keep the public capability seam
+// small without duplicating the JSON contract used by the tool dispatcher.
+type Session = subagentSession
+type Status = subagentStatus
+type Role = agentRole
+type CreateArgs = createSubagentArgs
+type RunArgs = runSubagentArgs
+type AwaitArgs = awaitSubagentArgs
+type ListArgs = listSubagentsArgs
+type ReadArgs = readSubagentArgs
+type CancelArgs = cancelSubagentArgs
+type Envelope = subagentEnvelope
+type AggregateEnvelope = subagentAggregateEnvelope
+
+type Runner func(context.Context, *Runtime, *Session) (string, error)
+
+// Manager owns child-agent lifecycle, visibility, limits, scheduling, and
+// result aggregation. Application code supplies only the runner adapter.
+type Manager struct{ core *subagentManager }
+
+// New constructs a subagent manager behind the capability seam.
+func New(cfg Config, runner Runner) *Manager {
+	manager := &Manager{}
+	manager.core = newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+		if runner == nil {
+			return "", errors.New("subagent runner is nil")
+		}
+		return runner(ctx, publicRuntime(runtime), session)
+	})
+	return manager
+}
+
+func (m *Manager) ListAll() []contracts.SubagentNode {
+	if m == nil || m.core == nil {
+		return nil
+	}
+	return m.core.ListAll()
+}
+
+func (m *Manager) Create(ctx context.Context, parent *Runtime, args CreateArgs) (*Session, error) {
+	return m.core.create(ctx, internalRuntime(parent), args)
+}
+
+func (m *Manager) Run(ctx context.Context, parent *Runtime, args RunArgs) (*Session, error) {
+	return m.core.run(ctx, internalRuntime(parent), args)
+}
+
+func (m *Manager) Await(ctx context.Context, parent *Runtime, args AwaitArgs) (*Session, error) {
+	return m.core.await(ctx, internalRuntime(parent), args)
+}
+
+func (m *Manager) Cancel(parent *Runtime, args CancelArgs) (*Session, error) {
+	return m.core.cancel(internalRuntime(parent), args)
+}
+
+func (m *Manager) List(parent *Runtime, args ListArgs) ([]Envelope, error) {
+	return m.core.list(internalRuntime(parent), args)
+}
+
+func (m *Manager) Read(parent *Runtime, args ReadArgs) (any, error) {
+	return m.core.read(internalRuntime(parent), args)
+}
+
+// Snapshot returns a stable tool-result view of a session.
+func (m *Manager) Snapshot(session *Session, includeOutput bool) Envelope {
+	if m == nil || m.core == nil || session == nil {
+		return Envelope{}
+	}
+	m.core.mu.Lock()
+	defer m.core.mu.Unlock()
+	return m.core.snapshotLocked(session, includeOutput)
+}
+
 func newSubagentManager(cfg subagentRuntimeConfig, runner subagentRunner) *subagentManager {
 	cfg.normalize()
 	m := &subagentManager{
@@ -180,12 +304,12 @@ func newSubagentManager(cfg subagentRuntimeConfig, runner subagentRunner) *subag
 
 // ListAll returns a snapshot of all known subagent sessions (used by TUI agent tree panel).
 // Does NOT include the top-level agents — those are managed by the TUI model.
-func (m *subagentManager) ListAll() []types.SubagentNode {
+func (m *subagentManager) ListAll() []contracts.SubagentNode {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	nodes := make([]types.SubagentNode, 0, len(m.sessions))
+	nodes := make([]contracts.SubagentNode, 0, len(m.sessions))
 	for _, s := range m.sessions {
-		nodes = append(nodes, types.SubagentNode{
+		nodes = append(nodes, contracts.SubagentNode{
 			ID:       s.ID,
 			Name:     s.Name,
 			Question: s.Question,
@@ -194,7 +318,7 @@ func (m *subagentManager) ListAll() []types.SubagentNode {
 			Depth:    s.Depth,
 		})
 	}
-	slices.SortFunc(nodes, func(a, b types.SubagentNode) int {
+	slices.SortFunc(nodes, func(a, b contracts.SubagentNode) int {
 		return strings.Compare(a.ID, b.ID)
 	})
 	return nodes
@@ -789,48 +913,11 @@ func buildAggregateEnvelope(items []subagentEnvelope, maxChars int) subagentAggr
 }
 
 func deriveChildAllowedTools(parentAllowed map[string]bool, requested []string, depth, maxDepth int) (map[string]bool, error) {
-	if len(parentAllowed) == 0 {
-		return nil, errors.New("parent has no allowed tools")
-	}
-	child := map[string]bool{}
-	if len(requested) == 0 {
-		for name, enabled := range parentAllowed {
-			if enabled {
-				child[name] = true
-			}
-		}
-	} else {
-		for _, raw := range requested {
-			name := strings.TrimSpace(raw)
-			if name == "" {
-				continue
-			}
-			if _, ok := optInTools[name]; !ok && !slices.Contains(alwaysEnabledTools, name) {
-				return nil, fmt.Errorf("unknown tool %q in allowed_tools", name)
-			}
-			if !parentAllowed[name] {
-				return nil, fmt.Errorf("tool %q is not allowed by parent policy", name)
-			}
-			child[name] = true
-		}
-	}
-	if depth >= maxDepth {
-		delete(child, toolCreateSubagent)
-		delete(child, toolRunSubagent)
-		delete(child, toolAwaitSubagent)
-		delete(child, toolListSubagents)
-		delete(child, toolReadSubagent)
-		delete(child, toolCancelSubagent)
-	}
-	return child, nil
+	return policy.InheritChildTools(parentAllowed, requested, depth, maxDepth)
 }
 
 func cloneAllowedTools(in map[string]bool) map[string]bool {
-	out := make(map[string]bool, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
+	return policy.CloneAllowedTools(in)
 }
 
 func cloneSession(in *subagentSession) *subagentSession {

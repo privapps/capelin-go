@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"encoding/hex"
@@ -10,11 +10,10 @@ import (
 	"strings"
 )
 
-// serverSecurityPolicy contains the independent browser-origin and outbound-target allowlists.
 type serverSecurityPolicy struct {
 	AllowedOrigins      map[string]bool
 	AllowAllOrigins     bool
-	AllowedTargets      map[string]bool // canonical origin entries
+	AllowedTargets      map[string]bool
 	AllowAllTargets     bool
 	AllowPrivateTargets bool
 }
@@ -26,6 +25,26 @@ type parsedTarget struct {
 	Private  bool
 }
 
+func loadServerSecurityPolicy(rawOrigins, rawTargets, rawPrivate string) (serverSecurityPolicy, error) {
+	origins, allOrigins, err := parseAllowlist(rawOrigins, true)
+	if err != nil {
+		return serverSecurityPolicy{}, err
+	}
+	targets, allTargets, err := parseAllowlist(rawTargets, false)
+	if err != nil {
+		return serverSecurityPolicy{}, err
+	}
+	allowPrivate, err := parseStrictBool(rawPrivate)
+	if err != nil {
+		return serverSecurityPolicy{}, fmt.Errorf("SERVER_ALLOW_PRIVATE_TARGETS: %w", err)
+	}
+	return serverSecurityPolicy{
+		AllowedOrigins: origins, AllowAllOrigins: allOrigins,
+		AllowedTargets: targets, AllowAllTargets: allTargets,
+		AllowPrivateTargets: allowPrivate,
+	}, nil
+}
+
 func (p serverSecurityPolicy) authorizeOrigin(raw string) (string, bool) {
 	if strings.TrimSpace(raw) == "" {
 		return "", true
@@ -34,8 +53,6 @@ func (p serverSecurityPolicy) authorizeOrigin(raw string) (string, bool) {
 	if err != nil || (!p.AllowAllOrigins && !p.AllowedOrigins[origin]) {
 		return "", false
 	}
-	// Return the exact supplied origin for CORS reflection; canonical form is
-	// used only for validation and allowlist comparison.
 	return strings.TrimSpace(raw), true
 }
 
@@ -69,11 +86,8 @@ func parseHTTPOrigin(raw string) (string, error) {
 	if u.User != nil || u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
 		return "", fmt.Errorf("origin must not contain credentials, path, query, or fragment")
 	}
-	if u.Hostname() == "" {
-		return "", fmt.Errorf("origin hostname is missing")
-	}
-	if strings.HasSuffix(u.Host, ":") {
-		return "", fmt.Errorf("origin port is empty")
+	if u.Hostname() == "" || strings.HasSuffix(u.Host, ":") {
+		return "", fmt.Errorf("origin hostname or port is missing")
 	}
 	return canonicalOrigin(u), nil
 }
@@ -93,26 +107,19 @@ func parseAllowlist(raw string, origin bool) (map[string]bool, bool, error) {
 			all = true
 			continue
 		}
-		var v string
-		var err error
 		if origin {
-			v, err = parseHTTPOrigin(item)
-		} else {
-			p, e := parseAbsoluteTarget(item)
-			err = e
-			if e == nil {
-				if p.URL.Path != "" && p.URL.Path != "/" || p.URL.RawQuery != "" || p.URL.Fragment != "" {
-					err = fmt.Errorf("target allowlist entries must be origins without path, query, or fragment")
-				}
-				v = p.Origin
+			value, err := parseHTTPOrigin(item)
+			if err != nil {
+				return nil, false, fmt.Errorf("invalid allowlist entry")
 			}
+			out[value] = true
+			continue
 		}
-		if err != nil {
-			// Do not include the raw entry in startup diagnostics: URL credentials
-			// (and other secrets embedded in malformed values) must not reach logs.
+		target, err := parseAbsoluteTarget(item)
+		if err != nil || target.URL.Path != "" && target.URL.Path != "/" || target.URL.RawQuery != "" || target.URL.Fragment != "" {
 			return nil, false, fmt.Errorf("invalid allowlist entry")
 		}
-		out[v] = true
+		out[target.Origin] = true
 	}
 	return out, all, nil
 }
@@ -160,17 +167,8 @@ func parseAbsoluteTarget(raw string) (parsedTarget, error) {
 	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
 		return parsedTarget{}, fmt.Errorf("target scheme must be http or https")
 	}
-	if u.User != nil {
-		return parsedTarget{}, fmt.Errorf("target credentials are not allowed")
-	}
-	if u.Fragment != "" {
-		return parsedTarget{}, fmt.Errorf("target fragments are not allowed")
-	}
-	if u.Hostname() == "" {
-		return parsedTarget{}, fmt.Errorf("target hostname is missing")
-	}
-	if strings.HasSuffix(u.Host, ":") {
-		return parsedTarget{}, fmt.Errorf("target port is empty")
+	if u.User != nil || u.Fragment != "" || u.Hostname() == "" || strings.HasSuffix(u.Host, ":") {
+		return parsedTarget{}, fmt.Errorf("invalid target")
 	}
 	u.Scheme = strings.ToLower(u.Scheme)
 	u.Host = strings.ToLower(u.Host)
@@ -186,28 +184,28 @@ func isPrivateHostname(host string) bool {
 }
 
 func (p serverSecurityPolicy) authorizeTarget(raw string) (parsedTarget, error) {
-	t, err := parseAbsoluteTarget(raw)
+	target, err := parseAbsoluteTarget(raw)
 	if err != nil {
 		return parsedTarget{}, err
 	}
-	if !p.AllowAllTargets && !p.AllowedTargets[t.Origin] {
+	if !p.AllowAllTargets && !p.AllowedTargets[target.Origin] {
 		return parsedTarget{}, fmt.Errorf("target not allowed")
 	}
-	if t.Private && (!p.AllowPrivateTargets || !p.AllowedTargets[t.Origin]) {
+	if target.Private && (!p.AllowPrivateTargets || !p.AllowedTargets[target.Origin]) {
 		return parsedTarget{}, fmt.Errorf("target not allowed")
 	}
-	return t, nil
+	return target, nil
 }
 
 func (p serverSecurityPolicy) rejectedTargetReason(raw string) string {
-	t, err := parseAbsoluteTarget(raw)
+	target, err := parseAbsoluteTarget(raw)
 	if err != nil {
 		return "invalid"
 	}
-	if !p.AllowAllTargets && !p.AllowedTargets[t.Origin] {
+	if !p.AllowAllTargets && !p.AllowedTargets[target.Origin] {
 		return "not_allowlisted"
 	}
-	if t.Private && (!p.AllowPrivateTargets || !p.AllowedTargets[t.Origin]) {
+	if target.Private && (!p.AllowPrivateTargets || !p.AllowedTargets[target.Origin]) {
 		return "private_target"
 	}
 	return "invalid"
@@ -222,19 +220,13 @@ func (p serverSecurityPolicy) logRejectedTarget(raw string) {
 }
 
 func (p serverSecurityPolicy) logRejectedOrigin(raw string) {
-	// Never log credentials, query strings, or other attacker-supplied origin data.
 	if origin, err := parseHTTPOrigin(raw); err == nil {
 		log.Printf("[capelin-go] rejected origin %s", origin)
-		return
-	}
-	if u, err := url.Parse(strings.TrimSpace(raw)); err == nil && u.Hostname() != "" {
-		log.Printf("[capelin-go] rejected origin hostname %s", strings.ToLower(u.Hostname()))
 		return
 	}
 	log.Printf("[capelin-go] rejected origin (invalid)")
 }
 
-// extractServerTarget accepts query endpoint values and ~<hex URL> paths only.
 func extractServerTarget(path, endpointPrefix string, query url.Values) (string, error) {
 	path = strings.TrimPrefix(path, endpointPrefix)
 	if strings.HasPrefix(path, "/~") {

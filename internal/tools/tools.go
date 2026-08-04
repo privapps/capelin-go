@@ -1,9 +1,10 @@
-package main
+package tools
 
 import (
 	"bytes"
+	"capelin-go/internal/contracts"
+	"capelin-go/internal/policy"
 	"capelin-go/internal/skills"
-	"capelin-go/internal/types"
 	"context"
 	"encoding/json"
 	"encoding/xml"
@@ -24,6 +25,29 @@ import (
 	"golang.org/x/net/html"
 )
 
+// Tool names are owned by the tool capability so policy and composition use a
+// single catalog vocabulary.
+const (
+	WebSearch      = "web_search"
+	FetchPage      = "fetch_page"
+	ListFiles      = "list_files"
+	ReadFile       = "read_file"
+	WriteFile      = "write_file"
+	EditFile       = "edit_file"
+	AppendFile     = "append_file"
+	ExecuteProgram = "execute_program"
+	ExecuteSkill   = "execute_skill"
+	ListSkills     = "list_skills"
+	ReadSkill      = "read_skill"
+	CreateSubagent = "create_subagent"
+	RunSubagent    = "run_subagent"
+	AwaitSubagent  = "await_subagent"
+	ListSubagents  = "list_subagents"
+	ReadSubagent   = "read_subagent"
+	CancelSubagent = "cancel_subagent"
+	UpdateTodos    = "update_todos"
+)
+
 const (
 	browserUA        = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 	toolTimeout      = 60 * time.Second
@@ -33,6 +57,7 @@ const (
 	maxListEntries   = 300
 	maxFileBytes     = 512 * 1024
 	maxExecOutput    = 256 * 1024
+	ToolTimeoutMax   = toolTimeoutMax
 )
 
 var ddgSearchURL = "https://html.duckduckgo.com/html"
@@ -40,6 +65,19 @@ var bingSearchURL = "https://www.bing.com/search"
 var allowPrivateFetch = false
 
 var errListLimitReached = errors.New("list limit reached")
+
+type privateFetchOverrideKey struct{}
+
+func withPrivateFetchOverride(ctx context.Context, allow bool) context.Context {
+	return context.WithValue(ctx, privateFetchOverrideKey{}, allow)
+}
+
+func privateFetchAllowed(ctx context.Context) bool {
+	if allow, ok := ctx.Value(privateFetchOverrideKey{}).(bool); ok {
+		return allow
+	}
+	return allowPrivateFetch
+}
 
 // safeDialer resolves the target hostname and validates every resolved IP against
 // isBlockedAddr before opening the TCP connection. This prevents DNS-rebinding
@@ -55,7 +93,7 @@ func safeDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !allowPrivateFetch {
+	if !privateFetchAllowed(ctx) {
 		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 		if err != nil {
 			return nil, err
@@ -186,11 +224,11 @@ type searchResult struct {
 	Abstract string
 }
 
-func specWebSearch() types.Tool {
-	return types.Tool{
+func specWebSearch() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolWebSearch,
+		Function: contracts.ToolSpec{
+			Name:        WebSearch,
 			Description: "Search the web using DuckDuckGo with Bing fallback and return result titles, URLs, and abstracts.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -204,11 +242,11 @@ func specWebSearch() types.Tool {
 	}
 }
 
-func specFetchPage() types.Tool {
-	return types.Tool{
+func specFetchPage() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolFetchPage,
+		Function: contracts.ToolSpec{
+			Name:        FetchPage,
 			Description: "Fetch a URL and return content as markdown-like text.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -222,11 +260,11 @@ func specFetchPage() types.Tool {
 	}
 }
 
-func specListFiles() types.Tool {
-	return types.Tool{
+func specListFiles() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolListFiles,
+		Function: contracts.ToolSpec{
+			Name:        ListFiles,
 			Description: "List files and directories under the local workspace.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -239,11 +277,11 @@ func specListFiles() types.Tool {
 	}
 }
 
-func specReadFile() types.Tool {
-	return types.Tool{
+func specReadFile() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolReadFile,
+		Function: contracts.ToolSpec{
+			Name:        ReadFile,
 			Description: "Read a file from local workspace with optional line range.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -259,11 +297,11 @@ func specReadFile() types.Tool {
 	}
 }
 
-func specWriteFile() types.Tool {
-	return types.Tool{
+func specWriteFile() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolWriteFile,
+		Function: contracts.ToolSpec{
+			Name:        WriteFile,
 			Description: "Write content to a file in local workspace (overwrites existing file).",
 			Parameters: map[string]any{
 				"type": "object",
@@ -278,11 +316,11 @@ func specWriteFile() types.Tool {
 	}
 }
 
-func specAppendFile() types.Tool {
-	return types.Tool{
+func specAppendFile() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolAppendFile,
+		Function: contracts.ToolSpec{
+			Name:        AppendFile,
 			Description: "Append content to a file in local workspace.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -297,11 +335,11 @@ func specAppendFile() types.Tool {
 	}
 }
 
-func specEditFile() types.Tool {
-	return types.Tool{
+func specEditFile() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolEditFile,
+		Function: contracts.ToolSpec{
+			Name:        EditFile,
 			Description: "Replace an exact string in a file. Fails if old_str is not found or appears more than once.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -317,11 +355,11 @@ func specEditFile() types.Tool {
 	}
 }
 
-func specExecuteProgram() types.Tool {
-	return types.Tool{
+func specExecuteProgram() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolExecuteProgram,
+		Function: contracts.ToolSpec{
+			Name:        ExecuteProgram,
 			Description: "Execute a local program safely with explicit command and args.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -342,11 +380,11 @@ func specExecuteProgram() types.Tool {
 	}
 }
 
-func specExecuteSkill() types.Tool {
-	return types.Tool{
+func specExecuteSkill() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolExecuteSkill,
+		Function: contracts.ToolSpec{
+			Name:        ExecuteSkill,
 			Description: "Execute a command that is declared by a loaded skill.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -368,11 +406,11 @@ func specExecuteSkill() types.Tool {
 	}
 }
 
-func specListSkills() types.Tool {
-	return types.Tool{
+func specListSkills() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolListSkills,
+		Function: contracts.ToolSpec{
+			Name:        ListSkills,
 			Description: "List loaded Claude-style skills discovered from skill directories.",
 			Parameters: map[string]any{
 				"type":                 "object",
@@ -383,11 +421,11 @@ func specListSkills() types.Tool {
 	}
 }
 
-func specReadSkill() types.Tool {
-	return types.Tool{
+func specReadSkill() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolReadSkill,
+		Function: contracts.ToolSpec{
+			Name:        ReadSkill,
 			Description: "Read full SKILL.md content for a loaded skill by name.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -401,11 +439,11 @@ func specReadSkill() types.Tool {
 	}
 }
 
-func specCreateSubagent() types.Tool {
-	return types.Tool{
+func specCreateSubagent() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolCreateSubagent,
+		Function: contracts.ToolSpec{
+			Name:        CreateSubagent,
 			Description: "Create a worker subagent session with inherited-and-restricted tool policy. Does not start execution.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -444,11 +482,11 @@ func specCreateSubagent() types.Tool {
 	}
 }
 
-func specRunSubagent() types.Tool {
-	return types.Tool{
+func specRunSubagent() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolRunSubagent,
+		Function: contracts.ToolSpec{
+			Name:        RunSubagent,
 			Description: "Start a created subagent. For parallel execution of multiple subagents: call run_subagent with wait=false for ALL subagents first (non-blocking fire), then call await_subagent for each to collect results. Use wait=true only when running a single subagent or intentionally serializing.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -474,11 +512,11 @@ func specRunSubagent() types.Tool {
 	}
 }
 
-func specAwaitSubagent() types.Tool {
-	return types.Tool{
+func specAwaitSubagent() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolAwaitSubagent,
+		Function: contracts.ToolSpec{
+			Name:        AwaitSubagent,
 			Description: "Wait for a running subagent to finish and return its result envelope.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -496,11 +534,11 @@ func specAwaitSubagent() types.Tool {
 	}
 }
 
-func specListSubagents() types.Tool {
-	return types.Tool{
+func specListSubagents() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolListSubagents,
+		Function: contracts.ToolSpec{
+			Name:        ListSubagents,
 			Description: "List subagents visible to the current agent.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -516,11 +554,11 @@ func specListSubagents() types.Tool {
 	}
 }
 
-func specReadSubagent() types.Tool {
-	return types.Tool{
+func specReadSubagent() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolReadSubagent,
+		Function: contracts.ToolSpec{
+			Name:        ReadSubagent,
 			Description: "Read one subagent envelope or aggregate multiple subagent results by ids.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -542,11 +580,11 @@ func specReadSubagent() types.Tool {
 	}
 }
 
-func specCancelSubagent() types.Tool {
-	return types.Tool{
+func specCancelSubagent() contracts.Tool {
+	return contracts.Tool{
 		Type: "function",
-		Function: types.ToolSpec{
-			Name:        toolCancelSubagent,
+		Function: contracts.ToolSpec{
+			Name:        CancelSubagent,
 			Description: "Cancel a pending or running subagent.",
 			Parameters: map[string]any{
 				"type": "object",
@@ -797,16 +835,7 @@ func runFetchPage(ctx context.Context, targetURL string) (string, error) {
 // transport. The standalone wrapper above retains the existing safe tool
 // client and test API.
 func runFetchPageWithClient(ctx context.Context, targetURL string, client *http.Client) (string, error) {
-	allowPrivate := allowPrivateFetch
-	// Server-mode policy explicitly permits private fetches only for exact
-	// allowlisted origins. Let validation proceed; the secure client performs
-	// the final authorization and DNS/address gate.
-	if activeServerPolicy != nil {
-		if target, parseErr := parseAbsoluteTarget(targetURL); parseErr == nil {
-			allowPrivate = activeServerPolicy.AllowPrivateTargets && activeServerPolicy.AllowedTargets[target.Origin]
-		}
-	}
-	parsed, err := validateFetchURLWithPrivate(ctx, targetURL, allowPrivate)
+	parsed, err := validateFetchURLWithPrivate(ctx, targetURL, privateFetchAllowed(ctx))
 	if err != nil {
 		return "", err
 	}
@@ -878,7 +907,7 @@ func validateFetchURLWithPrivate(ctx context.Context, raw string, allowPrivate b
 	if host == "" {
 		return nil, fmt.Errorf("fetch page: missing host in %q", raw)
 	}
-	if allowPrivate {
+	if privateFetchAllowed(ctx) {
 		return parsed, nil
 	}
 	if isBlockedHostname(host) {
@@ -1260,32 +1289,7 @@ func (l *limitedBuffer) String() string {
 }
 
 func containsDangerousPattern(command string, args []string) bool {
-	denyCommands := map[string]struct{}{
-		"sh": {}, "bash": {}, "zsh": {}, "fish": {}, "ksh": {}, "dash": {},
-		"cmd": {}, "cmd.exe": {}, "powershell": {}, "pwsh": {},
-	}
-	if _, blocked := denyCommands[strings.ToLower(filepath.Base(command))]; blocked {
-		return true
-	}
-
-	// exec.Command does not invoke a shell, so shell metacharacters in args are
-	// generally safe as literal text. Keep command-token validation strict, and
-	// only reject malformed control characters in args.
-	if strings.TrimSpace(command) == "" || strings.ContainsAny(command, " \t\r\n\x00") {
-		return true
-	}
-	commandPatterns := []string{";", "&&", "||", "|", "`", "$(", "${", "<(", ">("}
-	for _, p := range commandPatterns {
-		if strings.Contains(command, p) {
-			return true
-		}
-	}
-	for _, arg := range args {
-		if strings.Contains(arg, "\x00") {
-			return true
-		}
-	}
-	return false
+	return policy.ContainsDangerousPattern(command, args)
 }
 
 // resolvePathForTool resolves a user-supplied path against workspaceRoot.
@@ -1305,64 +1309,10 @@ func resolvePathForTool(workspaceRoot, userPath string, yolo bool) (string, erro
 	return resolveWorkspacePath(workspaceRoot, userPath)
 }
 
-// resolveExistingPath resolves symlinks for p, walking up to the nearest existing
-// ancestor and reconstructing the remaining path components without symlinks.
-func resolveExistingPath(p string) (string, error) {
-	resolved, err := filepath.EvalSymlinks(p)
-	if err == nil {
-		return resolved, nil
-	}
-	if !os.IsNotExist(err) {
-		return "", err
-	}
-	parent := filepath.Dir(p)
-	if parent == p {
-		return p, nil
-	}
-	resolvedParent, err := resolveExistingPath(parent)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(resolvedParent, filepath.Base(p)), nil
-}
-
+// resolveWorkspacePath is retained as an app-local compatibility wrapper for
+// callers and tests; the confinement policy is owned by internal/policy.
 func resolveWorkspacePath(workspaceRoot, userPath string) (string, error) {
-	if strings.TrimSpace(userPath) == "" {
-		return "", errors.New("path is required")
-	}
-	clean := filepath.Clean(userPath)
-	if filepath.IsAbs(clean) {
-		return "", fmt.Errorf("absolute paths are not allowed: %q", userPath)
-	}
-	candidate := filepath.Join(workspaceRoot, clean)
-
-	absBase, err := filepath.Abs(workspaceRoot)
-	if err != nil {
-		return "", fmt.Errorf("resolve path: %w", err)
-	}
-	absCandidate, err := filepath.Abs(candidate)
-	if err != nil {
-		return "", fmt.Errorf("resolve path: %w", err)
-	}
-
-	// Resolve symlinks on both paths to prevent symlink-based workspace escapes.
-	resolvedBase, err := resolveExistingPath(absBase)
-	if err != nil {
-		return "", fmt.Errorf("resolve path: %w", err)
-	}
-	resolvedCandidate, err := resolveExistingPath(absCandidate)
-	if err != nil {
-		return "", fmt.Errorf("resolve path: %w", err)
-	}
-
-	rel, err := filepath.Rel(resolvedBase, resolvedCandidate)
-	if err != nil {
-		return "", fmt.Errorf("resolve path: %w", err)
-	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("path %q escapes workspace root", userPath)
-	}
-	return absCandidate, nil
+	return policy.ResolveWorkspacePath(workspaceRoot, userPath)
 }
 
 func htmlToMarkdown(doc *html.Node) string {

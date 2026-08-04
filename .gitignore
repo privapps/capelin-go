@@ -4,3 +4,9 @@ dist/
 build/*
 .codex/*
 openspec
+.agents
+.archive/
+.capelin-go/
+graphify-out/
+.nca/*
+.scratch/*

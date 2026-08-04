@@ -46,6 +46,8 @@ make build
 make test
 ```
 
+For package ownership, dependency direction, adapter seams, and the full source-structure validation checklist, see [Architecture and source placement](docs/architecture.md).
+
 ## Run
 
 ```bash
@@ -62,7 +64,62 @@ Interactive mode (multi-turn REPL with shared conversation history):
 ./capelin-go -i
 ```
 
-Type `exit` or `quit` (or press Ctrl+D) to end an interactive session.
+Interactive slash commands:
+
+- `/exit` or `/quit` ends the session without sending a prompt to the model.
+- `/save` writes the latest successful textual assistant response to
+  `last-response.md` in the current working folder, overwriting that file if
+  it already exists.
+- `/session-new [prompt]` saves the current conversation and switches to a
+  blank session; an optional prompt is sent as its first turn.
+- `/session-list` shows full saved session IDs newest-first and marks the current
+  session. Each row includes a label, recent direct input, message count, update
+  time, and checklist progress. `/session-resume [ID|PREFIX]` switches to an exact,
+  unique-prefix, or newest saved session.
+- `/session-rename <name>` sets a durable display name; `/session-rename --clear`
+  restores the derived topic label.
+
+- `/goal <objective>` — start a new bounded checklist-driven objective; requires `--yolo`
+- `/goal` — continue the current incomplete checklist; requires `--yolo`
+
+Interactive sessions are saved atomically under `.capelin-go/sessions/` after
+successful turns, checklist updates, switches, and exit. The REPL prints the
+current UUID and a `--resume <id>` hint when it exits. Startup resume accepts
+`./capelin-go -i --resume [ID|PREFIX]` (a bare `--resume` selects the newest
+valid snapshot).
+
+YOLO goal execution is bounded: completion requires a non-empty checklist in
+which every item is `completed`. Deterministic tool errors such as missing
+paths, invalid arguments, disabled tools, and failed commands are returned to
+the model so the goal can recover. Provider failures, cancellation, persistence
+failures, and unrecoverable runtime errors are reported as incomplete. Three
+consecutive recoverable-error turns also stop the goal with an explicit
+incomplete outcome. Configure the outer limit independently with
+`--max-goal-iterations N` or `MAX_GOAL_ITERATIONS` (default 20); this does not
+change `--max-iterations`.
+
+Press Tab after `/` or a partial command to complete or display the available
+slash commands. Bare `exit` and `quit` are ordinary prompts and are sent to
+the model. Ctrl+D and the existing Ctrl+C behaviors remain available.
+
+In interactive mode, use `$skill-name` to select a locally loaded skill as
+bounded task guidance, for example `$research compare these designs`. The
+reference does not execute a skill or grant tool permission; execution still
+goes through the ordinary `execute_skill` policy. Press Tab after `$` or a
+partial `$skill` token to complete loaded skill names, including inline
+references. Unknown `$tokens` and escaped `\$tokens` remain ordinary text.
+For a one-shot request, quote the shell argument so the shell does not expand
+the dollar sign: `./capelin-go '$research compare these designs'`.
+The syntax is local-only; server-mode requests keep `$name` as ordinary user
+text.
+
+Selected skill content is bounded, treated as untrusted task guidance, and
+does not change the existing tool permissions.
+
+On Unix-like terminals that provide bracketed-paste markers, a multiline paste
+is submitted as one prompt with its internal line breaks preserved. Its history
+entry is stored as one safe record and is restored when recalled. Piped input,
+non-TTY sessions, and readline fallback remain line-oriented.
 
 **Server mode** (OpenAI-compatible proxy):
 
@@ -239,12 +296,14 @@ Enable everything (all tools + unrestricted paths):
 ## Environment variables
 
 - `--server-port PORT` (or `--server PORT`) — start HTTP server on given port (server mode)
+- `--resume [ID|PREFIX]` — resume the newest valid, exact, or unique-prefix interactive session
 - `ENDPOINT` — complete model URL (default: `http://localhost:8235/v1/chat/completions`). When its URL path ends with `/responses` (with an optional trailing slash), capelin-go uses the official OpenAI Responses API schema; all other paths use Chat Completions.
 - `MODEL` — model ID (default: `gpt-5-mini`)
 - `TOKEN` — optional API token
 - `REASONING_EFFORT` — passed through to the model backend; set to `none` or `nil` to omit the field entirely from the request
 - `SYSTEM_PROMPT` (or `systemPrompt`) — prompt override
 - `MAX_ITERATIONS` — root agent tool-call iteration cap (default: 40; overridden by `--max-iterations`); always wraps up gracefully on limit
+- `MAX_GOAL_ITERATIONS` — outer `/goal` iteration cap (default: 20; overridden by `--max-goal-iterations`); applies only to YOLO interactive goals
 - `SUBAGENT_MAX_DEPTH` — maximum subagent nesting depth (default: 1; overridden by `--subagent-max-depth`)
 - `SUBAGENT_MAX_CHILDREN` — maximum active subagents (pending/queued/running) a single parent can hold at once (default: 8; overridden by `--subagent-max-children`)
 - `SUBAGENT_MAX_PARALLEL` — maximum concurrently running parallel subagents (default: 4; overridden by `--subagent-max-parallel`)
@@ -254,6 +313,13 @@ Enable everything (all tools + unrestricted paths):
 - `SUBAGENT_MAX_ITERATIONS` — maximum tool-call iterations per subagent (default: 20; overridden by `--subagent-max-iterations`)
 - `SUBAGENT_MODEL` — model ID used for subagents (default: inherits `MODEL`; overridden by `--subagent-model`)
 - `SUBAGENT_REASONING_EFFORT` — reasoning effort for subagents (default: inherits `REASONING_EFFORT`; set to `none` or `nil` to omit; overridden by `--subagent-reasoning-effort`)
+
+Reasoning-capable providers can return native reasoning metadata alongside a
+tool call. Capelin replays that metadata in the provider's required format for
+the next tool or interactive turn, and persists compatible provider-owned
+continuation state in saved sessions. Older snapshots and incompatible state
+fall back to normalized conversation history; an initial provider error remains
+visible and is not silently retried with reasoning disabled.
 
 ## Config file
 
@@ -270,6 +336,7 @@ TOKEN =
 REASONING_EFFORT = medium
 SYSTEM_PROMPT =
 MAX_ITERATIONS = 40
+MAX_GOAL_ITERATIONS = 20
 
 # Subagent orchestration limits (env vars: SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN,
 # SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS, SUBAGENT_MAX_RESULT_CHARS,
