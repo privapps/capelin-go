@@ -116,6 +116,95 @@ func TestChatCompletionsPreservesEmptyNativeReasoningForToolContinuation(t *test
 	}
 }
 
+func TestChatCompletionsSynthesizesMissingReasoningForToolContinuation(t *testing.T) {
+	call := contracts.ToolCall{
+		ID: "call-1", Type: "function",
+		Function: contracts.FunctionCall{Name: "lookup", Arguments: `{}`},
+	}
+	var requests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		requests = append(requests, request)
+		w.Header().Set("Content-Type", "application/json")
+		if len(requests) == 1 {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}`))
+			return
+		}
+		messages := request["messages"].([]any)
+		assistant := messages[1].(map[string]any)
+		if reasoning, present := assistant["reasoning_content"]; !present || reasoning != "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"reasoning_content must be passed back as an empty string"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"finished"}}]}`))
+	}))
+	defer server.Close()
+
+	provider := NewChatCompletions(Config{Endpoint: server.URL, HTTP: server.Client()})
+	state := provider.Initialize(nil, "inspect")
+	response, err := provider.Complete(context.Background(), state, []contracts.Tool{{Type: "function", Function: contracts.ToolSpec{Name: "lookup"}}}, "model", "medium")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.ApplyResponse(state, response)
+	provider.ApplyToolResults(state, []contracts.ToolResult{{Call: call, Output: "tool result"}})
+	if _, err := provider.Complete(context.Background(), state, nil, "model", "medium"); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(requests) != 2 {
+		t.Fatalf("requests=%d, want 2", len(requests))
+	}
+	messages := requests[1]["messages"].([]any)
+	assistant := messages[1].(map[string]any)
+	if assistant["reasoning_content"] != "" {
+		t.Fatalf("assistant reasoning=%#v, want empty string", assistant["reasoning_content"])
+	}
+	if assistant["tool_calls"].([]any)[0].(map[string]any)["id"] != "call-1" {
+		t.Fatalf("assistant tool call=%#v", assistant["tool_calls"])
+	}
+	tool := messages[2].(map[string]any)
+	if tool["role"] != "tool" || tool["tool_call_id"] != "call-1" || tool["content"] != "tool result" {
+		t.Fatalf("tool result=%#v", tool)
+	}
+}
+
+func TestChatCompletionsAddsMissingReasoningToLegacyAssistantHistory(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`))
+	}))
+	defer server.Close()
+
+	reasoning := "kept"
+	provider := NewChatCompletions(Config{Endpoint: server.URL, HTTP: server.Client()})
+	state := provider.Initialize([]contracts.Message{
+		{Role: "assistant", Content: "old answer"},
+		{Role: "assistant", Content: "reasoned answer", ReasoningContent: &reasoning},
+	}, "continue")
+	if _, err := provider.Complete(context.Background(), state, nil, "model", "high"); err != nil {
+		t.Fatal(err)
+	}
+
+	messages := request["messages"].([]any)
+	if messages[0].(map[string]any)["reasoning_content"] != "" {
+		t.Fatalf("legacy assistant reasoning=%#v, want empty string", messages[0].(map[string]any)["reasoning_content"])
+	}
+	if messages[1].(map[string]any)["reasoning_content"] != "kept" {
+		t.Fatalf("native assistant reasoning=%#v, want kept", messages[1].(map[string]any)["reasoning_content"])
+	}
+}
+
 func TestChatCompletionsReasoningAliasesPreferNativeAndOmitWhenAbsent(t *testing.T) {
 	responses := []string{
 		`{"choices":[{"message":{"role":"assistant","content":"ok","reasoning":"legacy","reasoning_content":"native"}}]}`,
@@ -152,6 +241,10 @@ func TestChatCompletionsReasoningAliasesPreferNativeAndOmitWhenAbsent(t *testing
 	initial := requests[0]["messages"].([]any)[0].(map[string]any)
 	if _, present := initial["reasoning_content"]; present {
 		t.Fatal("reasoning_content was emitted before any reasoning was provided")
+	}
+	assistant := requests[1]["messages"].([]any)[1].(map[string]any)
+	if _, present := assistant["reasoning_content"]; present {
+		t.Fatal("reasoning_content was emitted when reasoning was disabled")
 	}
 }
 
@@ -205,6 +298,24 @@ func TestResponsesRestoresRawOutputItemsAcrossContinuationState(t *testing.T) {
 	}
 	if input[5].(map[string]any)["content"] != "next prompt" {
 		t.Fatalf("new prompt was not appended after restored state: %#v", input[5])
+	}
+}
+
+func TestResponsesAcceptsStructuredTopLevelReasoning(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"reasoning":{"context":"all_turns","effort":"high","summary":null},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}`))
+	}))
+	defer server.Close()
+
+	provider := NewResponses(Config{Endpoint: server.URL + "/responses", HTTP: server.Client()})
+	state := provider.Initialize(nil, "tell me about yourself")
+	completion, err := provider.Complete(context.Background(), state, nil, "model", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := completion.Content(); got != "done" {
+		t.Fatalf("content=%q, want done", got)
 	}
 }
 

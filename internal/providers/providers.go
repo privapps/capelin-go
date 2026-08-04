@@ -172,7 +172,7 @@ func (p *ChatCompletions) Complete(ctx context.Context, state contracts.TurnStat
 	if model == "" {
 		model = p.cfg.Model
 	}
-	req := chatRequest{Model: model, Messages: chatMessages(state.Messages()), Tools: tools, Reasoning: reasoning}
+	req := chatRequest{Model: model, Messages: chatMessages(state.Messages(), reasoning), Tools: tools, Reasoning: reasoning}
 	if len(tools) > 0 {
 		req.ToolChoice = "auto"
 	}
@@ -231,15 +231,19 @@ type chatContinuationData struct {
 	MessagesHash string `json:"messages_hash"`
 }
 
-func chatMessages(messages []contracts.Message) []chatMessage {
+func chatMessages(messages []contracts.Message, reasoning string) []chatMessage {
+	reasoningEnabled := strings.TrimSpace(reasoning) != ""
 	result := make([]chatMessage, 0, len(messages))
 	for _, message := range messages {
 		wire := chatMessage{
 			Role: message.Role, Content: message.Content, ToolCallID: message.ToolCallID,
 			Name: message.Name, ToolCalls: append([]contracts.ToolCall(nil), message.ToolCalls...),
 		}
-		if message.Role == "assistant" && message.ReasoningContent != nil {
-			value := *message.ReasoningContent
+		if message.Role == "assistant" && reasoningEnabled {
+			value := ""
+			if message.ReasoningContent != nil {
+				value = *message.ReasoningContent
+			}
 			wire.ReasoningContent = &value
 		}
 		result = append(result, wire)
@@ -404,8 +408,8 @@ func parseResponse(raw []byte) (contracts.Completion, error) {
 	var response struct {
 		Output           []json.RawMessage `json:"output"`
 		OutputText       *string           `json:"output_text"`
-		Reasoning        *string           `json:"reasoning"`
-		ReasoningContent *string           `json:"reasoning_content"`
+		Reasoning        json.RawMessage   `json:"reasoning"`
+		ReasoningContent json.RawMessage   `json:"reasoning_content"`
 	}
 	if err := json.Unmarshal(raw, &response); err != nil {
 		return nil, err
@@ -414,10 +418,10 @@ func parseResponse(raw []byte) (contracts.Completion, error) {
 		return nil, errors.New("model returned no output")
 	}
 	result := completionMessage{outputItems: append([]json.RawMessage(nil), response.Output...)}
-	if response.ReasoningContent != nil {
-		result.message.ReasoningContent = response.ReasoningContent
-	} else {
-		result.message.ReasoningContent = response.Reasoning
+	if reasoning := scalarReasoning(response.ReasoningContent); reasoning != nil {
+		result.message.ReasoningContent = reasoning
+	} else if reasoning := scalarReasoning(response.Reasoning); reasoning != nil {
+		result.message.ReasoningContent = reasoning
 	}
 	for _, item := range response.Output {
 		var parsed struct {
@@ -484,6 +488,18 @@ func parseResponse(raw []byte) (contracts.Completion, error) {
 	}
 	return result, nil
 }
+
+func scalarReasoning(raw json.RawMessage) *string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		return nil
+	}
+	return &text
+}
+
 func textPart(raw json.RawMessage) (string, string) {
 	var obj struct {
 		Type string `json:"type"`
