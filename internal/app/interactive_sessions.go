@@ -8,14 +8,21 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 func interactiveCommandArgument(input, command string) (string, bool) {
 	if input == command {
 		return "", true
 	}
-	if strings.HasPrefix(input, command+" ") {
-		return strings.TrimSpace(strings.TrimPrefix(input, command)), true
+	if !strings.HasPrefix(input, command) {
+		return "", false
+	}
+	remainder := strings.TrimPrefix(input, command)
+	separator, _ := utf8.DecodeRuneInString(remainder)
+	if unicode.IsSpace(separator) {
+		return strings.TrimSpace(remainder), true
 	}
 	return "", false
 }
@@ -107,6 +114,7 @@ func (a *app) sessionFromSnapshot(snapshot sessionSnapshot) *interactiveSession 
 		id:            snapshot.SessionUUID,
 		createdAt:     snapshot.CreatedAt,
 		todos:         cloneTodos(snapshot.Todos),
+		activeGoal:    cloneGoalState(snapshot.ActiveGoal),
 		name:          snapshot.Name,
 		topic:         snapshot.Topic,
 		lastInput:     snapshot.LastInput,
@@ -127,8 +135,18 @@ func (a *app) attachInteractiveRuntime(session *interactiveSession) {
 	session.runtime.todosMu.Lock()
 	session.runtime.todos = cloneTodos(session.todos)
 	session.runtime.todosMu.Unlock()
-	session.runtime.todosChanged = func(todos []todoItem) {
+	updateSessionTodos := func(todos []todoItem) {
 		session.todos = cloneTodos(todos)
+		if session.activeGoal != nil {
+			session.activeGoal.Completion = nil
+		}
+	}
+	if session.ephemeral {
+		session.runtime.todosChanged = updateSessionTodos
+		return
+	}
+	session.runtime.todosChanged = func(todos []todoItem) {
+		updateSessionTodos(todos)
 		if err := a.saveInteractiveSession(session); err != nil {
 			session.runtime.recordFatalError(err)
 			fmt.Fprintf(os.Stderr, "[capelin-go] warning: could not save checklist: %v\n", err)
@@ -143,9 +161,23 @@ func (a *app) attachInteractiveSaver(session *interactiveSession) {
 }
 
 func (a *app) saveInteractiveSession(session *interactiveSession) error {
+	if session == nil || session.ephemeral || strings.TrimSpace(session.id) == "" {
+		return nil
+	}
+	return a.persistInteractiveSession(session)
+}
+
+// saveInteractiveSessionCandidate persists a worker session before it is
+// committed to the live session. The worker is intentionally ephemeral so
+// that a provider or persistence failure cannot mutate the live session.
+func (a *app) saveInteractiveSessionCandidate(session *interactiveSession) error {
 	if session == nil || strings.TrimSpace(session.id) == "" {
 		return nil
 	}
+	return a.persistInteractiveSession(session)
+}
+
+func (a *app) persistInteractiveSession(session *interactiveSession) error {
 	store, err := a.ensureSessionStore()
 	if err != nil {
 		return newSessionPersistenceError(err)
@@ -165,6 +197,7 @@ func (a *app) saveInteractiveSession(session *interactiveSession) error {
 		LastInput:     session.lastInput,
 		Messages:      cloneMessages(session.messages),
 		Todos:         cloneTodos(session.todos),
+		ActiveGoal:    cloneGoalForPersistence(session.activeGoal),
 		ProviderState: cloneProviderState(session.providerState),
 	}
 	if err := store.save(snapshot); err != nil {
@@ -337,25 +370,65 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 		a.writeInteractiveSystem("[goal] invalid goal iteration limit")
 		return false
 	}
+	if session.runtime == nil {
+		session.runtime = a.rootRuntime()
+		a.attachInteractiveRuntime(session)
+	}
 	objective = strings.TrimSpace(objective)
+	originalTodos := cloneTodos(session.todos)
+	originalGoal := cloneGoalState(session.activeGoal)
 	if objective != "" {
+		session.activeGoal = &goalState{Objective: objective, Generation: nextGoalGeneration(session.activeGoal)}
 		session.todos = []todoItem{}
 		session.runtime.replaceTodos(session.todos)
-		if err := a.saveInteractiveSession(session); err != nil {
+		if err := a.saveGoalSession(session); err != nil {
+			session.todos = originalTodos
+			session.activeGoal = originalGoal
+			syncRuntimeTodos(session)
 			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", err))
 			return false
 		}
 	} else {
 		current := cloneTodos(session.todos)
-		if len(current) == 0 {
+		if len(current) == 0 && session.activeGoal == nil {
 			a.writeInteractiveSystem("[goal] incomplete: checklist is empty; use /goal <objective> to start a goal")
 			return false
 		}
-		if todosComplete(current) {
-			a.writeInteractiveSystem("[goal] incomplete: checklist is already complete; use /goal <objective> to start a new goal")
+		if session.activeGoal == nil {
+			session.activeGoal = &goalState{Objective: "Resume the current checklist", Generation: 1}
+		}
+		if session.activeGoal.Generation == 0 {
+			session.activeGoal.Generation = 1
+		}
+		if strings.TrimSpace(session.activeGoal.Objective) == "" {
+			session.activeGoal.Objective = "Resume the current checklist"
+		}
+		if validGoalCompletion(session.activeGoal, current) {
+			a.writeInteractiveSystem("[goal] complete: the persisted completion handshake is valid")
+			return false
+		}
+		// A resumed run must re-establish a claim against its current final
+		// checklist. A stale or provisional claim is never carried forward.
+		session.activeGoal.Completion = nil
+		if err := a.saveGoalSession(session); err != nil {
+			session.activeGoal = originalGoal
+			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", err))
 			return false
 		}
 	}
+	// Distinguish a goal worker from an ordinary turn in a session that may
+	// retain completed goal metadata. This private marker is only set on an
+	// ephemeral worker and is cleared when the worker is committed.
+	session.goalTurn = session.ephemeral
+	if session.runtime.allowedTools == nil {
+		session.runtime.allowedTools = make(map[string]bool)
+	}
+	session.runtime.allowedTools[toolCompleteGoal] = true
+	session.runtime.enableGoal(session.activeGoal.Generation)
+	defer func() {
+		delete(session.runtime.allowedTools, toolCompleteGoal)
+		session.runtime.disableGoal()
+	}()
 
 	previous := cloneTodos(session.todos)
 	unchanged := 0
@@ -363,16 +436,21 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 	for iteration := 1; iteration <= a.cfg.maxGoalIterations; iteration++ {
 		if ctx.Err() != nil {
 			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: cancelled after %d iteration(s)", iteration-1))
+			_ = a.saveGoalSession(session)
 			return true
 		}
 		a.writeInteractiveSystem(fmt.Sprintf("[goal] iteration %d/%d", iteration, a.cfg.maxGoalIterations))
 		prompt := goalContinuationPrompt
 		if objective != "" && iteration == 1 {
-			prompt = fmt.Sprintf("Start working toward this objective: %s\n\nCreate a fresh authoritative checklist with update_todos before doing the work. Make concrete progress, verify each completed item, and do not claim success while any checklist item remains incomplete.", objective)
+			prompt = fmt.Sprintf("Start working toward this objective: %s\n\nCreate a fresh authoritative checklist with update_todos before doing the work. Make concrete progress, verify each completed item, and do not claim success while any checklist item remains incomplete. When the final checklist is complete, call complete_goal with a concise summary and non-empty evidence statements.", objective)
+		} else if todosComplete(session.todos) {
+			prompt = fmt.Sprintf("Continue working toward the objective %q. The authoritative checklist is complete, but the completion handshake is missing or stale. Verify the final state and call complete_goal with a non-empty summary and evidence list; do not change the checklist unless verification requires it.", session.activeGoal.Objective)
+		} else if session.activeGoal != nil {
+			prompt = fmt.Sprintf("Continue working toward the objective %q. Make concrete progress on the next incomplete checklist item, then update the authoritative checklist with verified status. When every item is complete, call complete_goal with a non-empty summary and evidence list.", session.activeGoal.Objective)
 		}
 		stopped, err := a.runInteractiveTurnResult(ctx, session, prompt)
 		if err != nil {
-			if persistErr := a.saveInteractiveSession(session); persistErr != nil {
+			if persistErr := a.saveGoalSession(session); persistErr != nil {
 				a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
 				return false
 			}
@@ -393,14 +471,14 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 			return false
 		}
 		if stopped || ctx.Err() != nil {
-			if persistErr := a.saveInteractiveSession(session); persistErr != nil {
+			if persistErr := a.saveGoalSession(session); persistErr != nil {
 				a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
 				return false
 			}
 			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: cancelled after %d iteration(s)", iteration))
 			return true
 		}
-		if persistErr := a.saveInteractiveSession(session); persistErr != nil {
+		if persistErr := a.saveGoalSession(session); persistErr != nil {
 			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
 			return false
 		}
@@ -414,8 +492,15 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 			return false
 		}
 		if todosComplete(current) {
-			a.writeInteractiveSystem(fmt.Sprintf("[goal] complete after %d iteration(s)", iteration))
-			return false
+			if validGoalCompletion(session.activeGoal, current) {
+				if persistErr := a.saveGoalSession(session); persistErr != nil {
+					a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
+					return false
+				}
+				a.writeInteractiveSystem(fmt.Sprintf("[goal] complete after %d iteration(s): %s", iteration, session.activeGoal.Completion.Summary))
+				return false
+			}
+			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: checklist is complete after iteration %d, but the complete_goal handshake is missing or stale; continuing", iteration))
 		}
 		if session.runtime.hadRecoverableToolError() {
 			recoveryStreak++
@@ -441,7 +526,14 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 	return false
 }
 
-const goalContinuationPrompt = "Continue working toward the objective. Make concrete progress on the next incomplete checklist item, then update the authoritative checklist with verified status. Do not claim success while any checklist item remains incomplete."
+func (a *app) saveGoalSession(session *interactiveSession) error {
+	if session != nil && session.ephemeral {
+		return a.saveInteractiveSessionCandidate(session)
+	}
+	return a.saveInteractiveSession(session)
+}
+
+const goalContinuationPrompt = "Continue working toward the objective. Make concrete progress on the next incomplete checklist item, then update the authoritative checklist with verified status. When every item is complete, call complete_goal with a non-empty summary and evidence list. Do not claim success while any checklist item remains incomplete."
 
 const maxConsecutiveGoalRecoveries = 3
 

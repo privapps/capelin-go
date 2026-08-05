@@ -46,6 +46,7 @@ const (
 	ReadSubagent   = "read_subagent"
 	CancelSubagent = "cancel_subagent"
 	UpdateTodos    = "update_todos"
+	CompleteGoal   = "complete_goal"
 )
 
 const (

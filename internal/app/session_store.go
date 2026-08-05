@@ -33,6 +33,7 @@ type sessionSnapshot struct {
 	MessageCount  int                          `json:"messageCount"`
 	Messages      []contracts.Message          `json:"messages"`
 	Todos         []todoItem                   `json:"todos"`
+	ActiveGoal    *goalState                   `json:"activeGoal,omitempty"`
 	ProviderState *contracts.ContinuationState `json:"providerState,omitempty"`
 }
 
@@ -57,6 +58,7 @@ func (s *sessionSnapshot) UnmarshalJSON(data []byte) error {
 		MessageCount         int                 `json:"messageCount"`
 		Messages             []contracts.Message `json:"messages"`
 		Todos                []todoItem          `json:"todos"`
+		ActiveGoal           *goalState          `json:"activeGoal"`
 		ProviderStateRaw     json.RawMessage     `json:"providerState"`
 		ContinuationStateRaw json.RawMessage     `json:"continuationState"`
 		ProviderStateSnake   json.RawMessage     `json:"provider_state"`
@@ -92,6 +94,7 @@ func (s *sessionSnapshot) UnmarshalJSON(data []byte) error {
 	s.MessageCount = wire.MessageCount
 	s.Messages = wire.Messages
 	s.Todos = wire.Todos
+	s.ActiveGoal = cloneGoalState(wire.ActiveGoal)
 	stateRaw := wire.ProviderStateRaw
 	if len(stateRaw) == 0 {
 		stateRaw = wire.ContinuationStateRaw
@@ -256,6 +259,7 @@ func toSessionSnapshot(snapshot sessionSnapshot) sessionpkg.Snapshot {
 		SessionUUID: snapshot.SessionUUID, CreatedAt: snapshot.CreatedAt, UpdatedAt: snapshot.UpdatedAt,
 		LastContent: snapshot.LastContent, Name: snapshot.Name, Topic: snapshot.Topic, LastInput: snapshot.LastInput,
 		MessageCount: snapshot.MessageCount, Messages: toContractsMessages(snapshot.Messages), Todos: todos,
+		ActiveGoal:    toSessionGoal(snapshot.ActiveGoal),
 		ProviderState: cloneProviderState(snapshot.ProviderState),
 	}
 }
@@ -269,6 +273,7 @@ func fromSessionSnapshot(snapshot sessionpkg.Snapshot) sessionSnapshot {
 		SessionUUID: snapshot.SessionUUID, CreatedAt: snapshot.CreatedAt, UpdatedAt: snapshot.UpdatedAt,
 		LastContent: snapshot.LastContent, Name: snapshot.Name, Topic: snapshot.Topic, LastInput: snapshot.LastInput,
 		MessageCount: snapshot.MessageCount, Messages: cloneMessages(snapshot.Messages), Todos: todos,
+		ActiveGoal:    fromSessionGoal(snapshot.ActiveGoal),
 		ProviderState: cloneProviderState(snapshot.ProviderState),
 	}
 }

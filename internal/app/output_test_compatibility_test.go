@@ -5,7 +5,7 @@ import (
 	"capelin-go/internal/output"
 )
 
-const toolDisplayMaxChars = 180
+const toolDisplayMaxChars = 140
 
 // These aliases keep the historical package-local sink tests focused on the
 // same observable contract while the production sink lives in internal/output.

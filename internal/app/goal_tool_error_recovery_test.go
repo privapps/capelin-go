@@ -37,6 +37,7 @@ func TestGoalContinuesAfterRecoverableApplicationToolErrors(t *testing.T) {
 				chatTurnResponse("recovered enough to continue", "", nil),
 				chatTurnResponse("", "", []map[string]any{
 					goalToolCall("complete", toolUpdateTodos, goalTodosArguments("work", "completed")),
+					goalToolCall("claim", toolCompleteGoal, `{"summary":"recovered and complete","evidence":["the final checklist is complete"]}`),
 				}),
 				chatTurnResponse("done", "", nil),
 			)
@@ -96,6 +97,7 @@ func TestGoalContinuationCanIssueAnotherToolAfterRecovery(t *testing.T) {
 		}),
 		chatTurnResponse("", "", []map[string]any{
 			goalToolCall("complete", toolUpdateTodos, goalTodosArguments("work", "completed")),
+			goalToolCall("claim", toolCompleteGoal, `{"summary":"recovered and complete","evidence":["the final checklist is complete"]}`),
 		}),
 		chatTurnResponse("finished", "", nil),
 	)
@@ -136,6 +138,7 @@ func TestGoalToolTimeoutRetriesOnceThenRecoversAsToolError(t *testing.T) {
 		chatTurnResponse("timeout was reported", "", nil),
 		chatTurnResponse("", "", []map[string]any{
 			goalToolCall("complete", toolUpdateTodos, goalTodosArguments("work", "completed")),
+			goalToolCall("claim", toolCompleteGoal, `{"summary":"recovered and complete","evidence":["the final checklist is complete"]}`),
 		}),
 		chatTurnResponse("done", "", nil),
 	)

@@ -22,7 +22,7 @@ const (
 )
 
 var skillNameCommands = []string{
-	"/exit", "/goal", "/quit", "/save",
+	"/compact", "/exit", "/goal", "/quit", "/save",
 	"/session-list", "/session-new", "/session-rename", "/session-resume",
 }
 

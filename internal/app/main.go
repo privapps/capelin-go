@@ -80,30 +80,36 @@ type config struct {
 }
 
 type app struct {
-	cfg          config
-	client       *client
-	skills       map[string]skills.Skill
-	toolset      []contracts.Tool
-	subagents    *subagentManager
-	sink         contracts.OutputSink
-	dataStore    *dataStore
-	sessionStore *sessionStore
-	asyncRunner  func(string, *serverExecutionRequest)
+	cfg                 config
+	client              *client
+	skills              map[string]skills.Skill
+	toolset             []contracts.Tool
+	subagents           *subagentManager
+	sink                contracts.OutputSink
+	dataStore           *dataStore
+	sessionStore        *sessionStore
+	asyncRunner         func(string, *serverExecutionRequest)
+	interactiveIdleHook func()
 }
 
 type interactiveSession struct {
-	messages      []contracts.Message
-	providerState *contracts.ContinuationState
-	runtime       *agentRuntime
-	lastResponse  string
-	loadedSkills  map[string]bool
-	id            string
-	createdAt     time.Time
-	todos         []todoItem
-	name          string
-	topic         string
-	lastInput     string
-	save          func() error
+	messages       []contracts.Message
+	providerState  *contracts.ContinuationState
+	runtime        *agentRuntime
+	lastResponse   string
+	loadedSkills   map[string]bool
+	id             string
+	createdAt      time.Time
+	todos          []todoItem
+	activeGoal     *goalState
+	name           string
+	topic          string
+	lastInput      string
+	save           func() error
+	ephemeral      bool
+	goalTurn       bool
+	successMessage string
+	skipCommit     bool
 }
 
 type client struct {
@@ -289,24 +295,26 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "     SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT")
 	fmt.Fprintln(w, "     TOOL_MAX_PARALLEL, TOOL_TIMEOUT_SECONDS, TOOL_RETRY_ON_TIMEOUT")
 	fmt.Fprintln(w, "Opt-in tools (repeatable): --allow-tool write_file --allow-tool edit_file --allow-tool append_file --allow-tool execute_program --allow-tool execute_skill")
-	fmt.Fprintln(w, "Iteration limit: --max-iterations N (default 40; env MAX_ITERATIONS; always wraps up gracefully on limit)")
-	fmt.Fprintln(w, "Goal loop limit: --max-goal-iterations N (default 20; env MAX_GOAL_ITERATIONS; YOLO /goal only)")
+	fmt.Fprintln(w, "Iteration limit: --max-iterations N (default 40; YOLO fallback 256; env MAX_ITERATIONS; always wraps up gracefully on limit)")
+	fmt.Fprintln(w, "Goal loop limit: --max-goal-iterations N (default 20; YOLO fallback 200; env MAX_GOAL_ITERATIONS; YOLO /goal only)")
 	fmt.Fprintln(w, "Interactive goal: /goal <objective> starts a fresh checklist; bare /goal resumes an incomplete one (requires --yolo)")
-	fmt.Fprintln(w, "Interactive sessions: /session-new [prompt], /session-list, /session-rename <name|--clear>, /session-resume [ID|PREFIX], /exit, /quit")
+	fmt.Fprintln(w, "Goal completion: a completed checklist must be followed by a valid complete_goal summary and evidence claim")
+	fmt.Fprintln(w, "Interactive sessions: /compact, /session-new [prompt], /session-list, /session-rename <name|--clear>, /session-resume [ID|PREFIX], /exit, /quit")
+	fmt.Fprintln(w, "Interactive /compact summarizes retained conversation history without tools; it accepts no arguments and can be cancelled.")
 	fmt.Fprintln(w, "Subagent limits (flags, env vars, or config file):")
-	fmt.Fprintln(w, "  --subagent-max-depth N              (default 1;     env SUBAGENT_MAX_DEPTH)")
+	fmt.Fprintln(w, "  --subagent-max-depth N              (default 1; YOLO 2; env SUBAGENT_MAX_DEPTH)")
 	fmt.Fprintln(w, "  --subagent-max-children N           (default 8 active children; env SUBAGENT_MAX_CHILDREN)")
-	fmt.Fprintln(w, "  --subagent-max-parallel N           (default 4;     env SUBAGENT_MAX_PARALLEL)")
-	fmt.Fprintln(w, "  --subagent-timeout-seconds N        (default 600;   env SUBAGENT_TIMEOUT_SECONDS)")
+	fmt.Fprintln(w, "  --subagent-max-parallel N           (default 4; YOLO 8; env SUBAGENT_MAX_PARALLEL)")
+	fmt.Fprintln(w, "  --subagent-timeout-seconds N        (default 600; YOLO 600; env SUBAGENT_TIMEOUT_SECONDS)")
 	fmt.Fprintln(w, "  --subagent-max-result-chars N       (default 8000;  env SUBAGENT_MAX_RESULT_CHARS)")
-	fmt.Fprintln(w, "  --subagent-max-aggregate-chars N    (default 12000; env SUBAGENT_MAX_AGGREGATE_CHARS)")
-	fmt.Fprintln(w, "  --subagent-max-iterations N         (default 20;    env SUBAGENT_MAX_ITERATIONS)")
+	fmt.Fprintln(w, "  --subagent-max-aggregate-chars N    (default 12000; YOLO 48000; env SUBAGENT_MAX_AGGREGATE_CHARS)")
+	fmt.Fprintln(w, "  --subagent-max-iterations N         (default 20; YOLO 100; env SUBAGENT_MAX_ITERATIONS)")
 	fmt.Fprintln(w, "Subagent model (defaults to root MODEL if not set):")
 	fmt.Fprintln(w, "  --subagent-model MODEL              (env SUBAGENT_MODEL)")
 	fmt.Fprintln(w, "  --subagent-reasoning-effort VALUE   (env SUBAGENT_REASONING_EFFORT; set to 'none' or 'nil' to omit)")
 	fmt.Fprintln(w, "Tool execution (flags, env vars, or config file):")
-	fmt.Fprintln(w, "  --tool-max-parallel N               (default 8;     env TOOL_MAX_PARALLEL)")
-	fmt.Fprintln(w, "  --tool-timeout-seconds N            (default 60;    env TOOL_TIMEOUT_SECONDS)")
+	fmt.Fprintln(w, "  --tool-max-parallel N               (default 8; YOLO 16; env TOOL_MAX_PARALLEL)")
+	fmt.Fprintln(w, "  --tool-timeout-seconds N            (default 60; YOLO 300; env TOOL_TIMEOUT_SECONDS)")
 	fmt.Fprintln(w, "  --tool-retry-on-timeout             (default true;  env TOOL_RETRY_ON_TIMEOUT)")
 	fmt.Fprintln(w, "  --no-tool-retry-on-timeout          (disable retry)")
 	fmt.Fprintln(w, "All tools + unrestricted paths:  --yolo")
@@ -383,6 +391,7 @@ func (a *app) runInteractive(ctx context.Context) error {
 	}
 
 	stdin := io.ReadCloser(os.Stdin)
+	stdin = interactive.NewDoubleEscapeReader(stdin)
 	if bracketedPasteSupported() {
 		stdin = newBracketedPasteReader(stdin)
 	}
@@ -426,13 +435,73 @@ func (a *app) runInteractiveReadlineSession(ctx context.Context, session *intera
 	if err := a.initializeInteractiveSession(session); err != nil {
 		return err
 	}
+	restoreOutput := a.interactiveSinkForReadline(rl)
+	defer restoreOutput()
+	promptUpdates := make(chan string, 8)
+	promptUpdatesDone := make(chan struct{})
+	draftRestorer := &interactiveDraftRestorer{}
+	go func() {
+		defer close(promptUpdatesDone)
+		for prompt := range promptUpdates {
+			rl.SetPrompt(prompt)
+			rl.Refresh()
+		}
+	}()
+	var controller *interactiveTurnController
+	controller = newInteractiveTurnController(
+		func() {
+			promptUpdates <- interactiveBusyPrompt
+		},
+		func() {
+			promptUpdates <- interactiveCancellingPrompt
+		},
+		func() {
+			promptUpdates <- interactiveIdlePrompt
+		},
+		func(outcome interactiveTurnOutcome) {
+			a.finishInteractiveTurn(controller, session, outcome)
+		},
+		func() {
+			if a.interactiveIdleHook != nil {
+				a.interactiveIdleHook()
+			}
+		},
+	)
 	defer func() {
+		controller.wait()
+		draftRestorer.wait()
+		close(promptUpdates)
+		<-promptUpdatesDone
 		if err := a.saveInteractiveSession(session); err != nil {
 			fmt.Fprintf(os.Stderr, "[capelin-go] warning: could not save session: %v\n", err)
 		}
 	}()
-	if err := interactive.RunReadlineLoop(ctx, rl, func(line string) bool {
-		return a.handleInteractiveInput(ctx, session, line)
+	monitorDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			controller.shutdown()
+			draftRestorer.wait()
+			_ = rl.Close()
+		case <-monitorDone:
+		}
+	}()
+	defer close(monitorDone)
+	if err := interactive.RunReadlineLoopWithHooks(ctx, rl, interactive.ReadlineLoopHooks{
+		BeforeRead: func() {
+			draftRestorer.wait()
+		},
+		OnInput: func(line string) bool {
+			return a.handleInteractiveInputAsync(ctx, controller, session, rl, draftRestorer, line)
+		},
+		OnInterrupt: func(line string) bool {
+			if controller.busy() {
+				controller.cancelActive()
+				draftRestorer.restore(rl, line)
+				return false
+			}
+			return strings.TrimSpace(line) == ""
+		},
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "[capelin-go] readline error: %v\n", err)
 	}
@@ -450,13 +519,35 @@ func (a *app) runInteractiveFallbackSession(ctx context.Context, session *intera
 	if err := a.initializeInteractiveSession(session); err != nil {
 		return err
 	}
+	var controller *interactiveTurnController
+	controller = newInteractiveTurnController(
+		func() {
+			a.writeInteractiveSystem("[capelin-go] busy; input is rejected until the turn finishes (Ctrl+C cancels)")
+		},
+		func() { a.writeInteractiveSystem("[capelin-go] cancelling active turn…") },
+		func() { a.writeInteractiveSystem("[capelin-go] idle") },
+		func(outcome interactiveTurnOutcome) {
+			a.finishInteractiveTurn(controller, session, outcome)
+		},
+		nil,
+	)
 	defer func() {
+		controller.wait()
 		if err := a.saveInteractiveSession(session); err != nil {
 			fmt.Fprintf(os.Stderr, "[capelin-go] warning: could not save session: %v\n", err)
 		}
 	}()
+	monitorDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			controller.shutdown()
+		case <-monitorDone:
+		}
+	}()
+	defer close(monitorDone)
 	return interactive.RunFallbackLoop(ctx, os.Stdin, os.Stderr, func(line string) bool {
-		return a.handleInteractiveInput(ctx, session, line)
+		return a.handleInteractiveInputAsync(ctx, controller, session, nil, nil, line)
 	})
 }
 
@@ -480,6 +571,18 @@ func (a *app) handleInteractiveInput(ctx context.Context, session *interactiveSe
 			fmt.Fprintf(os.Stderr, "[capelin-go] /session-list failed: %v\n", err)
 		}
 		return false
+	case "/compact":
+		messageCount, err := a.compactAndPersistInteractiveSession(ctx, session)
+		if err != nil {
+			if errors.Is(err, errNothingToCompact) {
+				a.writeInteractiveSystem("[capelin-go] nothing to compact")
+			} else {
+				a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] /compact failed: %v", err))
+			}
+			return false
+		}
+		a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] compacted conversation to %d messages", messageCount))
+		return false
 	case "/save":
 		if strings.TrimSpace(session.lastResponse) == "" {
 			fmt.Fprintln(os.Stderr, "[capelin-go] /save: no assistant response is available")
@@ -496,6 +599,13 @@ func (a *app) handleInteractiveInput(ctx context.Context, session *interactiveSe
 		}
 		return false
 	default:
+		if arg, ok := interactiveCommandArgument(input, "/compact"); ok {
+			if arg != "" {
+				a.writeInteractiveSystem("[capelin-go] /compact accepts no arguments")
+				return false
+			}
+			return false
+		}
 		if arg, ok := interactiveCommandArgument(input, "/session-new"); ok {
 			if err := a.switchToNewSession(session); err != nil {
 				fmt.Fprintf(os.Stderr, "[capelin-go] /session-new failed: %v\n", err)
@@ -529,7 +639,10 @@ func (a *app) handleInteractiveInput(ctx context.Context, session *interactiveSe
 // This keeps a failed turn from replacing either the conversation state or the
 // last response that /save can recover.
 func (a *app) runInteractiveTurn(ctx context.Context, session *interactiveSession, question string) bool {
-	stopped, _ := a.runInteractiveTurnResult(ctx, session, question)
+	stopped, err := a.runInteractiveTurnResult(ctx, session, question)
+	if err != nil && !stopped && !errors.Is(err, context.Canceled) {
+		a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] error: %v", err))
+	}
 	return stopped
 }
 
@@ -544,12 +657,15 @@ func (a *app) runInteractiveTurnResult(ctx context.Context, session *interactive
 	session.runtime.resetToolError()
 	preTurnLen := len(session.messages)
 	prepared, newlyLoaded := prepareSkillPrompt(question, a.skills, session.loadedSkills)
-	messages, result, _, providerState, err := a.runTurnLoopWithState(ctx, session.messages, prepared, session.runtime, a.toolset, true, session.providerState)
+	toolset := a.toolset
+	if session.runtime.goalIsEnabled() {
+		toolset = tools.Build(session.runtime.allowedTools)
+	}
+	messages, result, _, providerState, err := a.runTurnLoopWithState(ctx, session.messages, prepared, session.runtime, toolset, true, session.providerState)
 	if err != nil {
 		if ctx.Err() != nil {
 			return true, err
 		}
-		fmt.Fprintf(os.Stderr, "[capelin-go] error: %v\n", err)
 		if preTurnLen <= len(session.messages) {
 			session.messages = session.messages[:preTurnLen]
 		}
@@ -567,6 +683,9 @@ func (a *app) runInteractiveTurnResult(ctx context.Context, session *interactive
 	}
 	if response := strings.TrimSpace(result); response != "" {
 		session.lastResponse = response
+	}
+	if session.runtime.goalIsEnabled() && session.activeGoal != nil {
+		session.activeGoal.Completion = session.runtime.snapshotGoalClaim()
 	}
 	if strings.TrimSpace(question) != "" && isDirectInteractivePrompt(question) {
 		session.lastInput = strings.TrimSpace(question)
@@ -712,6 +831,13 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 				value.(*agentRuntime).replaceTodos(todos)
 				return todoListResult(todos)
 			},
+			CompleteGoal: func(value any, raw json.RawMessage) (string, error) {
+				runtime, ok := value.(*agentRuntime)
+				if !ok {
+					return "", errors.New("goal completion runtime is unavailable")
+				}
+				return a.completeGoalForRuntime(runtime, raw)
+			},
 			MarshalResult: marshalToolResult,
 		},
 	}
@@ -719,6 +845,9 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 }
 
 func (a *app) isToolEnabled(runtime *agentRuntime, name string) bool {
+	if name == toolCompleteGoal {
+		return runtime != nil && runtime.goalIsEnabled() && runtime.allowedTools[name]
+	}
 	if runtime == nil {
 		return a.cfg.allowedTools[name]
 	}
@@ -835,5 +964,11 @@ func truncateStr(s string, max int) string {
 // truncateDisplay limits the complete displayed value, including its ellipsis.
 // Use runes so a long argument containing UTF-8 text is not split mid-character.
 func buildAgentTools(enabled map[string]bool) []contracts.Tool {
-	return tools.Build(enabled)
+	// complete_goal is a goal-loop capability, not a general application
+	// capability. Goal turns build their catalog explicitly after enabling the
+	// runtime marker; ordinary/server catalogs must never advertise it merely
+	// because a caller supplied an over-broad map.
+	filtered := cloneAllowedTools(enabled)
+	delete(filtered, toolCompleteGoal)
+	return tools.Build(filtered)
 }

@@ -15,15 +15,27 @@ import (
 )
 
 const (
-	defaultEndpoint           = "http://localhost:8235/v1/chat/completions"
-	defaultModel              = "gpt-5-mini"
-	defaultToken              = ""
-	defaultReasoning          = "medium"
+	defaultEndpoint           = "https://opencode.ai/zen/v1/chat/completions"
+	defaultModel              = "deepseek-v4-flash-free"
+	defaultToken              = "public"
+	defaultReasoning          = "high"
 	defaultMaxIterations      = 40
 	defaultMaxGoalIterations  = 20
 	defaultToolMaxParallel    = 8
 	defaultToolTimeoutSec     = 60
 	defaultToolRetryOnTimeout = true
+)
+
+const (
+	yoloMaxIterations          = 256
+	yoloMaxGoalIterations      = 200
+	yoloSubagentMaxDepth       = 2
+	yoloSubagentMaxParallel    = 8
+	yoloSubagentTimeoutSec     = 600
+	yoloSubagentToolIterations = 100
+	yoloSubagentAggregateChars = 48000
+	yoloToolMaxParallel        = 16
+	yoloToolTimeoutSec         = 300
 )
 
 const defaultSystemPrompt = `You are an execution-focused AI assistant.
@@ -504,44 +516,40 @@ func Load(args []string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("resolving workspace root: %w", err)
 	}
-	// Resolve subagent limits: flag (non-zero) > env > file > built-in default (via normalize).
-	// Check env/file only for fields the flag loop left at zero (i.e. not explicitly provided).
-	if subagentCfg.MaxDepth == 0 {
-		if v, err := parsePositiveInt(readCfg("SUBAGENT_MAX_DEPTH", fileCfg, ""), "SUBAGENT_MAX_DEPTH"); err == nil {
-			subagentCfg.MaxDepth = v
-		}
+	// Resolve numeric settings with flag > environment > saved config > the
+	// active mode's fallback. Saved values equal to an ordinary built-in default
+	// are intentionally treated as uncustomized in YOLO mode. This lets the
+	// generated first-run file remain ordinary while still activating the YOLO
+	// budget on the invocation that requested it.
+	subagentCfg.MaxDepth, err = resolvePositiveSetting("SUBAGENT_MAX_DEPTH", subagentCfg.MaxDepth, fileCfg, defaultSubagentMaxDepth, yoloSubagentMaxDepth, yolo)
+	if err != nil {
+		return Config{}, err
 	}
-	if subagentCfg.MaxChildren == 0 {
-		if v, err := parsePositiveInt(readCfg("SUBAGENT_MAX_CHILDREN", fileCfg, ""), "SUBAGENT_MAX_CHILDREN"); err == nil {
-			subagentCfg.MaxChildren = v
-		}
+	subagentCfg.MaxChildren, err = resolvePositiveSetting("SUBAGENT_MAX_CHILDREN", subagentCfg.MaxChildren, fileCfg, defaultSubagentMaxChildren, defaultSubagentMaxChildren, false)
+	if err != nil {
+		return Config{}, err
 	}
-	if subagentCfg.MaxParallel == 0 {
-		if v, err := parsePositiveInt(readCfg("SUBAGENT_MAX_PARALLEL", fileCfg, ""), "SUBAGENT_MAX_PARALLEL"); err == nil {
-			subagentCfg.MaxParallel = v
-		}
+	subagentCfg.MaxParallel, err = resolvePositiveSetting("SUBAGENT_MAX_PARALLEL", subagentCfg.MaxParallel, fileCfg, defaultSubagentMaxParallel, yoloSubagentMaxParallel, yolo)
+	if err != nil {
+		return Config{}, err
 	}
-	if subagentCfg.DefaultTimeoutSec == 0 {
-		if v, err := parsePositiveInt(readCfg("SUBAGENT_TIMEOUT_SECONDS", fileCfg, ""), "SUBAGENT_TIMEOUT_SECONDS"); err == nil {
-			subagentCfg.DefaultTimeoutSec = v
-		}
+	subagentCfg.DefaultTimeoutSec, err = resolvePositiveSetting("SUBAGENT_TIMEOUT_SECONDS", subagentCfg.DefaultTimeoutSec, fileCfg, defaultSubagentDefaultTimeoutSec, yoloSubagentTimeoutSec, yolo)
+	if err != nil {
+		return Config{}, err
 	}
-	if subagentCfg.MaxResultChars == 0 {
-		if v, err := parsePositiveInt(readCfg("SUBAGENT_MAX_RESULT_CHARS", fileCfg, ""), "SUBAGENT_MAX_RESULT_CHARS"); err == nil {
-			subagentCfg.MaxResultChars = v
-		}
+	subagentCfg.MaxResultChars, err = resolvePositiveSetting("SUBAGENT_MAX_RESULT_CHARS", subagentCfg.MaxResultChars, fileCfg, defaultSubagentResultChars, defaultSubagentResultChars, false)
+	if err != nil {
+		return Config{}, err
 	}
-	if subagentCfg.MaxAggregateChars == 0 {
-		if v, err := parsePositiveInt(readCfg("SUBAGENT_MAX_AGGREGATE_CHARS", fileCfg, ""), "SUBAGENT_MAX_AGGREGATE_CHARS"); err == nil {
-			subagentCfg.MaxAggregateChars = v
-		}
+	subagentCfg.MaxAggregateChars, err = resolvePositiveSetting("SUBAGENT_MAX_AGGREGATE_CHARS", subagentCfg.MaxAggregateChars, fileCfg, defaultSubagentAggregateChars, yoloSubagentAggregateChars, yolo)
+	if err != nil {
+		return Config{}, err
 	}
-	if subagentCfg.MaxToolIterations == 0 {
-		if v, err := parsePositiveInt(readCfg("SUBAGENT_MAX_ITERATIONS", fileCfg, ""), "SUBAGENT_MAX_ITERATIONS"); err == nil {
-			subagentCfg.MaxToolIterations = v
-		}
+	subagentCfg.MaxToolIterations, err = resolvePositiveSetting("SUBAGENT_MAX_ITERATIONS", subagentCfg.MaxToolIterations, fileCfg, defaultSubagentToolIterations, yoloSubagentToolIterations, yolo)
+	if err != nil {
+		return Config{}, err
 	}
-	subagentCfg.normalize() // fills any remaining zeros with built-in defaults
+	subagentCfg.normalize()
 
 	// Resolve subagent Model: flag > env > file > inherit root model.
 	// Empty string means "not explicitly set"; fall through to next source.
@@ -567,54 +575,21 @@ func Load(args []string) (Config, error) {
 		subagentCfg.ReasoningEffort = rawSubagentReasoning
 	}
 
-	// Resolve max iterations: flag > env > file > default
-	if maxIter == 0 {
-		if env := readCfg("MAX_ITERATIONS", fileCfg, ""); env != "" {
-			if v, err := parsePositiveInt(env, "MAX_ITERATIONS"); err == nil {
-				maxIter = v
-			}
-		}
+	maxIter, err = resolvePositiveSetting("MAX_ITERATIONS", maxIter, fileCfg, defaultMaxIterations, yoloMaxIterations, yolo)
+	if err != nil {
+		return Config{}, err
 	}
-	if maxIter == 0 {
-		maxIter = defaultMaxIterations
+	maxGoalIter, err = resolvePositiveSetting("MAX_GOAL_ITERATIONS", maxGoalIter, fileCfg, defaultMaxGoalIterations, yoloMaxGoalIterations, yolo)
+	if err != nil {
+		return Config{}, err
 	}
-
-	// Resolve the outer goal limit independently from the per-turn tool limit.
-	// Unlike the older MAX_ITERATIONS handling, an explicitly supplied invalid
-	// environment/config value is an error rather than silently falling back.
-	if maxGoalIter == 0 {
-		if raw := readCfg("MAX_GOAL_ITERATIONS", fileCfg, ""); raw != "" {
-			value, err := parsePositiveInt(raw, "MAX_GOAL_ITERATIONS")
-			if err != nil {
-				return Config{}, err
-			}
-			maxGoalIter = value
-		}
+	toolMaxParallel, err = resolvePositiveSetting("TOOL_MAX_PARALLEL", toolMaxParallel, fileCfg, defaultToolMaxParallel, yoloToolMaxParallel, yolo)
+	if err != nil {
+		return Config{}, err
 	}
-	if maxGoalIter == 0 {
-		maxGoalIter = defaultMaxGoalIterations
-	}
-
-	// Resolve tool config: flag (non-zero) > env > file > built-in default.
-	if toolMaxParallel == 0 {
-		if env := readCfg("TOOL_MAX_PARALLEL", fileCfg, ""); env != "" {
-			if v, err := parsePositiveInt(env, "TOOL_MAX_PARALLEL"); err == nil {
-				toolMaxParallel = v
-			}
-		}
-	}
-	if toolMaxParallel == 0 {
-		toolMaxParallel = defaultToolMaxParallel
-	}
-	if toolTimeoutSec == 0 {
-		if env := readCfg("TOOL_TIMEOUT_SECONDS", fileCfg, ""); env != "" {
-			if v, err := parsePositiveInt(env, "TOOL_TIMEOUT_SECONDS"); err == nil {
-				toolTimeoutSec = v
-			}
-		}
-	}
-	if toolTimeoutSec == 0 {
-		toolTimeoutSec = defaultToolTimeoutSec
+	toolTimeoutSec, err = resolvePositiveSetting("TOOL_TIMEOUT_SECONDS", toolTimeoutSec, fileCfg, defaultToolTimeoutSec, yoloToolTimeoutSec, yolo)
+	if err != nil {
+		return Config{}, err
 	}
 	if toolRetryOnTimeout == -1 {
 		toolRetryOnTimeout = boolToInt(readBoolCfg("TOOL_RETRY_ON_TIMEOUT", fileCfg, defaultToolRetryOnTimeout))
@@ -648,6 +623,34 @@ func Load(args []string) (Config, error) {
 		Debug:                     debug,
 	}, nil
 }
+
+// resolvePositiveSetting applies the shared precedence rules for bounded
+// positive-integer settings. A non-zero flag value is already validated while
+// parsing CLI arguments. Environment and saved-file values are parsed here so
+// explicit invalid values are rejected rather than silently replaced.
+func resolvePositiveSetting(key string, flagValue int, fileCfg map[string]string, ordinary, yoloFallback int, yolo bool) (int, error) {
+	if flagValue > 0 {
+		return flagValue, nil
+	}
+	if raw := strings.TrimSpace(os.Getenv(key)); raw != "" {
+		return parsePositiveInt(raw, key)
+	}
+	if raw := strings.TrimSpace(fileCfg[key]); raw != "" {
+		value, err := parsePositiveInt(raw, key)
+		if err != nil {
+			return 0, err
+		}
+		if yolo && value == ordinary {
+			return yoloFallback, nil
+		}
+		return value, nil
+	}
+	if yolo {
+		return yoloFallback, nil
+	}
+	return ordinary, nil
+}
+
 func parsePositiveInt(raw, flagName string) (int, error) {
 	value := strings.TrimSpace(raw)
 	if value == "" {
@@ -751,10 +754,10 @@ const defaultConfigFileContent = `# capelin-go configuration
 # Edit this file to set persistent defaults.
 # Priority: CLI flags > environment variables > this file > built-in defaults.
 
-ENDPOINT = http://localhost:8235/v1/chat/completions
-MODEL = gpt-5-mini
-TOKEN =
-REASONING_EFFORT = medium
+ENDPOINT = https://opencode.ai/zen/v1/chat/completions
+MODEL = deepseek-v4-flash-free
+TOKEN = public
+REASONING_EFFORT = high
 SYSTEM_PROMPT =
 MAX_ITERATIONS = 40
 MAX_GOAL_ITERATIONS = 20

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -106,20 +105,22 @@ func TestGoalConfigIsIndependentAndRejectsInvalidLimits(t *testing.T) {
 	}
 }
 
-func TestInteractiveGoalCompletesOnlyFromTodoState(t *testing.T) {
+func TestInteractiveGoalRequiresAndAcceptsCompletionHandshake(t *testing.T) {
 	pendingArgs, _ := json.Marshal(map[string]any{"todos": []map[string]string{{"id": "one", "content": "first", "source": "model", "status": "pending"}}})
 	completedArgs, _ := json.Marshal(map[string]any{"todos": []map[string]string{{"id": "one", "content": "first", "source": "model", "status": "completed"}}})
-	toolResponse := func(id string, args []byte) string {
-		return `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"` + id + `","type":"function","function":{"name":"update_todos","arguments":` + string(mustJSONQuote(args)) + `}}]}}]}`
+	toolResponse := func(calls ...map[string]any) string {
+		return chatTurnResponse("", "", calls)
 	}
 	testApp := newInteractiveTurnTestAppWithResponses(t,
-		toolResponse("one", pendingArgs),
+		toolResponse(goalToolCall("one", toolUpdateTodos, string(pendingArgs))),
 		`{"choices":[{"message":{"role":"assistant","content":"working"}}]}`,
-		toolResponse("two", completedArgs),
+		toolResponse(goalToolCall("two", toolUpdateTodos, string(completedArgs))),
 		`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`,
+		toolResponse(goalToolCall("three", toolCompleteGoal, `{"summary":"implemented and verified","evidence":["the checklist is complete","the final state was verified"]}`)),
+		`{"choices":[{"message":{"role":"assistant","content":"complete"}}]}`,
 	)
 	testApp.app.cfg.yolo = true
-	testApp.app.cfg.maxGoalIterations = 3
+	testApp.app.cfg.maxGoalIterations = 4
 	testApp.app.cfg.allowedTools = map[string]bool{toolUpdateTodos: true}
 	testApp.app.toolset = buildAgentTools(testApp.app.cfg.allowedTools)
 	session, err := testApp.app.newInteractiveSession([]types.Message{{Role: "system", Content: "test"}})
@@ -132,8 +133,40 @@ func TestInteractiveGoalCompletesOnlyFromTodoState(t *testing.T) {
 	if !todosComplete(session.todos) {
 		t.Fatalf("goal completion did not follow authoritative todos: %#v", session.todos)
 	}
-	if got := testApp.userPrompts(); len(got) < 3 || !strings.Contains(got[0], "finish the task") || !strings.Contains(strings.Join(got, "\n"), "Continue working toward the objective") {
+	if got := testApp.userPrompts(); len(got) != 6 || !strings.Contains(got[0], "finish the task") || !strings.Contains(strings.Join(got, "\n"), "complete_goal") {
 		t.Fatalf("goal did not append visible continuation turns: %#v", got)
+	}
+	if session.activeGoal == nil || !validGoalCompletion(session.activeGoal, session.todos) {
+		t.Fatalf("valid completion handshake was not retained: %#v", session.activeGoal)
+	}
+}
+
+func TestInteractiveGoalDoesNotCompleteFromTodosAlone(t *testing.T) {
+	completedArgs, _ := json.Marshal(map[string]any{"todos": []map[string]string{{"id": "one", "content": "first", "source": "model", "status": "completed"}}})
+	testApp := newInteractiveTurnTestAppWithResponses(t,
+		chatTurnResponse("", "", []map[string]any{goalToolCall("one", toolUpdateTodos, string(completedArgs))}),
+		chatTurnResponse("done", "", nil),
+		chatTurnResponse("still working", "", nil),
+		chatTurnResponse("still working", "", nil),
+	)
+	testApp.app.cfg.yolo = true
+	testApp.app.cfg.maxGoalIterations = 2
+	testApp.app.cfg.allowedTools = map[string]bool{toolUpdateTodos: true}
+	testApp.app.toolset = buildAgentTools(testApp.app.cfg.allowedTools)
+	var events []string
+	testApp.app.sink.(*spySink).onSystem = func(message string) { events = append(events, message) }
+	session, err := testApp.app.newInteractiveSession([]types.Message{{Role: "system", Content: "test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped := testApp.app.runGoal(context.Background(), session, "finish the task"); stopped {
+		t.Fatal("goal unexpectedly stopped the REPL")
+	}
+	if !todosComplete(session.todos) || session.activeGoal == nil || session.activeGoal.Completion != nil {
+		t.Fatalf("false completion changed goal state: todos=%#v goal=%#v", session.todos, session.activeGoal)
+	}
+	if containsEvent(events, "[goal] complete") || !containsEvent(events, "handshake is missing") {
+		t.Fatalf("false completion outcome was not distinguishable: %v", events)
 	}
 }
 
@@ -393,28 +426,42 @@ func TestGoalRejectsNonYoloBeforeProviderOrStateChange(t *testing.T) {
 	}
 }
 
-func TestBareGoalRejectsEmptyAndCompletedChecklists(t *testing.T) {
-	for _, todos := range [][]todoItem{
-		{},
-		{{ID: "done", Content: "already done", Status: todoStatusCompleted}},
-	} {
-		t.Run(fmt.Sprintf("todos-%d", len(todos)), func(t *testing.T) {
-			testApp := newInteractiveTurnTestApp(t)
-			testApp.app.cfg.yolo = true
-			testApp.app.cfg.maxGoalIterations = 2
-			session, err := testApp.app.newInteractiveSession([]types.Message{{Role: "system", Content: "test"}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			session.todos = cloneTodos(todos)
-			if stopped := testApp.app.runGoal(context.Background(), session, ""); stopped {
-				t.Fatal("bare goal unexpectedly stopped the REPL")
-			}
-			if len(testApp.userPrompts()) != 0 {
-				t.Fatalf("bare recovery goal called provider: %#v", testApp.userPrompts())
-			}
-		})
-	}
+func TestBareGoalRejectsEmptyButResumesCompletedChecklistForHandshake(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		testApp := newInteractiveTurnTestApp(t)
+		testApp.app.cfg.yolo = true
+		testApp.app.cfg.maxGoalIterations = 2
+		session, err := testApp.app.newInteractiveSession([]types.Message{{Role: "system", Content: "test"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stopped := testApp.app.runGoal(context.Background(), session, ""); stopped {
+			t.Fatal("bare goal unexpectedly stopped the REPL")
+		}
+		if len(testApp.userPrompts()) != 0 {
+			t.Fatalf("empty recovery goal called provider: %#v", testApp.userPrompts())
+		}
+	})
+	t.Run("completed", func(t *testing.T) {
+		testApp := newInteractiveTurnTestAppWithResponses(t,
+			chatTurnResponse("", "", []map[string]any{goalToolCall("claim", toolCompleteGoal, `{"summary":"resumed","evidence":["final checklist was already complete"]}`)}),
+			chatTurnResponse("resumed", "", nil),
+		)
+		testApp.app.cfg.yolo = true
+		testApp.app.cfg.maxGoalIterations = 2
+		session, err := testApp.app.newInteractiveSession([]types.Message{{Role: "system", Content: "test"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		session.todos = []todoItem{{ID: "done", Content: "already done", Status: todoStatusCompleted}}
+		syncRuntimeTodos(session)
+		if stopped := testApp.app.runGoal(context.Background(), session, ""); stopped {
+			t.Fatal("bare goal unexpectedly stopped the REPL")
+		}
+		if len(testApp.userPrompts()) != 2 || session.activeGoal == nil || !validGoalCompletion(session.activeGoal, session.todos) {
+			t.Fatalf("completed recovery did not establish handshake: calls=%#v goal=%#v", testApp.userPrompts(), session.activeGoal)
+		}
+	})
 }
 
 func TestGoalStopsAfterTwoUnchangedIncompleteSnapshots(t *testing.T) {

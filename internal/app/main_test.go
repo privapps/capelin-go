@@ -1064,13 +1064,13 @@ func TestConfigFileCreatedWithDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readConfigFile: %v", err)
 	}
-	if cfg["ENDPOINT"] != "http://localhost:8235/v1/chat/completions" {
+	if cfg["ENDPOINT"] != "https://opencode.ai/zen/v1/chat/completions" {
 		t.Fatalf("unexpected ENDPOINT: %q", cfg["ENDPOINT"])
 	}
-	if cfg["MODEL"] != "gpt-5-mini" {
+	if cfg["MODEL"] != "deepseek-v4-flash-free" {
 		t.Fatalf("unexpected MODEL: %q", cfg["MODEL"])
 	}
-	if cfg["REASONING_EFFORT"] != "medium" {
+	if cfg["REASONING_EFFORT"] != "high" {
 		t.Fatalf("unexpected REASONING_EFFORT: %q", cfg["REASONING_EFFORT"])
 	}
 }
@@ -2303,23 +2303,20 @@ func TestFinalOnlySinkSuppressesToolAndSystemOutput(t *testing.T) {
 	}
 }
 
-func TestFormatToolCallDisplayTruncatesArgumentsTo180Characters(t *testing.T) {
+func TestFormatToolCallDisplayUsesBoundedSemanticArguments(t *testing.T) {
 	args := strings.Repeat("é", 200)
 	got := formatToolCallDisplay("read_file", args)
 
-	want := "[tool] read_file(" + strings.Repeat("é", 177) + "...)\n"
-	if got != want {
-		t.Fatalf("unexpected tool display:\n got: %q\nwant: %q", got, want)
+	if !strings.HasPrefix(got, "[tool] read_file arguments=") || !strings.HasSuffix(got, "...\n") {
+		t.Fatalf("unexpected bounded tool display: %q", got)
 	}
-
-	displayedArgs := strings.TrimSuffix(strings.TrimPrefix(got, "[tool] read_file("), ")\n")
-	if len([]rune(displayedArgs)) != toolDisplayMaxChars {
-		t.Fatalf("expected %d displayed argument characters, got %d", toolDisplayMaxChars, len([]rune(displayedArgs)))
+	if len([]rune(strings.TrimSuffix(got, "\n"))) != toolDisplayMaxChars {
+		t.Fatalf("expected %d displayed runes, got %d", toolDisplayMaxChars, len([]rune(strings.TrimSuffix(got, "\n"))))
 	}
 }
 
-func TestFormatToolCallDisplayPreservesShortArguments(t *testing.T) {
-	if got, want := formatToolCallDisplay("list_files", `{"path":"."}`), "[tool] list_files({\"path\":\".\"})\n"; got != want {
+func TestFormatToolCallDisplayUsesReadableKeyValueArguments(t *testing.T) {
+	if got, want := formatToolCallDisplay("list_files", `{"path":".","recursive":true}`), "[tool] list_files path=. recursive=true\n"; got != want {
 		t.Fatalf("unexpected tool display: got %q, want %q", got, want)
 	}
 }

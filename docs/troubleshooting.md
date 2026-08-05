@@ -15,10 +15,12 @@ If the URL ends in `/responses`, Capelin uses the Responses request format. Othe
 The built-in endpoint is:
 
 ```text
-http://localhost:8235/v1/chat/completions
+https://opencode.ai/zen/v1/chat/completions
 ```
 
-That service is not started by Capelin. Set `ENDPOINT` to the URL of the AI service you intend to use, and set `TOKEN` if that service requires a token.
+Set `ENDPOINT`, `MODEL`, or `TOKEN` to the values for another AI service if
+needed. The built-in model is `deepseek-v4-flash-free` and the built-in token is
+`public`.
 
 ## I see `model request failed`
 
@@ -146,14 +148,17 @@ snapshot is reported instead of silently selecting another conversation.
 ## A goal is reported incomplete
 
 `/goal` requires `--yolo` and an authoritative non-empty `update_todos`
-checklist. Success requires every checklist item to have status `completed`.
-Provider or tool errors, cancellation, cancelled items, an empty checklist, two
-unchanged incomplete checklist snapshots, three consecutive recoverable-tool
-error turns, and the outer iteration limit all produce an incomplete outcome.
-Deterministic tool errors are normally returned to the model so it can correct
-the next call; persistent provider, persistence, cancellation, and runtime
-errors stop the goal immediately. Use bare `/goal` to continue a saved
-incomplete checklist, or start a new objective with `/goal <objective>`.
+checklist. Success requires every checklist item to have status `completed` and
+a valid goal-only `complete_goal` call with a non-empty summary and evidence
+list. A completed checklist without the handshake is not success and remains
+resumable. Provider or tool errors, cancellation, cancelled items, an empty
+checklist, two unchanged checklist snapshots, three consecutive
+recoverable-tool-error turns, and the outer iteration limit all produce an
+incomplete outcome. Deterministic tool errors are normally returned to the
+model so it can correct the next call; persistent provider, persistence,
+cancellation, and runtime errors stop the goal immediately. Use bare `/goal` to
+continue the saved active objective, or start a new objective with
+`/goal <objective>`.
 
 Set the outer limit independently with `--max-goal-iterations N` or
 `MAX_GOAL_ITERATIONS`. This does not change the normal per-turn

@@ -62,6 +62,12 @@ Every ordinary line is sent as a new turn. Follow-up questions can refer to earl
 
 - `/exit` or `/quit` closes the session without sending the command to the assistant.
 - `/save` writes the latest successful text answer to `last-response.md` in the current working folder. It replaces that file if it already exists.
+- `/compact` asks the configured model for a no-tools summary of retained
+  history. It accepts no arguments, preserves the system prompt, session
+  metadata, and checklist, clears provider continuation and loaded-skill
+  bookkeeping, and supports the existing cancellation controls. A provider,
+  validation, cancellation, or persistence failure leaves the prior session
+  unchanged. Compaction is an explicit command; it is not automatic.
 - `/session-new [prompt]` saves the current session, creates a blank one, and
   optionally submits `prompt` as its first normal turn.
 - `/session-list` lists valid saved UUIDs newest-first and marks the current
@@ -78,17 +84,21 @@ Sessions are persisted atomically in `.capelin-go/sessions/`. Use
 the newest valid snapshot. On exit, Capelin prints only the current UUID and a
 `--resume <id>` continuation hint.
 
-The goal loop is bounded to 20 outer iterations by default. Set
+The goal loop is bounded to 20 outer iterations by default, or 200 when
+`--yolo` is active without an explicit override. Set
 `--max-goal-iterations N` or `MAX_GOAL_ITERATIONS`; this is independent of the
-per-turn `--max-iterations` limit. A goal is complete only when the
-authoritative `update_todos` checklist is non-empty and every item is
-`completed`. Deterministic tool errors—such as a missing path, invalid
-arguments, a disabled tool, or a failed command—are returned to the model as
-recoverable results. The model can correct the call and continue. Tool-scoped
-timeouts retain one bounded retry. Provider failures, parent cancellation,
-persistence failures, and unrecoverable runtime errors stop with an explicit
-incomplete outcome; three consecutive recoverable-error turns also activate a
-bounded recovery guard. Resume with bare `/goal` after an interruption.
+per-turn `--max-iterations` limit (ordinary default 40, YOLO fallback 256). A goal is complete only when the
+authoritative `update_todos` checklist is non-empty, every item is `completed`,
+and the model makes a valid goal-only `complete_goal` call containing a
+non-empty summary and evidence list. A completed checklist without the
+handshake is progress, not success; Capelin requests another continuation and
+eventually reports an explicit incomplete safeguard outcome. Later checklist
+changes and new objectives invalidate prior claims. Deterministic tool
+errors—such as a missing path, invalid arguments, a disabled tool, or a failed
+command—are returned to the model as recoverable results. Provider failures,
+parent cancellation, persistence failures, and unrecoverable runtime errors
+stop with an explicit incomplete outcome while retaining the active objective
+for bare `/goal` resume. Tool-scoped timeouts retain one bounded retry.
 
 ### Reasoning and resumed turns
 
@@ -110,7 +120,16 @@ The command prompt supports Tab completion for slash commands and local skill na
 
 `exit` and `quit` without a leading slash are ordinary prompts sent to the model.
 
-On compatible Unix-like terminals, pasting several lines submits them as one request while keeping the line breaks. Piped input and fallback input remain line-based.
+On compatible Unix-like terminals, pasting inserts the content into the current prompt without submitting it. Press Enter to send it; multiline paste keeps its line breaks. Piped input and fallback input remain line-based.
+
+While a model or tool turn is running, the prompt shows
+`[busy — Esc Esc cancels] > `. Printable and multiline editing remain available,
+but Enter and local commands are rejected and the draft is restored instead of
+being queued. Press Escape twice, or Ctrl+C, to cancel; the prompt shows
+`[cancelling…] > ` until the worker exits, then returns to idle. Background
+assistant and tool output redraws the prompt safely. Fallback input reports busy
+status and rejects lines until the turn ends; it does not provide editable
+drafts or Escape-twice cancellation.
 
 ### Keyboard controls
 
@@ -124,8 +143,10 @@ On compatible Unix-like terminals, pasting several lines submits them as one req
 | Ctrl+K | Delete to the end of the line |
 | Ctrl+U | Clear the line |
 | Ctrl+J | Submit the line |
-| Ctrl+C on a non-empty line | Clear the line and try again |
-| Ctrl+C on an empty line | Exit the session |
+| Ctrl+C while busy | Cancel the active turn and keep the session open |
+| Ctrl+C on a non-empty idle line | Clear the line and try again |
+| Ctrl+C on an empty idle line | Exit the session |
+| Escape twice while busy | Cancel the active turn and keep the session open |
 | Ctrl+D | Exit the session |
 | Ctrl+L | Clear the screen |
 
@@ -179,15 +200,15 @@ Common settings:
 
 | Setting | Purpose | Default |
 | --- | --- | --- |
-| `ENDPOINT` | Complete AI service URL | `http://localhost:8235/v1/chat/completions` |
-| `MODEL` | Model name sent to the service | `gpt-5-mini` |
-| `TOKEN` | Optional token for the AI service | empty |
-| `REASONING_EFFORT` | Reasoning setting passed to the service | `medium` |
+| `ENDPOINT` | Complete AI service URL | `https://opencode.ai/zen/v1/chat/completions` |
+| `MODEL` | Model name sent to the service | `deepseek-v4-flash-free` |
+| `TOKEN` | Token for the AI service | `public` |
+| `REASONING_EFFORT` | Reasoning setting passed to the service | `high` |
 | `SYSTEM_PROMPT` | Extra instructions for the assistant | built-in instructions |
-| `MAX_ITERATIONS` | Maximum tool-use rounds for the main task | `40` |
-| `MAX_GOAL_ITERATIONS` | Maximum outer iterations for a YOLO `/goal` | `20` |
-| `TOOL_MAX_PARALLEL` | Maximum tools used at the same time | `8` |
-| `TOOL_TIMEOUT_SECONDS` | Default time allowed for one tool | `60` |
+| `MAX_ITERATIONS` | Maximum tool-use rounds for the main task | `40` (`256` YOLO fallback) |
+| `MAX_GOAL_ITERATIONS` | Maximum outer iterations for a YOLO `/goal` | `20` (`200` YOLO fallback) |
+| `TOOL_MAX_PARALLEL` | Maximum tools used at the same time | `8` (`16` YOLO fallback) |
+| `TOOL_TIMEOUT_SECONDS` | Default time allowed for one tool | `60` (`300` YOLO fallback) |
 | `TOOL_RETRY_ON_TIMEOUT` | Retry a tool once after a timeout | `true` |
 
 Set reasoning to `none` or `nil` to leave it out of the request.
@@ -211,6 +232,13 @@ If the endpoint path ends in `/responses`, Capelin uses the Responses request fo
 ```
 
 Optional tools are `write_file`, `edit_file`, `append_file`, `execute_program`, and `execute_skill`. Read-only tools and worker-assistant tools are available without an `--allow-tool` flag in local mode. See [Tools and safety](tools-and-safety.md).
+
+YOLO also uses larger bounded worker fallbacks: depth `2`, parallel workers
+`8`, worker iterations `100`, aggregate output `48000` characters, and a
+`600`-second worker timeout. Flags and environment settings take precedence;
+custom saved values are preserved, while saved values equal to ordinary
+defaults are treated as uncustomized for YOLO. The generated config file keeps
+the ordinary provider and limit defaults.
 
 ## Worker assistants
 

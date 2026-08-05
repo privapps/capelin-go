@@ -55,21 +55,32 @@ type agentRuntime struct {
 	model             string
 	reasoning         string
 
-	todosMu      sync.RWMutex
-	todos        []todoItem
-	todosChanged func([]todoItem)
-	toolErrorMu  sync.Mutex
-	fatalError   error
-	recoveryErr  error
+	todosMu        sync.RWMutex
+	todos          []todoItem
+	todosChanged   func([]todoItem)
+	toolErrorMu    sync.Mutex
+	fatalError     error
+	recoveryErr    error
+	goalMu         sync.Mutex
+	goalEnabled    bool
+	goalGeneration uint64
+	goalClaim      *goalCompletion
 }
 
 func (r *agentRuntime) replaceTodos(todos []todoItem) {
 	updated := cloneTodos(todos)
+	// Serialize checklist replacement with completion-claim publication. If
+	// todosMu were released before the claim was cleared, an old claim could be
+	// published after an identical replacement and its fingerprint would look
+	// current again.
+	r.goalMu.Lock()
 	r.todosMu.Lock()
 	r.todos = updated
 	changed := r.todosChanged
 	callbackTodos := cloneTodos(updated)
 	r.todosMu.Unlock()
+	r.goalClaim = nil
+	r.goalMu.Unlock()
 	if changed != nil {
 		changed(callbackTodos)
 	}
@@ -129,6 +140,83 @@ func (r *agentRuntime) hadRecoverableToolError() bool {
 	r.toolErrorMu.Lock()
 	defer r.toolErrorMu.Unlock()
 	return r.recoveryErr != nil
+}
+
+func (r *agentRuntime) enableGoal(generation uint64) {
+	if r == nil {
+		return
+	}
+	r.goalMu.Lock()
+	r.goalEnabled = true
+	r.goalGeneration = generation
+	r.goalClaim = nil
+	r.goalMu.Unlock()
+}
+
+func (r *agentRuntime) disableGoal() {
+	if r == nil {
+		return
+	}
+	r.goalMu.Lock()
+	r.goalEnabled = false
+	r.goalGeneration = 0
+	r.goalClaim = nil
+	r.goalMu.Unlock()
+}
+
+func (r *agentRuntime) goalIsEnabled() bool {
+	if r == nil {
+		return false
+	}
+	r.goalMu.Lock()
+	defer r.goalMu.Unlock()
+	return r.goalEnabled
+}
+
+func (r *agentRuntime) recordGoalClaim(summary string, evidence []string) error {
+	if r == nil {
+		return errors.New("goal completion capability is unavailable")
+	}
+	r.goalMu.Lock()
+	defer r.goalMu.Unlock()
+	if !r.goalEnabled {
+		return errors.New("complete_goal is available only during an autonomous goal")
+	}
+	r.todosMu.RLock()
+	todos := cloneTodos(r.todos)
+	r.todosMu.RUnlock()
+	claim := &goalCompletion{
+		Summary:              strings.TrimSpace(summary),
+		Evidence:             append([]string(nil), evidence...),
+		Generation:           r.goalGeneration,
+		ChecklistFingerprint: todosFingerprint(todos),
+	}
+	r.goalClaim = claim
+	return nil
+}
+
+func (r *agentRuntime) invalidateGoalClaim() {
+	if r == nil {
+		return
+	}
+	r.goalMu.Lock()
+	r.goalClaim = nil
+	r.goalMu.Unlock()
+}
+
+func (r *agentRuntime) goalGenerationValue() uint64 {
+	r.goalMu.Lock()
+	defer r.goalMu.Unlock()
+	return r.goalGeneration
+}
+
+func (r *agentRuntime) snapshotGoalClaim() *goalCompletion {
+	if r == nil {
+		return nil
+	}
+	r.goalMu.Lock()
+	defer r.goalMu.Unlock()
+	return cloneGoalCompletion(r.goalClaim)
 }
 
 // The old names remain local compatibility helpers for callers that only

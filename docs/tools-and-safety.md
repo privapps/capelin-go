@@ -118,15 +118,27 @@ and `/session-rename <name>` to assign a durable label. A bare
 
 The `update_todos` tool replaces the complete ordered checklist. Valid statuses
 are `pending`, `in_progress`, `completed`, and `cancelled`. A YOLO `/goal`
-requires a non-empty checklist with every item completed before it reports
-success. Deterministic tool failures (for example missing paths, invalid
-arguments, disabled tools, and failed commands) are returned to the model as
-recoverable results. Provider failures, cancellation, persistence failures,
-stalled checklists, and iteration exhaustion are reported as incomplete. Three
-consecutive recoverable-error turns also activate a bounded recovery guard.
-Goal execution is bounded independently from normal tool iterations by
-`--max-goal-iterations N` or `MAX_GOAL_ITERATIONS` (default `20`). Resume an
-interrupted checklist with bare `/goal`.
+requires a non-empty checklist with every item completed and a goal-only
+`complete_goal` call containing a non-empty summary and evidence list before it
+reports success. The completion claim is tied to the current goal generation
+and final checklist; a later checklist replacement or new objective invalidates
+it. Deterministic tool failures (for example missing paths, invalid arguments,
+disabled tools, and failed commands) are returned to the model as recoverable
+results. Provider failures, cancellation, persistence failures, stalled
+checklists, and iteration exhaustion are reported as incomplete and retain the
+active objective for bare `/goal` resume. Three consecutive recoverable-error
+turns also activate a bounded recovery guard. Goal execution is bounded
+independently from normal tool iterations by `--max-goal-iterations N` or
+`MAX_GOAL_ITERATIONS` (default `20`, YOLO fallback `200`).
+
+YOLO budget fallbacks are larger but still bounded: root tool-use iterations
+`256`, goal-loop iterations `200`, worker depth `2`, worker parallelism `8`,
+worker tool-use iterations `100`, worker aggregate output `48000` characters,
+tool parallelism `16`, and per-tool timeout `300` seconds. Explicit flags and
+environment settings override these fallbacks. Customized saved values remain
+in effect; saved values equal to ordinary built-in defaults are treated as
+un-customized in YOLO mode. The generated settings file always retains the
+ordinary defaults.
 
 The default mode favors reading, research, and controlled workspace access. Use repeatable `--allow-tool` flags for specific actions that change files or run programs.
 

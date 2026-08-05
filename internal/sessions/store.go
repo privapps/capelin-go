@@ -33,6 +33,19 @@ type Todo struct {
 	Status  string `json:"status"`
 }
 
+type GoalCompletion struct {
+	Summary              string   `json:"summary"`
+	Evidence             []string `json:"evidence"`
+	Generation           uint64   `json:"generation"`
+	ChecklistFingerprint string   `json:"checklistFingerprint"`
+}
+
+type Goal struct {
+	Objective  string          `json:"objective"`
+	Generation uint64          `json:"generation"`
+	Completion *GoalCompletion `json:"completion,omitempty"`
+}
+
 // Snapshot is the stable, provider-neutral representation of an interactive
 // conversation. Optional metadata is deliberately retained for old snapshots.
 type Snapshot struct {
@@ -46,6 +59,7 @@ type Snapshot struct {
 	MessageCount  int                          `json:"messageCount"`
 	Messages      []contracts.Message          `json:"messages"`
 	Todos         []Todo                       `json:"todos"`
+	ActiveGoal    *Goal                        `json:"activeGoal,omitempty"`
 	ProviderState *contracts.ContinuationState `json:"providerState,omitempty"`
 }
 
@@ -69,6 +83,7 @@ func (s *Snapshot) UnmarshalJSON(data []byte) error {
 		MessageCount         int                 `json:"messageCount"`
 		Messages             []contracts.Message `json:"messages"`
 		Todos                []Todo              `json:"todos"`
+		ActiveGoal           *Goal               `json:"activeGoal"`
 		ProviderStateRaw     json.RawMessage     `json:"providerState"`
 		ContinuationStateRaw json.RawMessage     `json:"continuationState"`
 		ProviderStateSnake   json.RawMessage     `json:"provider_state"`
@@ -104,6 +119,7 @@ func (s *Snapshot) UnmarshalJSON(data []byte) error {
 	s.MessageCount = wire.MessageCount
 	s.Messages = wire.Messages
 	s.Todos = wire.Todos
+	s.ActiveGoal = cloneGoal(wire.ActiveGoal)
 	stateRaw := wire.ProviderStateRaw
 	if len(stateRaw) == 0 {
 		stateRaw = wire.ContinuationStateRaw
@@ -186,6 +202,7 @@ func (s *Store) Save(snapshot Snapshot) error {
 	}
 	snapshot.Messages = cloneMessages(snapshot.Messages)
 	snapshot.ProviderState = cloneProviderState(snapshot.ProviderState)
+	snapshot.ActiveGoal = cloneGoal(snapshot.ActiveGoal)
 	if snapshot.Topic == "" {
 		snapshot.Topic = deriveTopic(snapshot.Messages)
 	}
@@ -384,6 +401,19 @@ func ValidateTodos(todos []Todo) error {
 		}
 	}
 	return nil
+}
+
+func cloneGoal(goal *Goal) *Goal {
+	if goal == nil {
+		return nil
+	}
+	clone := *goal
+	if goal.Completion != nil {
+		completion := *goal.Completion
+		completion.Evidence = append([]string(nil), goal.Completion.Evidence...)
+		clone.Completion = &completion
+	}
+	return &clone
 }
 
 func (s *Store) pathFor(id string) string { return filepath.Join(s.Directory(), id+snapshotSuffix) }

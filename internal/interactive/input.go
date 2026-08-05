@@ -50,6 +50,70 @@ type ModifiedEnterReader struct {
 	readBuf           [4096]byte
 }
 
+// DoubleEscapeReader translates two adjacent standalone Escape bytes into a
+// Ctrl+C byte. Escape-prefixed navigation and Alt-key sequences are passed
+// through unchanged because their second byte is not another Escape.
+type DoubleEscapeReader struct {
+	reader            io.Reader
+	output, candidate []byte
+	err               error
+	readBuf           [4096]byte
+}
+
+func NewDoubleEscapeReader(reader io.Reader) *DoubleEscapeReader {
+	return &DoubleEscapeReader{reader: reader}
+}
+
+func (r *DoubleEscapeReader) Close() error {
+	if closer, ok := r.reader.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
+func (r *DoubleEscapeReader) Read(p []byte) (int, error) {
+	for len(r.output) == 0 && r.err == nil {
+		n, err := r.reader.Read(r.readBuf[:])
+		for _, b := range r.readBuf[:n] {
+			r.feed(b)
+		}
+		if err != nil {
+			if len(r.candidate) > 0 {
+				r.output = append(r.output, '\x1b')
+				r.candidate = r.candidate[:0]
+			}
+			r.err = err
+		}
+		if n == 0 && err == nil {
+			return 0, nil
+		}
+	}
+	if len(r.output) > 0 {
+		n := copy(p, r.output)
+		r.output = r.output[n:]
+		return n, nil
+	}
+	return 0, r.err
+}
+
+func (r *DoubleEscapeReader) feed(b byte) {
+	if len(r.candidate) == 0 {
+		if b == '\x1b' {
+			r.candidate = append(r.candidate, b)
+			return
+		}
+		r.output = append(r.output, b)
+		return
+	}
+	if b == '\x1b' {
+		r.output = append(r.output, '\x03')
+		r.candidate = r.candidate[:0]
+		return
+	}
+	r.output = append(r.output, '\x1b', b)
+	r.candidate = r.candidate[:0]
+}
+
 func NewModifiedEnterReader(reader io.Reader) *ModifiedEnterReader {
 	return &ModifiedEnterReader{reader: reader}
 }
@@ -196,7 +260,7 @@ func (r *BracketedPasteReader) feed(b byte) {
 			r.candidate = r.candidate[:0]
 			if r.inPaste {
 				r.inPaste = false
-				r.output = append(r.output, PasteEnd, '\r')
+				r.output = append(r.output, PasteEnd)
 			} else {
 				r.inPaste = true
 				r.output = append(r.output, PasteStart)
@@ -400,16 +464,39 @@ func EnableBracketedPaste() func() {
 	return func() { _, _ = io.WriteString(readline.Stderr, "\x1b[?2004l") }
 }
 
-// RunReadlineLoop owns EOF, interrupt, cancellation, and command callback
-// behavior. The application supplies the callback so this package remains
+// ReadlineLoopHooks owns EOF, interrupt, cancellation, and command callback
+// behavior. The application supplies the callbacks so this package remains
 // independent from sessions, agents, tools, and output sinks.
+type ReadlineLoopHooks struct {
+	BeforeRead  func()
+	OnInput     func(string) bool
+	OnInterrupt func(string) bool
+}
+
+// RunReadlineLoop preserves the original loop seam for callers that only need
+// ordinary input handling.
 func RunReadlineLoop(ctx context.Context, rl *readline.Instance, onInput func(string) bool) error {
+	return RunReadlineLoopWithHooks(ctx, rl, ReadlineLoopHooks{OnInput: onInput})
+}
+
+// RunReadlineLoopWithHooks lets an application handle interrupts without
+// making a busy asynchronous turn look like an instruction to exit the REPL.
+func RunReadlineLoopWithHooks(ctx context.Context, rl *readline.Instance, hooks ReadlineLoopHooks) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil
 		}
+		if hooks.BeforeRead != nil {
+			hooks.BeforeRead()
+		}
 		line, err := rl.Readline()
 		if err == readline.ErrInterrupt {
+			if hooks.OnInterrupt != nil {
+				if hooks.OnInterrupt(line) {
+					break
+				}
+				continue
+			}
 			// Ctrl+C on a non-empty line clears it and reprompts. Ctrl+C on
 			// an empty line exits, matching readline's existing contract.
 			if strings.TrimSpace(line) == "" {
@@ -423,7 +510,10 @@ func RunReadlineLoop(ctx context.Context, rl *readline.Instance, onInput func(st
 		if err != nil {
 			return err
 		}
-		if onInput(line) {
+		if hooks.OnInput == nil {
+			continue
+		}
+		if hooks.OnInput(line) {
 			break
 		}
 	}
@@ -441,7 +531,25 @@ func RunFallbackLoop(ctx context.Context, reader io.Reader, prompt io.Writer, on
 		if _, err := io.WriteString(prompt, "\n> "); err != nil {
 			return err
 		}
-		n, err := reader.Read(buffer)
+		type readResult struct {
+			n   int
+			err error
+		}
+		readDone := make(chan readResult, 1)
+		go func() {
+			n, err := reader.Read(buffer)
+			readDone <- readResult{n: n, err: err}
+		}()
+		var result readResult
+		select {
+		case result = <-readDone:
+		case <-ctx.Done():
+			if closer, ok := reader.(io.Closer); ok {
+				_ = closer.Close()
+			}
+			return nil
+		}
+		n, err := result.n, result.err
 		if n > 0 {
 			pending += string(buffer[:n])
 			for {

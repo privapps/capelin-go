@@ -104,6 +104,7 @@ func Build(enabled map[string]bool) []contracts.Tool {
 	appendIf(ReadSubagent, specReadSubagent())
 	appendIf(CancelSubagent, specCancelSubagent())
 	appendIf(UpdateTodos, updateTodosSpec())
+	appendIf(CompleteGoal, completeGoalSpec())
 	slices.SortFunc(result, func(a, b contracts.Tool) int {
 		return strings.Compare(a.Function.Name, b.Function.Name)
 	})
@@ -122,6 +123,7 @@ type Hooks struct {
 	ReadSubagent   func(any, json.RawMessage) (any, error)
 	CancelSubagent func(any, json.RawMessage) (any, error)
 	UpdateTodos    func(any, json.RawMessage) (string, error)
+	CompleteGoal   func(any, json.RawMessage) (string, error)
 	MarshalResult  func(any) (string, error)
 }
 
@@ -297,6 +299,11 @@ func (d Dispatcher) Run(ctx context.Context, runtime any, call contracts.ToolCal
 			return "", errors.New("todo capability is unavailable")
 		}
 		return d.Hooks.UpdateTodos(runtime, []byte(call.Function.Arguments))
+	case CompleteGoal:
+		if d.Hooks.CompleteGoal == nil {
+			return "", errors.New("goal completion capability is unavailable")
+		}
+		return d.Hooks.CompleteGoal(runtime, []byte(call.Function.Arguments))
 	default:
 		return "", fmt.Errorf("unknown tool %q", name)
 	}
@@ -353,6 +360,29 @@ func updateTodosSpec() contracts.Tool {
 	return contracts.Tool{Type: "function", Function: contracts.ToolSpec{Name: UpdateTodos, Description: "Replace the authoritative ordered checklist with the complete current list. Use pending, in_progress, completed, or cancelled for each item.", Parameters: map[string]any{
 		"type": "object", "properties": map[string]any{"todos": map[string]any{"type": "array", "description": "The complete checklist. This replaces the previous list; use an empty array to clear it.", "items": map[string]any{"type": "object", "properties": map[string]any{"id": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}, "source": map[string]any{"type": "string"}, "status": map[string]any{"type": "string", "enum": []string{"pending", "in_progress", "completed", "cancelled"}}}, "required": []string{"id", "content", "status"}, "additionalProperties": false}}}, "required": []string{"todos"}, "additionalProperties": false,
 	}}}
+}
+
+func completeGoalSpec() contracts.Tool {
+	return contracts.Tool{Type: "function", Function: contracts.ToolSpec{
+		Name:        CompleteGoal,
+		Description: "Record an explicit, evidenced declaration that the current autonomous goal is complete. This is provisional until the authoritative checklist is fully completed.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"summary": map[string]any{
+					"type":        "string",
+					"description": "Concise summary of why the current goal is complete",
+				},
+				"evidence": map[string]any{
+					"type":        "array",
+					"description": "Non-empty evidence statements supporting completion",
+					"items":       map[string]any{"type": "string"},
+				},
+			},
+			"required":             []string{"summary", "evidence"},
+			"additionalProperties": false,
+		},
+	}}
 }
 
 func truncateUTF8(value string, maxBytes int) string {

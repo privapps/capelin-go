@@ -16,9 +16,9 @@ import (
 // helpers below.
 
 const (
-	defaultEndpoint      = "http://localhost:8235/v1/chat/completions"
-	defaultModel         = "gpt-5-mini"
-	defaultReasoning     = "medium"
+	defaultEndpoint      = "https://opencode.ai/zen/v1/chat/completions"
+	defaultModel         = "deepseek-v4-flash-free"
+	defaultReasoning     = "high"
 	defaultMaxIterations = 40
 )
 
@@ -28,10 +28,10 @@ const defaultConfigFileContent = `# capelin-go configuration
 # Edit this file to set persistent defaults.
 # Priority: CLI flags > environment variables > this file > built-in defaults.
 
-ENDPOINT = http://localhost:8235/v1/chat/completions
-MODEL = gpt-5-mini
-TOKEN =
-REASONING_EFFORT = medium
+ENDPOINT = https://opencode.ai/zen/v1/chat/completions
+MODEL = deepseek-v4-flash-free
+TOKEN = public
+REASONING_EFFORT = high
 SYSTEM_PROMPT =
 MAX_ITERATIONS = 40
 MAX_GOAL_ITERATIONS = 20

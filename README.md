@@ -70,6 +70,12 @@ Interactive slash commands:
 - `/save` writes the latest successful textual assistant response to
   `last-response.md` in the current working folder, overwriting that file if
   it already exists.
+- `/compact` summarizes the retained conversation history through the configured
+  model without tools. It accepts no arguments, preserves the system prompt and
+  session metadata/checklist, clears provider continuation and previously loaded
+  skill bookkeeping, and can be cancelled. A failed or cancelled compaction
+  leaves the existing session unchanged; compaction is manual and never
+  automatic.
 - `/session-new [prompt]` saves the current conversation and switches to a
   blank session; an optional prompt is sent as its first turn.
 - `/session-list` shows full saved session IDs newest-first and marks the current
@@ -88,15 +94,19 @@ current UUID and a `--resume <id>` hint when it exits. Startup resume accepts
 `./capelin-go -i --resume [ID|PREFIX]` (a bare `--resume` selects the newest
 valid snapshot).
 
-YOLO goal execution is bounded: completion requires a non-empty checklist in
-which every item is `completed`. Deterministic tool errors such as missing
-paths, invalid arguments, disabled tools, and failed commands are returned to
-the model so the goal can recover. Provider failures, cancellation, persistence
-failures, and unrecoverable runtime errors are reported as incomplete. Three
-consecutive recoverable-error turns also stop the goal with an explicit
-incomplete outcome. Configure the outer limit independently with
-`--max-goal-iterations N` or `MAX_GOAL_ITERATIONS` (default 20); this does not
-change `--max-iterations`.
+YOLO goal execution is bounded: completion requires a non-empty authoritative
+checklist in which every item is `completed`, plus a valid goal-only
+`complete_goal` call with a non-empty summary and evidence list. A completed
+checklist without that handshake is progress, not success, and triggers another
+continuation or an explicit incomplete safeguard outcome. The handshake is
+invalidated by later checklist changes or a new objective. Deterministic tool
+errors such as missing paths, invalid arguments, disabled tools, and failed
+commands are returned to the model so the goal can recover. Provider failures,
+cancellation, persistence failures, and unrecoverable runtime errors are
+reported as incomplete and remain resumable with bare `/goal`. Configure the
+outer limit independently with `--max-goal-iterations N` or
+`MAX_GOAL_ITERATIONS` (default 20, YOLO fallback 200); this does not change
+`--max-iterations` (default 40, YOLO fallback 256).
 
 Press Tab after `/` or a partial command to complete or display the available
 slash commands. Bare `exit` and `quit` are ordinary prompts and are sent to
@@ -116,10 +126,21 @@ text.
 Selected skill content is bounded, treated as untrusted task guidance, and
 does not change the existing tool permissions.
 
-On Unix-like terminals that provide bracketed-paste markers, a multiline paste
-is submitted as one prompt with its internal line breaks preserved. Its history
-entry is stored as one safe record and is restored when recalled. Piped input,
-non-TTY sessions, and readline fallback remain line-oriented.
+On Unix-like terminals that provide bracketed-paste markers, pasting inserts the
+content into the current prompt without submitting it. Press Enter to send the
+prompt; multiline paste keeps its internal line breaks, and its history entry
+is stored as one safe record and restored when recalled. Piped input, non-TTY
+sessions, and readline fallback remain line-oriented.
+
+While a model or tool turn is running, the prompt changes to
+`[busy — Esc Esc cancels] > `. You can keep editing a draft, but Enter and
+local commands are rejected and the draft is restored rather than queued. Press
+Escape twice, or Ctrl+C, to cancel the active turn; the prompt shows a
+cancelling state until the worker exits. After success, failure, or cancellation
+the prompt returns to idle. Background assistant and tool output redraws the
+prompt around the draft. Fallback input reports busy status and rejects lines
+until the active turn finishes; it does not provide editable drafts or
+Escape-twice handling.
 
 **Server mode** (OpenAI-compatible proxy):
 
@@ -297,22 +318,31 @@ Enable everything (all tools + unrestricted paths):
 
 - `--server-port PORT` (or `--server PORT`) — start HTTP server on given port (server mode)
 - `--resume [ID|PREFIX]` — resume the newest valid, exact, or unique-prefix interactive session
-- `ENDPOINT` — complete model URL (default: `http://localhost:8235/v1/chat/completions`). When its URL path ends with `/responses` (with an optional trailing slash), capelin-go uses the official OpenAI Responses API schema; all other paths use Chat Completions.
-- `MODEL` — model ID (default: `gpt-5-mini`)
-- `TOKEN` — optional API token
-- `REASONING_EFFORT` — passed through to the model backend; set to `none` or `nil` to omit the field entirely from the request
+- `ENDPOINT` — complete model URL (default: `https://opencode.ai/zen/v1/chat/completions`). When its URL path ends with `/responses` (with an optional trailing slash), capelin-go uses the official OpenAI Responses API schema; all other paths use Chat Completions.
+- `MODEL` — model ID (default: `deepseek-v4-flash-free`)
+- `TOKEN` — API token (default: `public`)
+- `REASONING_EFFORT` — passed through to the model backend (default: `high`); set to `none` or `nil` to omit the field entirely from the request
 - `SYSTEM_PROMPT` (or `systemPrompt`) — prompt override
-- `MAX_ITERATIONS` — root agent tool-call iteration cap (default: 40; overridden by `--max-iterations`); always wraps up gracefully on limit
-- `MAX_GOAL_ITERATIONS` — outer `/goal` iteration cap (default: 20; overridden by `--max-goal-iterations`); applies only to YOLO interactive goals
-- `SUBAGENT_MAX_DEPTH` — maximum subagent nesting depth (default: 1; overridden by `--subagent-max-depth`)
+- `MAX_ITERATIONS` — root agent tool-call iteration cap (ordinary default: 40; YOLO fallback: 256; overridden by `--max-iterations`)
+- `MAX_GOAL_ITERATIONS` — outer `/goal` iteration cap (ordinary default: 20; YOLO fallback: 200; overridden by `--max-goal-iterations`); applies only to YOLO interactive goals
+- `SUBAGENT_MAX_DEPTH` — maximum subagent nesting depth (ordinary default: 1; YOLO fallback: 2; overridden by `--subagent-max-depth`)
 - `SUBAGENT_MAX_CHILDREN` — maximum active subagents (pending/queued/running) a single parent can hold at once (default: 8; overridden by `--subagent-max-children`)
-- `SUBAGENT_MAX_PARALLEL` — maximum concurrently running parallel subagents (default: 4; overridden by `--subagent-max-parallel`)
-- `SUBAGENT_TIMEOUT_SECONDS` — default subagent execution timeout in seconds (default: 300; overridden by `--subagent-timeout-seconds`)
+- `SUBAGENT_MAX_PARALLEL` — maximum concurrently running parallel subagents (ordinary default: 4; YOLO fallback: 8; overridden by `--subagent-max-parallel`)
+- `SUBAGENT_TIMEOUT_SECONDS` — default subagent execution timeout in seconds (default and YOLO fallback: 600; overridden by `--subagent-timeout-seconds`)
 - `SUBAGENT_MAX_RESULT_CHARS` — maximum characters returned per subagent result (default: 8000; overridden by `--subagent-max-result-chars`)
-- `SUBAGENT_MAX_AGGREGATE_CHARS` — maximum total characters across all subagent results in a single turn (default: 12000; overridden by `--subagent-max-aggregate-chars`)
-- `SUBAGENT_MAX_ITERATIONS` — maximum tool-call iterations per subagent (default: 20; overridden by `--subagent-max-iterations`)
+- `SUBAGENT_MAX_AGGREGATE_CHARS` — maximum total characters across all subagent results in a single turn (ordinary default: 12000; YOLO fallback: 48000; overridden by `--subagent-max-aggregate-chars`)
+- `SUBAGENT_MAX_ITERATIONS` — maximum tool-call iterations per subagent (ordinary default: 20; YOLO fallback: 100; overridden by `--subagent-max-iterations`)
 - `SUBAGENT_MODEL` — model ID used for subagents (default: inherits `MODEL`; overridden by `--subagent-model`)
 - `SUBAGENT_REASONING_EFFORT` — reasoning effort for subagents (default: inherits `REASONING_EFFORT`; set to `none` or `nil` to omit; overridden by `--subagent-reasoning-effort`)
+- `TOOL_MAX_PARALLEL` — maximum concurrent tools (ordinary default: 8; YOLO fallback: 16; overridden by `--tool-max-parallel`)
+- `TOOL_TIMEOUT_SECONDS` — per-tool timeout in seconds (ordinary default: 60; YOLO fallback: 300; overridden by `--tool-timeout-seconds`)
+
+When `--yolo` is active, these YOLO values are fallbacks only. CLI flags and
+environment variables always win; saved numeric values that differ from the
+ordinary defaults are preserved. Saved values equal to ordinary defaults are
+treated as uncustomized so a returning YOLO invocation receives the larger
+bounded preset. The generated config file always retains ordinary provider and
+limit defaults.
 
 Reasoning-capable providers can return native reasoning metadata alongside a
 tool call. Capelin replays that metadata in the provider's required format for
@@ -330,10 +360,10 @@ On first run capelin-go creates `~/.local/capelin-go/config.ini` with default va
 # Edit this file to set persistent defaults.
 # Priority: CLI flags > environment variables > this file > built-in defaults.
 
-ENDPOINT = http://localhost:8235/v1/chat/completions
-MODEL = gpt-5-mini
-TOKEN =
-REASONING_EFFORT = medium
+ENDPOINT = https://opencode.ai/zen/v1/chat/completions
+MODEL = deepseek-v4-flash-free
+TOKEN = public
+REASONING_EFFORT = high
 SYSTEM_PROMPT =
 MAX_ITERATIONS = 40
 MAX_GOAL_ITERATIONS = 20
@@ -344,7 +374,7 @@ MAX_GOAL_ITERATIONS = 20
 SUBAGENT_MAX_DEPTH = 1
 SUBAGENT_MAX_CHILDREN = 8
 SUBAGENT_MAX_PARALLEL = 4
-SUBAGENT_TIMEOUT_SECONDS = 300
+SUBAGENT_TIMEOUT_SECONDS = 600
 SUBAGENT_MAX_RESULT_CHARS = 8000
 SUBAGENT_MAX_AGGREGATE_CHARS = 12000
 SUBAGENT_MAX_ITERATIONS = 20
