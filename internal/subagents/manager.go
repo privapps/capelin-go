@@ -108,8 +108,22 @@ type agentRuntime struct {
 	role              agentRole
 	allowedTools      map[string]bool
 	maxToolIterations int
+	executionProfile  RuntimeProfile
 	model             string
 	reasoning         string
+}
+
+// RuntimeProfile carries the selected application budget into a child-agent
+// execution. The manager uses Subagents for child lifecycle limits and keeps
+// the remaining fields available to the application runner for the child's
+// own turn and tool execution.
+type RuntimeProfile struct {
+	MaxIterations      int
+	MaxGoalIterations  int
+	Subagents          Config
+	ToolMaxParallel    int
+	ToolTimeoutSec     int
+	ToolRetryOnTimeout bool
 }
 
 type subagentStatus string
@@ -143,6 +157,8 @@ type subagentSession struct {
 	Error           string
 	Output          string
 	OutputTruncated bool
+	profile         RuntimeProfile
+	limits          subagentRuntimeConfig
 
 	started   bool
 	parentCtx context.Context // inherited from the parent agent's run() call
@@ -163,7 +179,7 @@ type subagentManager struct {
 	nextID         atomic.Uint64
 	sessions       map[string]*subagentSession
 	childrenByNode map[string][]string
-	parallelSem    chan struct{}
+	parallelActive int
 }
 
 // Config controls the lifecycle and resource policy for child agents. The
@@ -182,6 +198,7 @@ type Runtime struct {
 	Role              string
 	AllowedTools      map[string]bool
 	MaxToolIterations int
+	ExecutionProfile  RuntimeProfile
 	Model             string
 	Reasoning         string
 }
@@ -196,6 +213,7 @@ func internalRuntime(runtime *Runtime) *agentRuntime {
 		role:              agentRole(runtime.Role),
 		allowedTools:      cloneAllowedTools(runtime.AllowedTools),
 		maxToolIterations: runtime.MaxToolIterations,
+		executionProfile:  runtime.ExecutionProfile,
 		model:             runtime.Model,
 		reasoning:         runtime.Reasoning,
 	}
@@ -211,6 +229,7 @@ func publicRuntime(runtime *agentRuntime) *Runtime {
 		Role:              string(runtime.role),
 		AllowedTools:      cloneAllowedTools(runtime.allowedTools),
 		MaxToolIterations: runtime.maxToolIterations,
+		ExecutionProfile:  runtime.executionProfile,
 		Model:             runtime.model,
 		Reasoning:         runtime.reasoning,
 	}
@@ -296,7 +315,6 @@ func newSubagentManager(cfg subagentRuntimeConfig, runner subagentRunner) *subag
 		runner:         runner,
 		sessions:       map[string]*subagentSession{},
 		childrenByNode: map[string][]string{},
-		parallelSem:    make(chan struct{}, cfg.MaxParallel),
 	}
 	m.slotCond = sync.NewCond(&m.mu)
 	return m
@@ -324,6 +342,29 @@ func (m *subagentManager) ListAll() []contracts.SubagentNode {
 	return nodes
 }
 
+// profileFor resolves the profile active at a parent runtime. A runtime that
+// predates profile propagation falls back to the manager's ordinary config so
+// existing capability callers retain their established behavior.
+func (m *subagentManager) profileFor(parent *agentRuntime) RuntimeProfile {
+	profile := RuntimeProfile{}
+	if parent != nil {
+		profile = parent.executionProfile
+	}
+	limits := profile.Subagents
+	if limits == (subagentRuntimeConfig{}) {
+		limits = m.cfg
+		if parent != nil && parent.maxToolIterations > 0 {
+			profile.MaxIterations = parent.maxToolIterations
+		}
+	}
+	limits.normalize()
+	profile.Subagents = limits
+	// A child loop is bounded by the selected subagent iteration limit, while
+	// tool and policy limits continue to come from the inherited full profile.
+	profile.MaxIterations = limits.MaxToolIterations
+	return profile
+}
+
 func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args createSubagentArgs) (*subagentSession, error) {
 	if parent == nil {
 		return nil, errors.New("parent runtime is required")
@@ -335,11 +376,13 @@ func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args
 	if question == "" {
 		return nil, errors.New("create_subagent question is required")
 	}
+	profile := m.profileFor(parent)
+	limits := profile.Subagents
 	depth := parent.depth + 1
-	if depth > m.cfg.MaxDepth {
-		return nil, fmt.Errorf("max subagent depth exceeded: requested depth %d, max %d", depth, m.cfg.MaxDepth)
+	if depth > limits.MaxDepth {
+		return nil, fmt.Errorf("max subagent depth exceeded: requested depth %d, max %d", depth, limits.MaxDepth)
 	}
-	timeoutSec, err := m.resolveTimeoutSeconds(args.TimeoutSeconds)
+	timeoutSec, err := m.resolveTimeoutSeconds(args.TimeoutSeconds, limits)
 	if err != nil {
 		return nil, err
 	}
@@ -349,12 +392,12 @@ func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args
 	}
 	waitTimeoutSec := 0
 	if overflowMode == createSubagentOverflowWaitForSlot {
-		waitTimeoutSec, err = m.resolveWaitTimeoutSeconds(args.WaitTimeoutSeconds)
+		waitTimeoutSec, err = m.resolveWaitTimeoutSeconds(args.WaitTimeoutSeconds, limits)
 		if err != nil {
 			return nil, err
 		}
 	}
-	allowed, err := deriveChildAllowedTools(parent.allowedTools, args.AllowedTools, depth, m.cfg.MaxDepth)
+	allowed, err := deriveChildAllowedTools(parent.allowedTools, args.AllowedTools, depth, limits.MaxDepth)
 	if err != nil {
 		return nil, err
 	}
@@ -362,11 +405,11 @@ func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for m.activeChildrenLocked(parent.sessionID) >= m.cfg.MaxChildren {
+	for m.activeChildrenLocked(parent.sessionID) >= limits.MaxChildren {
 		if overflowMode == createSubagentOverflowFailFast {
-			return nil, fmt.Errorf("max children exceeded for parent %q (%d)", parent.sessionID, m.cfg.MaxChildren)
+			return nil, fmt.Errorf("max children exceeded for parent %q (%d)", parent.sessionID, limits.MaxChildren)
 		}
-		if err := m.waitForChildSlotLocked(ctx, parent.sessionID, waitTimeoutSec); err != nil {
+		if err := m.waitForChildSlotLocked(ctx, parent.sessionID, waitTimeoutSec, limits.MaxChildren); err != nil {
 			return nil, err
 		}
 	}
@@ -383,12 +426,14 @@ func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args
 		ExecutionMode: strings.ToLower(strings.TrimSpace(args.ExecutionMode)),
 		AllowedTools:  allowed,
 		Timeout:       time.Duration(timeoutSec) * time.Second,
+		profile:       profile,
+		limits:        limits,
 		CreatedAt:     now,
 		Status:        subagentStatusPending,
 		done:          make(chan struct{}),
 	}
 	if session.ExecutionMode == "" {
-		if m.cfg.MaxParallel > 1 {
+		if limits.MaxParallel > 1 {
 			session.ExecutionMode = "parallel"
 		} else {
 			session.ExecutionMode = "sequential"
@@ -467,17 +512,70 @@ func (m *subagentManager) run(ctx context.Context, parent *agentRuntime, args ru
 	return queued, nil
 }
 
+func (m *subagentManager) acquireParallel(session *subagentSession) bool {
+	ctx := session.parentCtx
+	stopCtxWatch := make(chan struct{})
+	if ctx != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				m.mu.Lock()
+				m.slotCond.Broadcast()
+				m.mu.Unlock()
+			case <-stopCtxWatch:
+			}
+		}()
+	}
+	defer close(stopCtxWatch)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for m.parallelActive >= session.limits.MaxParallel {
+		if session.Status == subagentStatusCancelled || (ctx != nil && ctx.Err() != nil) {
+			return false
+		}
+		m.slotCond.Wait()
+	}
+	if session.Status == subagentStatusCancelled || (ctx != nil && ctx.Err() != nil) {
+		return false
+	}
+	m.parallelActive++
+	return true
+}
+
+func (m *subagentManager) releaseParallel() {
+	m.mu.Lock()
+	if m.parallelActive > 0 {
+		m.parallelActive--
+	}
+	m.slotCond.Broadcast()
+	m.mu.Unlock()
+}
+
 func (m *subagentManager) execute(session *subagentSession) {
+	parallelAcquired := false
 	if session.ExecutionMode == "sequential" {
 		m.serialMu.Lock()
 	} else {
-		m.parallelSem <- struct{}{}
+		parallelAcquired = m.acquireParallel(session)
+		if !parallelAcquired {
+			m.mu.Lock()
+			if !isTerminalSubagentStatus(session.Status) {
+				session.Status = subagentStatusCancelled
+				session.Error = "subagent cancelled before execution"
+				session.FinishedAt = time.Now().UTC()
+				session.closeDone()
+				m.slotCond.Broadcast()
+			}
+			m.mu.Unlock()
+			return
+		}
 	}
 	defer func() {
 		if session.ExecutionMode == "sequential" {
 			m.serialMu.Unlock()
-		} else {
-			<-m.parallelSem
+		} else if parallelAcquired {
+			m.releaseParallel()
 		}
 	}()
 
@@ -502,9 +600,10 @@ func (m *subagentManager) execute(session *subagentSession) {
 		depth:             session.Depth,
 		role:              session.Role,
 		allowedTools:      cloneAllowedTools(session.AllowedTools),
-		maxToolIterations: m.cfg.MaxToolIterations,
-		model:             m.cfg.Model,
-		reasoning:         m.cfg.ReasoningEffort,
+		maxToolIterations: session.profile.MaxIterations,
+		executionProfile:  session.profile,
+		model:             session.limits.Model,
+		reasoning:         session.limits.ReasoningEffort,
 	}
 	output, runErr := m.runner(execCtx, runtime, cloneSession(session))
 
@@ -516,7 +615,7 @@ func (m *subagentManager) execute(session *subagentSession) {
 	defer m.mu.Unlock()
 	session.cancel = nil
 	session.FinishedAt = time.Now().UTC()
-	session.Output, session.OutputTruncated = truncateText(output, m.cfg.MaxResultChars)
+	session.Output, session.OutputTruncated = truncateText(output, session.limits.MaxResultChars)
 
 	switch {
 	case errors.Is(execCtxErr, context.DeadlineExceeded):
@@ -546,6 +645,7 @@ func (m *subagentManager) await(ctx context.Context, parent *agentRuntime, args 
 	if id == "" {
 		return nil, errors.New("await_subagent id is required")
 	}
+	limits := m.profileFor(parent).Subagents
 	m.mu.Lock()
 	session, err := m.getVisibleSessionLocked(parent, id)
 	if err != nil {
@@ -558,8 +658,8 @@ func (m *subagentManager) await(ctx context.Context, parent *agentRuntime, args 
 	waitCtx := ctx
 	var cancel context.CancelFunc
 	if args.TimeoutSeconds > 0 {
-		if args.TimeoutSeconds > m.cfg.MaxTimeoutSec {
-			return nil, fmt.Errorf("await_subagent timeout_seconds exceeds %d", m.cfg.MaxTimeoutSec)
+		if args.TimeoutSeconds > limits.MaxTimeoutSec {
+			return nil, fmt.Errorf("await_subagent timeout_seconds exceeds %d", limits.MaxTimeoutSec)
 		}
 		waitCtx, cancel = context.WithTimeout(ctx, time.Duration(args.TimeoutSeconds)*time.Second)
 		defer cancel()
@@ -660,8 +760,9 @@ func (m *subagentManager) read(parent *agentRuntime, args readSubagentArgs) (any
 		return snap, nil
 	}
 
-	if len(ids) > m.cfg.MaxAggregateCount {
-		return nil, fmt.Errorf("aggregation exceeds max ids (%d)", m.cfg.MaxAggregateCount)
+	limits := m.profileFor(parent).Subagents
+	if len(ids) > limits.MaxAggregateCount {
+		return nil, fmt.Errorf("aggregation exceeds max ids (%d)", limits.MaxAggregateCount)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -674,7 +775,7 @@ func (m *subagentManager) read(parent *agentRuntime, args readSubagentArgs) (any
 		}
 		items = append(items, m.snapshotLocked(session, includeOutput))
 	}
-	aggregate := buildAggregateEnvelope(items, m.cfg.MaxAggregateChars)
+	aggregate := buildAggregateEnvelope(items, limits.MaxAggregateChars)
 	if !includeOutput {
 		for i := range aggregate.Items {
 			aggregate.Items[i].Output = ""
@@ -748,22 +849,22 @@ func (m *subagentManager) isVisibleLocked(parent *agentRuntime, session *subagen
 	return false
 }
 
-func (m *subagentManager) resolveTimeoutSeconds(requested int) (int, error) {
+func (m *subagentManager) resolveTimeoutSeconds(requested int, limits subagentRuntimeConfig) (int, error) {
 	if requested <= 0 {
-		return m.cfg.DefaultTimeoutSec, nil
+		return limits.DefaultTimeoutSec, nil
 	}
-	if requested > m.cfg.MaxTimeoutSec {
-		return 0, fmt.Errorf("timeout_seconds exceeds %d", m.cfg.MaxTimeoutSec)
+	if requested > limits.MaxTimeoutSec {
+		return 0, fmt.Errorf("timeout_seconds exceeds %d", limits.MaxTimeoutSec)
 	}
 	return requested, nil
 }
 
-func (m *subagentManager) resolveWaitTimeoutSeconds(requested int) (int, error) {
+func (m *subagentManager) resolveWaitTimeoutSeconds(requested int, limits subagentRuntimeConfig) (int, error) {
 	if requested <= 0 {
-		return m.cfg.DefaultTimeoutSec, nil
+		return limits.DefaultTimeoutSec, nil
 	}
-	if requested > m.cfg.MaxTimeoutSec {
-		return 0, fmt.Errorf("wait_timeout_seconds exceeds %d", m.cfg.MaxTimeoutSec)
+	if requested > limits.MaxTimeoutSec {
+		return 0, fmt.Errorf("wait_timeout_seconds exceeds %d", limits.MaxTimeoutSec)
 	}
 	return requested, nil
 }
@@ -781,7 +882,7 @@ func (m *subagentManager) activeChildrenLocked(parentID string) int {
 	return count
 }
 
-func (m *subagentManager) waitForChildSlotLocked(ctx context.Context, parentID string, timeoutSec int) error {
+func (m *subagentManager) waitForChildSlotLocked(ctx context.Context, parentID string, timeoutSec, maxChildren int) error {
 	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
 	cancelledByContext := false
 	stopCtxWatch := make(chan struct{})
@@ -799,13 +900,13 @@ func (m *subagentManager) waitForChildSlotLocked(ctx context.Context, parentID s
 	}
 	defer close(stopCtxWatch)
 
-	for m.activeChildrenLocked(parentID) >= m.cfg.MaxChildren {
+	for m.activeChildrenLocked(parentID) >= maxChildren {
 		if cancelledByContext {
 			return fmt.Errorf("wait_for_slot: %w", ctx.Err())
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return fmt.Errorf("wait_for_slot timed out after %ds for parent %q (%d)", timeoutSec, parentID, m.cfg.MaxChildren)
+			return fmt.Errorf("wait_for_slot timed out after %ds for parent %q (%d)", timeoutSec, parentID, maxChildren)
 		}
 		timedOut := false
 		timer := time.AfterFunc(remaining, func() {
@@ -819,8 +920,8 @@ func (m *subagentManager) waitForChildSlotLocked(ctx context.Context, parentID s
 			_ = timer.Stop()
 			return fmt.Errorf("wait_for_slot: %w", ctx.Err())
 		}
-		if !timer.Stop() && timedOut && m.activeChildrenLocked(parentID) >= m.cfg.MaxChildren {
-			return fmt.Errorf("wait_for_slot timed out after %ds for parent %q (%d)", timeoutSec, parentID, m.cfg.MaxChildren)
+		if !timer.Stop() && timedOut && m.activeChildrenLocked(parentID) >= maxChildren {
+			return fmt.Errorf("wait_for_slot timed out after %ds for parent %q (%d)", timeoutSec, parentID, maxChildren)
 		}
 	}
 	return nil
@@ -941,6 +1042,8 @@ func cloneSession(in *subagentSession) *subagentSession {
 		Error:           in.Error,
 		Output:          in.Output,
 		OutputTruncated: in.OutputTruncated,
+		profile:         in.profile,
+		limits:          in.limits,
 		started:         in.started,
 		parentCtx:       in.parentCtx,
 		done:            in.done,

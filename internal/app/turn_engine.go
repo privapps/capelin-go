@@ -68,13 +68,14 @@ func newAppToolCapability(toolset []contracts.Tool, a *app, runtime *agentRuntim
 	if runtime == nil {
 		runtime = a.rootRuntime()
 	}
+	profile := a.runtimeProfileFor(runtime)
 	return appToolCapability{
 		catalog: append([]contracts.Tool(nil), toolset...),
 		runner: appToolRunner{runtime: runtime, runner: agent.NewToolRunner(
 			agent.ToolRunnerConfig{
-				MaxParallel:    a.cfg.toolMaxParallel,
-				Timeout:        time.Duration(a.cfg.toolTimeoutSec) * time.Second,
-				RetryOnTimeout: a.cfg.toolRetryOnTimeout,
+				MaxParallel:    profile.ToolMaxParallel,
+				Timeout:        time.Duration(profile.ToolTimeoutSec) * time.Second,
+				RetryOnTimeout: profile.ToolRetryOnTimeout,
 			},
 			func(ctx context.Context, call contracts.ToolCall) (string, error) {
 				return a.runToolForRuntime(ctx, runtime, call)

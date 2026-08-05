@@ -27,15 +27,15 @@ const (
 )
 
 const (
-	yoloMaxIterations          = 256
-	yoloMaxGoalIterations      = 200
-	yoloSubagentMaxDepth       = 2
-	yoloSubagentMaxParallel    = 8
-	yoloSubagentTimeoutSec     = 600
-	yoloSubagentToolIterations = 100
-	yoloSubagentAggregateChars = 48000
-	yoloToolMaxParallel        = 16
-	yoloToolTimeoutSec         = 300
+	goalMaxIterations          = 256
+	goalMaxGoalIterations      = 64
+	goalSubagentMaxDepth       = 2
+	goalSubagentMaxParallel    = 8
+	goalSubagentTimeoutSec     = 600
+	goalSubagentToolIterations = 100
+	goalSubagentAggregateChars = 48000
+	goalToolMaxParallel        = 16
+	goalToolTimeoutSec         = 300
 )
 
 const defaultSystemPrompt = `You are an execution-focused AI assistant.
@@ -118,6 +118,7 @@ type Config struct {
 	ToolRetryOnTimeout        bool // retry once on timeout (0 = disable; empty = default true)
 	AsyncTimeout              time.Duration
 	Debug                     bool
+	profileSources            profileSources
 }
 
 const (
@@ -160,6 +161,46 @@ type SubagentConfig struct {
 	MaxAggregateChars int
 	Model             string
 	ReasoningEffort   string
+}
+
+// RuntimeProfile contains the bounded resource limits for one execution
+// context. Config.Load always resolves ordinary values into Config; callers
+// that enter a goal can select GoalProfile without mutating global or saved
+// configuration.
+type RuntimeProfile struct {
+	MaxIterations      int
+	MaxGoalIterations  int
+	Subagents          SubagentConfig
+	ToolMaxParallel    int
+	ToolTimeoutSec     int
+	ToolRetryOnTimeout bool
+}
+
+// ExecutionProfile is retained as a descriptive alias for callers that use
+// execution terminology rather than runtime terminology.
+type ExecutionProfile = RuntimeProfile
+
+type settingOrigin uint8
+
+const (
+	settingOriginBuiltIn settingOrigin = iota
+	settingOriginSaved
+	settingOriginEnvironment
+	settingOriginCLI
+)
+
+type profileSources struct {
+	maxIterations             settingOrigin
+	maxGoalIterations         settingOrigin
+	subagentMaxDepth          settingOrigin
+	subagentMaxChildren       settingOrigin
+	subagentMaxParallel       settingOrigin
+	subagentTimeoutSec        settingOrigin
+	subagentMaxResultChars    settingOrigin
+	subagentMaxAggregateChars settingOrigin
+	subagentMaxToolIterations settingOrigin
+	toolMaxParallel           settingOrigin
+	toolTimeoutSec            settingOrigin
 }
 
 func defaultSubagentRuntimeConfig() SubagentConfig {
@@ -228,6 +269,7 @@ func Load(args []string) (Config, error) {
 	finalOnly := false
 	maxIter := 0
 	maxGoalIter := 0
+	numericFlags := map[string]bool{}
 	resumeID := ""
 	resumeRequested := false
 	serverPort := 0
@@ -276,12 +318,14 @@ func Load(args []string) (Config, error) {
 				return Config{}, err
 			}
 			subagentCfg.MaxDepth = value
+			numericFlags["SUBAGENT_MAX_DEPTH"] = true
 		case strings.HasPrefix(arg, "--subagent-max-depth="):
 			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--subagent-max-depth="), "--subagent-max-depth")
 			if err != nil {
 				return Config{}, err
 			}
 			subagentCfg.MaxDepth = value
+			numericFlags["SUBAGENT_MAX_DEPTH"] = true
 		case arg == "--subagent-max-children":
 			if i+1 >= len(args) {
 				return Config{}, errors.New("--subagent-max-children requires a value")
@@ -292,12 +336,14 @@ func Load(args []string) (Config, error) {
 				return Config{}, err
 			}
 			subagentCfg.MaxChildren = value
+			numericFlags["SUBAGENT_MAX_CHILDREN"] = true
 		case strings.HasPrefix(arg, "--subagent-max-children="):
 			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--subagent-max-children="), "--subagent-max-children")
 			if err != nil {
 				return Config{}, err
 			}
 			subagentCfg.MaxChildren = value
+			numericFlags["SUBAGENT_MAX_CHILDREN"] = true
 		case arg == "--subagent-max-parallel":
 			if i+1 >= len(args) {
 				return Config{}, errors.New("--subagent-max-parallel requires a value")
@@ -308,12 +354,14 @@ func Load(args []string) (Config, error) {
 				return Config{}, err
 			}
 			subagentCfg.MaxParallel = value
+			numericFlags["SUBAGENT_MAX_PARALLEL"] = true
 		case strings.HasPrefix(arg, "--subagent-max-parallel="):
 			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--subagent-max-parallel="), "--subagent-max-parallel")
 			if err != nil {
 				return Config{}, err
 			}
 			subagentCfg.MaxParallel = value
+			numericFlags["SUBAGENT_MAX_PARALLEL"] = true
 		case arg == "--subagent-timeout-seconds":
 			if i+1 >= len(args) {
 				return Config{}, errors.New("--subagent-timeout-seconds requires a value")
@@ -324,12 +372,14 @@ func Load(args []string) (Config, error) {
 				return Config{}, err
 			}
 			subagentCfg.DefaultTimeoutSec = value
+			numericFlags["SUBAGENT_TIMEOUT_SECONDS"] = true
 		case strings.HasPrefix(arg, "--subagent-timeout-seconds="):
 			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--subagent-timeout-seconds="), "--subagent-timeout-seconds")
 			if err != nil {
 				return Config{}, err
 			}
 			subagentCfg.DefaultTimeoutSec = value
+			numericFlags["SUBAGENT_TIMEOUT_SECONDS"] = true
 		case arg == "--subagent-max-result-chars":
 			if i+1 >= len(args) {
 				return Config{}, errors.New("--subagent-max-result-chars requires a value")
@@ -340,12 +390,14 @@ func Load(args []string) (Config, error) {
 				return Config{}, err
 			}
 			subagentCfg.MaxResultChars = value
+			numericFlags["SUBAGENT_MAX_RESULT_CHARS"] = true
 		case strings.HasPrefix(arg, "--subagent-max-result-chars="):
 			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--subagent-max-result-chars="), "--subagent-max-result-chars")
 			if err != nil {
 				return Config{}, err
 			}
 			subagentCfg.MaxResultChars = value
+			numericFlags["SUBAGENT_MAX_RESULT_CHARS"] = true
 		case arg == "--subagent-max-aggregate-chars":
 			if i+1 >= len(args) {
 				return Config{}, errors.New("--subagent-max-aggregate-chars requires a value")
@@ -356,12 +408,14 @@ func Load(args []string) (Config, error) {
 				return Config{}, err
 			}
 			subagentCfg.MaxAggregateChars = value
+			numericFlags["SUBAGENT_MAX_AGGREGATE_CHARS"] = true
 		case strings.HasPrefix(arg, "--subagent-max-aggregate-chars="):
 			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--subagent-max-aggregate-chars="), "--subagent-max-aggregate-chars")
 			if err != nil {
 				return Config{}, err
 			}
 			subagentCfg.MaxAggregateChars = value
+			numericFlags["SUBAGENT_MAX_AGGREGATE_CHARS"] = true
 		case arg == "--subagent-max-iterations":
 			if i+1 >= len(args) {
 				return Config{}, errors.New("--subagent-max-iterations requires a value")
@@ -372,12 +426,14 @@ func Load(args []string) (Config, error) {
 				return Config{}, err
 			}
 			subagentCfg.MaxToolIterations = value
+			numericFlags["SUBAGENT_MAX_ITERATIONS"] = true
 		case strings.HasPrefix(arg, "--subagent-max-iterations="):
 			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--subagent-max-iterations="), "--subagent-max-iterations")
 			if err != nil {
 				return Config{}, err
 			}
 			subagentCfg.MaxToolIterations = value
+			numericFlags["SUBAGENT_MAX_ITERATIONS"] = true
 		case arg == "--subagent-model":
 			if i+1 >= len(args) {
 				return Config{}, errors.New("--subagent-Model requires a value")
@@ -424,12 +480,14 @@ func Load(args []string) (Config, error) {
 				return Config{}, err
 			}
 			maxIter = value
+			numericFlags["MAX_ITERATIONS"] = true
 		case strings.HasPrefix(arg, "--max-iterations="):
 			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--max-iterations="), "--max-iterations")
 			if err != nil {
 				return Config{}, err
 			}
 			maxIter = value
+			numericFlags["MAX_ITERATIONS"] = true
 		case arg == "--max-goal-iterations":
 			if i+1 >= len(args) {
 				return Config{}, errors.New("--max-goal-iterations requires a value")
@@ -440,12 +498,14 @@ func Load(args []string) (Config, error) {
 				return Config{}, err
 			}
 			maxGoalIter = value
+			numericFlags["MAX_GOAL_ITERATIONS"] = true
 		case strings.HasPrefix(arg, "--max-goal-iterations="):
 			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--max-goal-iterations="), "--max-goal-iterations")
 			if err != nil {
 				return Config{}, err
 			}
 			maxGoalIter = value
+			numericFlags["MAX_GOAL_ITERATIONS"] = true
 		case arg == "--resume":
 			resumeRequested = true
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
@@ -469,12 +529,14 @@ func Load(args []string) (Config, error) {
 				return Config{}, err
 			}
 			toolMaxParallel = value
+			numericFlags["TOOL_MAX_PARALLEL"] = true
 		case strings.HasPrefix(arg, "--tool-max-parallel="):
 			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--tool-max-parallel="), "--tool-max-parallel")
 			if err != nil {
 				return Config{}, err
 			}
 			toolMaxParallel = value
+			numericFlags["TOOL_MAX_PARALLEL"] = true
 		case arg == "--tool-timeout-seconds":
 			if i+1 >= len(args) {
 				return Config{}, errors.New("--tool-timeout-seconds requires a value")
@@ -485,12 +547,14 @@ func Load(args []string) (Config, error) {
 				return Config{}, err
 			}
 			toolTimeoutSec = value
+			numericFlags["TOOL_TIMEOUT_SECONDS"] = true
 		case strings.HasPrefix(arg, "--tool-timeout-seconds="):
 			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--tool-timeout-seconds="), "--tool-timeout-seconds")
 			if err != nil {
 				return Config{}, err
 			}
 			toolTimeoutSec = value
+			numericFlags["TOOL_TIMEOUT_SECONDS"] = true
 		case arg == "--tool-retry-on-timeout":
 			toolRetryOnTimeout = 1
 		case arg == "--no-tool-retry-on-timeout":
@@ -516,36 +580,36 @@ func Load(args []string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("resolving workspace root: %w", err)
 	}
-	// Resolve numeric settings with flag > environment > saved config > the
-	// active mode's fallback. Saved values equal to an ordinary built-in default
-	// are intentionally treated as uncustomized in YOLO mode. This lets the
-	// generated first-run file remain ordinary while still activating the YOLO
-	// budget on the invocation that requested it.
-	subagentCfg.MaxDepth, err = resolvePositiveSetting("SUBAGENT_MAX_DEPTH", subagentCfg.MaxDepth, fileCfg, defaultSubagentMaxDepth, yoloSubagentMaxDepth, yolo)
+	// Resolve ordinary numeric settings with flag > environment > saved config
+	// > ordinary built-in defaults. The source of each value is retained so a
+	// later goal profile can distinguish an explicit override from a generated
+	// saved baseline without changing this ordinary configuration.
+	var sources profileSources
+	subagentCfg.MaxDepth, sources.subagentMaxDepth, err = resolvePositiveSetting("SUBAGENT_MAX_DEPTH", subagentCfg.MaxDepth, numericFlags["SUBAGENT_MAX_DEPTH"], fileCfg, defaultSubagentMaxDepth)
 	if err != nil {
 		return Config{}, err
 	}
-	subagentCfg.MaxChildren, err = resolvePositiveSetting("SUBAGENT_MAX_CHILDREN", subagentCfg.MaxChildren, fileCfg, defaultSubagentMaxChildren, defaultSubagentMaxChildren, false)
+	subagentCfg.MaxChildren, sources.subagentMaxChildren, err = resolvePositiveSetting("SUBAGENT_MAX_CHILDREN", subagentCfg.MaxChildren, numericFlags["SUBAGENT_MAX_CHILDREN"], fileCfg, defaultSubagentMaxChildren)
 	if err != nil {
 		return Config{}, err
 	}
-	subagentCfg.MaxParallel, err = resolvePositiveSetting("SUBAGENT_MAX_PARALLEL", subagentCfg.MaxParallel, fileCfg, defaultSubagentMaxParallel, yoloSubagentMaxParallel, yolo)
+	subagentCfg.MaxParallel, sources.subagentMaxParallel, err = resolvePositiveSetting("SUBAGENT_MAX_PARALLEL", subagentCfg.MaxParallel, numericFlags["SUBAGENT_MAX_PARALLEL"], fileCfg, defaultSubagentMaxParallel)
 	if err != nil {
 		return Config{}, err
 	}
-	subagentCfg.DefaultTimeoutSec, err = resolvePositiveSetting("SUBAGENT_TIMEOUT_SECONDS", subagentCfg.DefaultTimeoutSec, fileCfg, defaultSubagentDefaultTimeoutSec, yoloSubagentTimeoutSec, yolo)
+	subagentCfg.DefaultTimeoutSec, sources.subagentTimeoutSec, err = resolvePositiveSetting("SUBAGENT_TIMEOUT_SECONDS", subagentCfg.DefaultTimeoutSec, numericFlags["SUBAGENT_TIMEOUT_SECONDS"], fileCfg, defaultSubagentDefaultTimeoutSec)
 	if err != nil {
 		return Config{}, err
 	}
-	subagentCfg.MaxResultChars, err = resolvePositiveSetting("SUBAGENT_MAX_RESULT_CHARS", subagentCfg.MaxResultChars, fileCfg, defaultSubagentResultChars, defaultSubagentResultChars, false)
+	subagentCfg.MaxResultChars, sources.subagentMaxResultChars, err = resolvePositiveSetting("SUBAGENT_MAX_RESULT_CHARS", subagentCfg.MaxResultChars, numericFlags["SUBAGENT_MAX_RESULT_CHARS"], fileCfg, defaultSubagentResultChars)
 	if err != nil {
 		return Config{}, err
 	}
-	subagentCfg.MaxAggregateChars, err = resolvePositiveSetting("SUBAGENT_MAX_AGGREGATE_CHARS", subagentCfg.MaxAggregateChars, fileCfg, defaultSubagentAggregateChars, yoloSubagentAggregateChars, yolo)
+	subagentCfg.MaxAggregateChars, sources.subagentMaxAggregateChars, err = resolvePositiveSetting("SUBAGENT_MAX_AGGREGATE_CHARS", subagentCfg.MaxAggregateChars, numericFlags["SUBAGENT_MAX_AGGREGATE_CHARS"], fileCfg, defaultSubagentAggregateChars)
 	if err != nil {
 		return Config{}, err
 	}
-	subagentCfg.MaxToolIterations, err = resolvePositiveSetting("SUBAGENT_MAX_ITERATIONS", subagentCfg.MaxToolIterations, fileCfg, defaultSubagentToolIterations, yoloSubagentToolIterations, yolo)
+	subagentCfg.MaxToolIterations, sources.subagentMaxToolIterations, err = resolvePositiveSetting("SUBAGENT_MAX_ITERATIONS", subagentCfg.MaxToolIterations, numericFlags["SUBAGENT_MAX_ITERATIONS"], fileCfg, defaultSubagentToolIterations)
 	if err != nil {
 		return Config{}, err
 	}
@@ -575,19 +639,19 @@ func Load(args []string) (Config, error) {
 		subagentCfg.ReasoningEffort = rawSubagentReasoning
 	}
 
-	maxIter, err = resolvePositiveSetting("MAX_ITERATIONS", maxIter, fileCfg, defaultMaxIterations, yoloMaxIterations, yolo)
+	maxIter, sources.maxIterations, err = resolvePositiveSetting("MAX_ITERATIONS", maxIter, numericFlags["MAX_ITERATIONS"], fileCfg, defaultMaxIterations)
 	if err != nil {
 		return Config{}, err
 	}
-	maxGoalIter, err = resolvePositiveSetting("MAX_GOAL_ITERATIONS", maxGoalIter, fileCfg, defaultMaxGoalIterations, yoloMaxGoalIterations, yolo)
+	maxGoalIter, sources.maxGoalIterations, err = resolvePositiveSetting("MAX_GOAL_ITERATIONS", maxGoalIter, numericFlags["MAX_GOAL_ITERATIONS"], fileCfg, defaultMaxGoalIterations)
 	if err != nil {
 		return Config{}, err
 	}
-	toolMaxParallel, err = resolvePositiveSetting("TOOL_MAX_PARALLEL", toolMaxParallel, fileCfg, defaultToolMaxParallel, yoloToolMaxParallel, yolo)
+	toolMaxParallel, sources.toolMaxParallel, err = resolvePositiveSetting("TOOL_MAX_PARALLEL", toolMaxParallel, numericFlags["TOOL_MAX_PARALLEL"], fileCfg, defaultToolMaxParallel)
 	if err != nil {
 		return Config{}, err
 	}
-	toolTimeoutSec, err = resolvePositiveSetting("TOOL_TIMEOUT_SECONDS", toolTimeoutSec, fileCfg, defaultToolTimeoutSec, yoloToolTimeoutSec, yolo)
+	toolTimeoutSec, sources.toolTimeoutSec, err = resolvePositiveSetting("TOOL_TIMEOUT_SECONDS", toolTimeoutSec, numericFlags["TOOL_TIMEOUT_SECONDS"], fileCfg, defaultToolTimeoutSec)
 	if err != nil {
 		return Config{}, err
 	}
@@ -620,35 +684,79 @@ func Load(args []string) (Config, error) {
 		ToolMaxParallel:           toolMaxParallel,
 		ToolTimeoutSec:            toolTimeoutSec,
 		ToolRetryOnTimeout:        toolRetryOnTimeout != 0,
+		profileSources:            sources,
 		Debug:                     debug,
 	}, nil
 }
 
+// OrdinaryProfile returns the limits used by routine turns. It is a value, not
+// shared mutable state, so a caller can derive a goal profile independently.
+func (c Config) OrdinaryProfile() RuntimeProfile {
+	return RuntimeProfile{
+		MaxIterations:      c.MaxIterations,
+		MaxGoalIterations:  c.MaxGoalIterations,
+		Subagents:          c.Subagents,
+		ToolMaxParallel:    c.ToolMaxParallel,
+		ToolTimeoutSec:     c.ToolTimeoutSec,
+		ToolRetryOnTimeout: c.ToolRetryOnTimeout,
+	}
+}
+
+// GoalProfile resolves the bounded goal limits from the same sources as the
+// ordinary profile. Explicit CLI and environment values always carry over;
+// customized saved values carry over too. A saved value equal to the ordinary
+// built-in default is treated as the generated baseline and receives the goal
+// fallback. This method never writes configuration or changes the receiver.
+func (c Config) GoalProfile() RuntimeProfile {
+	ordinary := c.OrdinaryProfile()
+	goal := ordinary
+	goal.MaxIterations = goalSetting(c.MaxIterations, defaultMaxIterations, goalMaxIterations, c.profileSources.maxIterations)
+	goal.MaxGoalIterations = goalSetting(c.MaxGoalIterations, defaultMaxGoalIterations, goalMaxGoalIterations, c.profileSources.maxGoalIterations)
+	goal.Subagents = c.Subagents
+	goal.Subagents.MaxDepth = goalSetting(c.Subagents.MaxDepth, defaultSubagentMaxDepth, goalSubagentMaxDepth, c.profileSources.subagentMaxDepth)
+	goal.Subagents.MaxChildren = goalSetting(c.Subagents.MaxChildren, defaultSubagentMaxChildren, defaultSubagentMaxChildren, c.profileSources.subagentMaxChildren)
+	goal.Subagents.MaxParallel = goalSetting(c.Subagents.MaxParallel, defaultSubagentMaxParallel, goalSubagentMaxParallel, c.profileSources.subagentMaxParallel)
+	goal.Subagents.DefaultTimeoutSec = goalSetting(c.Subagents.DefaultTimeoutSec, defaultSubagentDefaultTimeoutSec, goalSubagentTimeoutSec, c.profileSources.subagentTimeoutSec)
+	goal.Subagents.MaxResultChars = goalSetting(c.Subagents.MaxResultChars, defaultSubagentResultChars, defaultSubagentResultChars, c.profileSources.subagentMaxResultChars)
+	goal.Subagents.MaxAggregateChars = goalSetting(c.Subagents.MaxAggregateChars, defaultSubagentAggregateChars, goalSubagentAggregateChars, c.profileSources.subagentMaxAggregateChars)
+	goal.Subagents.MaxToolIterations = goalSetting(c.Subagents.MaxToolIterations, defaultSubagentToolIterations, goalSubagentToolIterations, c.profileSources.subagentMaxToolIterations)
+	goal.ToolMaxParallel = goalSetting(c.ToolMaxParallel, defaultToolMaxParallel, goalToolMaxParallel, c.profileSources.toolMaxParallel)
+	goal.ToolTimeoutSec = goalSetting(c.ToolTimeoutSec, defaultToolTimeoutSec, goalToolTimeoutSec, c.profileSources.toolTimeoutSec)
+	return goal
+}
+
+func goalSetting(value, ordinaryDefault, goalFallback int, origin settingOrigin) int {
+	if origin == settingOriginCLI || origin == settingOriginEnvironment {
+		return value
+	}
+	if origin == settingOriginSaved && value != ordinaryDefault {
+		return value
+	}
+	if origin == settingOriginBuiltIn && value != ordinaryDefault {
+		return value
+	}
+	return goalFallback
+}
+
 // resolvePositiveSetting applies the shared precedence rules for bounded
-// positive-integer settings. A non-zero flag value is already validated while
-// parsing CLI arguments. Environment and saved-file values are parsed here so
-// explicit invalid values are rejected rather than silently replaced.
-func resolvePositiveSetting(key string, flagValue int, fileCfg map[string]string, ordinary, yoloFallback int, yolo bool) (int, error) {
-	if flagValue > 0 {
-		return flagValue, nil
+// positive-integer settings. Environment and saved-file values are parsed
+// here so explicit invalid values are rejected rather than silently replaced.
+func resolvePositiveSetting(key string, flagValue int, flagSet bool, fileCfg map[string]string, ordinary int) (int, settingOrigin, error) {
+	if flagSet {
+		return flagValue, settingOriginCLI, nil
 	}
 	if raw := strings.TrimSpace(os.Getenv(key)); raw != "" {
-		return parsePositiveInt(raw, key)
+		value, err := parsePositiveInt(raw, key)
+		return value, settingOriginEnvironment, err
 	}
 	if raw := strings.TrimSpace(fileCfg[key]); raw != "" {
 		value, err := parsePositiveInt(raw, key)
 		if err != nil {
-			return 0, err
+			return 0, settingOriginSaved, err
 		}
-		if yolo && value == ordinary {
-			return yoloFallback, nil
-		}
-		return value, nil
+		return value, settingOriginSaved, nil
 	}
-	if yolo {
-		return yoloFallback, nil
-	}
-	return ordinary, nil
+	return ordinary, settingOriginBuiltIn, nil
 }
 
 func parsePositiveInt(raw, flagName string) (int, error) {
@@ -753,6 +861,9 @@ func configFilePath() string {
 const defaultConfigFileContent = `# capelin-go configuration
 # Edit this file to set persistent defaults.
 # Priority: CLI flags > environment variables > this file > built-in defaults.
+# The values below are ordinary baselines. An accepted /goal in a --yolo
+# session resolves a separate in-memory goal-run profile; --yolo alone does
+# not select that profile, and ordinary limits return after the goal stops.
 
 ENDPOINT = https://opencode.ai/zen/v1/chat/completions
 MODEL = deepseek-v4-flash-free
@@ -822,13 +933,19 @@ func ensureConfigFileForMode(serverMode bool) (map[string]string, error) {
 		if err != nil {
 			return map[string]string{}, err
 		}
-		if !serverMode && strings.TrimSpace(existing["ENDPOINT"]) == "" {
-			return map[string]string{}, fmt.Errorf("config file %s is missing ENDPOINT", path)
-		}
 		// File exists: append any keys present in the default template but absent in the file.
 		if err := upsertConfigFileKeys(path); err != nil {
 			// Non-fatal: warn but continue with whatever is in the file.
 			fmt.Fprintf(os.Stderr, "[capelin-go] warning: updating config file: %v\n", err)
+		}
+		if !serverMode && strings.TrimSpace(existing["ENDPOINT"]) == "" {
+			migrated, err := readConfigFile(path)
+			if err != nil {
+				return map[string]string{}, err
+			}
+			if strings.TrimSpace(migrated["ENDPOINT"]) == "" {
+				return map[string]string{}, fmt.Errorf("config file %s is missing ENDPOINT", path)
+			}
 		}
 	}
 

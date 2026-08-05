@@ -84,21 +84,40 @@ Sessions are persisted atomically in `.capelin-go/sessions/`. Use
 the newest valid snapshot. On exit, Capelin prints only the current UUID and a
 `--resume <id>` continuation hint.
 
-The goal loop is bounded to 20 outer iterations by default, or 200 when
-`--yolo` is active without an explicit override. Set
+The ordinary goal-loop baseline is 20 outer iterations. An accepted goal uses
+the separate goal profile's default of 64. Set
 `--max-goal-iterations N` or `MAX_GOAL_ITERATIONS`; this is independent of the
-per-turn `--max-iterations` limit (ordinary default 40, YOLO fallback 256). A goal is complete only when the
-authoritative `update_todos` checklist is non-empty, every item is `completed`,
-and the model makes a valid goal-only `complete_goal` call containing a
-non-empty summary and evidence list. A completed checklist without the
-handshake is progress, not success; Capelin requests another continuation and
-eventually reports an explicit incomplete safeguard outcome. Later checklist
-changes and new objectives invalidate prior claims. Deterministic tool
-errors—such as a missing path, invalid arguments, a disabled tool, or a failed
-command—are returned to the model as recoverable results. Provider failures,
-parent cancellation, persistence failures, and unrecoverable runtime errors
-stop with an explicit incomplete outcome while retaining the active objective
-for bare `/goal` resume. Tool-scoped timeouts retain one bounded retry.
+per-turn `--max-iterations` limit (ordinary default 40; goal profile default
+256). A goal is complete only when the authoritative `update_todos` checklist
+is non-empty, every item is `completed`, and the model makes a valid goal-only
+`complete_goal` call containing a non-empty summary and evidence list. A
+completed checklist without the handshake is progress, not success; Capelin
+requests another continuation and eventually reports an explicit incomplete
+safeguard outcome. Later checklist changes and new objectives invalidate prior
+claims. Deterministic tool errors—such as a missing path, invalid arguments, a
+disabled tool, or a failed command—are returned to the model as recoverable
+results. Provider failures, parent cancellation, persistence failures, and
+unrecoverable runtime errors stop with an explicit incomplete outcome while
+retaining the active objective for bare `/goal` resume. Tool-scoped timeouts
+retain one bounded retry. While an accepted goal turn is active, Capelin emits
+an immediate iteration status and generic working heartbeat (about five
+seconds initially, then every ten seconds) with total and current-turn elapsed
+time.
+
+The four built-in provider defaults are `ENDPOINT=https://opencode.ai/zen/v1/chat/completions`,
+`MODEL=deepseek-v4-flash-free`, `TOKEN=public`, and
+`REASONING_EFFORT=high`. CLI flags override environment settings, which
+override saved `config.ini` values, which override built-in defaults. Saved
+numeric values equal to the ordinary defaults are treated as generated
+baselines when a goal profile is resolved; non-default saved values remain
+customizations. Goal profile resolution is in memory only and never adds
+goal-specific configuration keys.
+
+The goal profile is active only while an accepted `/goal` is running. It is
+recomputed for a resumed active goal from the current in-memory configuration,
+without a persisted budget-mode field, and ordinary limits are restored after
+the goal completes or stops. `--yolo` remains the permission and path-safety
+gate; using `--yolo` without `/goal` keeps ordinary limits.
 
 ### Reasoning and resumed turns
 
@@ -205,10 +224,10 @@ Common settings:
 | `TOKEN` | Token for the AI service | `public` |
 | `REASONING_EFFORT` | Reasoning setting passed to the service | `high` |
 | `SYSTEM_PROMPT` | Extra instructions for the assistant | built-in instructions |
-| `MAX_ITERATIONS` | Maximum tool-use rounds for the main task | `40` (`256` YOLO fallback) |
-| `MAX_GOAL_ITERATIONS` | Maximum outer iterations for a YOLO `/goal` | `20` (`200` YOLO fallback) |
-| `TOOL_MAX_PARALLEL` | Maximum tools used at the same time | `8` (`16` YOLO fallback) |
-| `TOOL_TIMEOUT_SECONDS` | Default time allowed for one tool | `60` (`300` YOLO fallback) |
+| `MAX_ITERATIONS` | Maximum tool-use rounds for the main task | `40` ordinary (`256` goal profile) |
+| `MAX_GOAL_ITERATIONS` | Maximum outer iterations for a YOLO-gated `/goal` | `20` ordinary (`64` goal profile) |
+| `TOOL_MAX_PARALLEL` | Maximum tools used at the same time | `8` ordinary (`16` goal profile) |
+| `TOOL_TIMEOUT_SECONDS` | Default time allowed for one tool | `60` ordinary (`300` goal profile) |
 | `TOOL_RETRY_ON_TIMEOUT` | Retry a tool once after a timeout | `true` |
 
 Set reasoning to `none` or `nil` to leave it out of the request.
@@ -220,7 +239,7 @@ If the endpoint path ends in `/responses`, Capelin uses the Responses request fo
 ```text
 -i, --interactive                 Keep a multi-turn conversation open
 --resume [ID|PREFIX]               Resume newest, exact, or unique-prefix session
---max-goal-iterations N            Set the YOLO `/goal` outer iteration limit
+--max-goal-iterations N            Set the `/goal` outer iteration limit
 --final-only                      Print only the final answer in one-shot mode
 --debug                           Show request and response diagnostics
 --max-iterations N                Set the main task tool-use limit
@@ -233,12 +252,13 @@ If the endpoint path ends in `/responses`, Capelin uses the Responses request fo
 
 Optional tools are `write_file`, `edit_file`, `append_file`, `execute_program`, and `execute_skill`. Read-only tools and worker-assistant tools are available without an `--allow-tool` flag in local mode. See [Tools and safety](tools-and-safety.md).
 
-YOLO also uses larger bounded worker fallbacks: depth `2`, parallel workers
-`8`, worker iterations `100`, aggregate output `48000` characters, and a
-`600`-second worker timeout. Flags and environment settings take precedence;
-custom saved values are preserved, while saved values equal to ordinary
-defaults are treated as uncustomized for YOLO. The generated config file keeps
-the ordinary provider and limit defaults.
+Accepted goals use a separate bounded worker profile: depth `2`, parallel
+workers `8`, worker iterations `100`, aggregate output `48000` characters,
+and a `600`-second worker timeout. Flags and environment settings take
+precedence; custom saved values are preserved, while saved values equal to
+ordinary defaults are treated as generated baselines for goal fallback. Goal
+profile resolution is in memory only. `--yolo` remains the permission and
+safety gate and does not select these budgets by itself.
 
 ## Worker assistants
 

@@ -75,21 +75,26 @@ type config struct {
 	toolMaxParallel    int  // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
 	toolTimeoutSec     int  // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
 	toolRetryOnTimeout bool // retry once on timeout (0 = disable; empty = default true)
+	ordinaryProfile    configpkg.RuntimeProfile
+	goalProfile        configpkg.RuntimeProfile
+	profilesResolved   bool
 	asyncTimeout       time.Duration
 	debug              bool
 }
 
 type app struct {
-	cfg                 config
-	client              *client
-	skills              map[string]skills.Skill
-	toolset             []contracts.Tool
-	subagents           *subagentManager
-	sink                contracts.OutputSink
-	dataStore           *dataStore
-	sessionStore        *sessionStore
-	asyncRunner         func(string, *serverExecutionRequest)
-	interactiveIdleHook func()
+	cfg                       config
+	client                    *client
+	skills                    map[string]skills.Skill
+	toolset                   []contracts.Tool
+	subagents                 *subagentManager
+	sink                      contracts.OutputSink
+	dataStore                 *dataStore
+	sessionStore              *sessionStore
+	asyncRunner               func(string, *serverExecutionRequest)
+	interactiveIdleHook       func()
+	goalHeartbeatInitialDelay time.Duration
+	goalHeartbeatCadence      time.Duration
 }
 
 type interactiveSession struct {
@@ -270,9 +275,52 @@ func loadConfig(args []string) (config, error) {
 		toolMaxParallel:    parsed.ToolMaxParallel,
 		toolTimeoutSec:     parsed.ToolTimeoutSec,
 		toolRetryOnTimeout: parsed.ToolRetryOnTimeout,
+		ordinaryProfile:    parsed.OrdinaryProfile(),
+		goalProfile:        parsed.GoalProfile(),
+		profilesResolved:   true,
 		asyncTimeout:       parsed.AsyncTimeout,
 		debug:              parsed.Debug,
 	}, nil
+}
+
+// ordinaryRuntimeProfile returns the resolved ordinary profile for loaded
+// configuration. The legacy fallback keeps package-local test seams and
+// compatibility callers that construct config directly working without
+// creating a second configuration source.
+func (c config) ordinaryRuntimeProfile() configpkg.RuntimeProfile {
+	if c.profilesResolved {
+		return c.ordinaryProfile
+	}
+	return configpkg.RuntimeProfile{
+		MaxIterations:      c.maxIterations,
+		MaxGoalIterations:  c.maxGoalIterations,
+		ToolMaxParallel:    c.toolMaxParallel,
+		ToolTimeoutSec:     c.toolTimeoutSec,
+		ToolRetryOnTimeout: c.toolRetryOnTimeout,
+	}
+}
+
+// goalRuntimeProfile returns the in-memory profile used by an accepted goal.
+// Directly constructed compatibility configurations have no source metadata,
+// so their ordinary values remain the effective profile for existing tests and
+// narrow application seams.
+func (c config) goalRuntimeProfile() configpkg.RuntimeProfile {
+	if c.profilesResolved {
+		return c.goalProfile
+	}
+	return c.ordinaryRuntimeProfile()
+}
+
+func (a *app) runtimeProfileFor(runtime *agentRuntime) configpkg.RuntimeProfile {
+	profile := a.cfg.ordinaryRuntimeProfile()
+	if runtime != nil && runtime.executionProfile.MaxIterations > 0 {
+		profile = runtime.executionProfile
+	} else if runtime != nil && runtime.maxToolIterations > 0 {
+		// Child runtimes created by the current subagent compatibility seam
+		// carry their own turn limit even before profile propagation is added.
+		profile.MaxIterations = runtime.maxToolIterations
+	}
+	return profile
 }
 
 func printUsage(w io.Writer) {
@@ -294,30 +342,36 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT")
 	fmt.Fprintln(w, "     TOOL_MAX_PARALLEL, TOOL_TIMEOUT_SECONDS, TOOL_RETRY_ON_TIMEOUT")
+	fmt.Fprintln(w, "Provider defaults: ENDPOINT=https://opencode.ai/zen/v1/chat/completions MODEL=deepseek-v4-flash-free TOKEN=public REASONING_EFFORT=high")
+	fmt.Fprintln(w, "Configuration precedence: CLI flags > environment > saved config > built-in defaults")
 	fmt.Fprintln(w, "Opt-in tools (repeatable): --allow-tool write_file --allow-tool edit_file --allow-tool append_file --allow-tool execute_program --allow-tool execute_skill")
-	fmt.Fprintln(w, "Iteration limit: --max-iterations N (default 40; YOLO fallback 256; env MAX_ITERATIONS; always wraps up gracefully on limit)")
-	fmt.Fprintln(w, "Goal loop limit: --max-goal-iterations N (default 20; YOLO fallback 200; env MAX_GOAL_ITERATIONS; YOLO /goal only)")
+	fmt.Fprintln(w, "Ordinary limits: root iterations 40, goal-loop baseline 20, subagent depth/parallelism/iterations 1/4/20, aggregate chars 12000, tools parallel/timeout 8/60s")
+	fmt.Fprintln(w, "Goal-run limits: root iterations 256, outer iterations 64, subagent depth/parallelism/iterations 2/8/100, aggregate chars 48000, tools parallel/timeout 16/300s")
+	fmt.Fprintln(w, "Saved numeric values equal to ordinary defaults are baseline values for goal fallback; custom saved, environment, and CLI values remain explicit")
+	fmt.Fprintln(w, "--yolo enables permissions and path access only; it does not select goal budgets. /goal still requires --yolo, and stopping/completing a goal restores ordinary limits")
+	fmt.Fprintln(w, "Iteration limit: --max-iterations N (ordinary default 40; goal-run default 256; env MAX_ITERATIONS; always wraps up gracefully on limit)")
+	fmt.Fprintln(w, "Goal loop limit: --max-goal-iterations N (ordinary baseline 20; goal-run default 64; env MAX_GOAL_ITERATIONS; accepted /goal only)")
 	fmt.Fprintln(w, "Interactive goal: /goal <objective> starts a fresh checklist; bare /goal resumes an incomplete one (requires --yolo)")
 	fmt.Fprintln(w, "Goal completion: a completed checklist must be followed by a valid complete_goal summary and evidence claim")
 	fmt.Fprintln(w, "Interactive sessions: /compact, /session-new [prompt], /session-list, /session-rename <name|--clear>, /session-resume [ID|PREFIX], /exit, /quit")
 	fmt.Fprintln(w, "Interactive /compact summarizes retained conversation history without tools; it accepts no arguments and can be cancelled.")
 	fmt.Fprintln(w, "Subagent limits (flags, env vars, or config file):")
-	fmt.Fprintln(w, "  --subagent-max-depth N              (default 1; YOLO 2; env SUBAGENT_MAX_DEPTH)")
+	fmt.Fprintln(w, "  --subagent-max-depth N              (ordinary 1; goal-run 2; env SUBAGENT_MAX_DEPTH)")
 	fmt.Fprintln(w, "  --subagent-max-children N           (default 8 active children; env SUBAGENT_MAX_CHILDREN)")
-	fmt.Fprintln(w, "  --subagent-max-parallel N           (default 4; YOLO 8; env SUBAGENT_MAX_PARALLEL)")
-	fmt.Fprintln(w, "  --subagent-timeout-seconds N        (default 600; YOLO 600; env SUBAGENT_TIMEOUT_SECONDS)")
+	fmt.Fprintln(w, "  --subagent-max-parallel N           (ordinary 4; goal-run 8; env SUBAGENT_MAX_PARALLEL)")
+	fmt.Fprintln(w, "  --subagent-timeout-seconds N        (ordinary and goal-run 600; env SUBAGENT_TIMEOUT_SECONDS)")
 	fmt.Fprintln(w, "  --subagent-max-result-chars N       (default 8000;  env SUBAGENT_MAX_RESULT_CHARS)")
-	fmt.Fprintln(w, "  --subagent-max-aggregate-chars N    (default 12000; YOLO 48000; env SUBAGENT_MAX_AGGREGATE_CHARS)")
-	fmt.Fprintln(w, "  --subagent-max-iterations N         (default 20; YOLO 100; env SUBAGENT_MAX_ITERATIONS)")
+	fmt.Fprintln(w, "  --subagent-max-aggregate-chars N    (ordinary 12000; goal-run 48000; env SUBAGENT_MAX_AGGREGATE_CHARS)")
+	fmt.Fprintln(w, "  --subagent-max-iterations N         (ordinary 20; goal-run 100; env SUBAGENT_MAX_ITERATIONS)")
 	fmt.Fprintln(w, "Subagent model (defaults to root MODEL if not set):")
 	fmt.Fprintln(w, "  --subagent-model MODEL              (env SUBAGENT_MODEL)")
 	fmt.Fprintln(w, "  --subagent-reasoning-effort VALUE   (env SUBAGENT_REASONING_EFFORT; set to 'none' or 'nil' to omit)")
 	fmt.Fprintln(w, "Tool execution (flags, env vars, or config file):")
-	fmt.Fprintln(w, "  --tool-max-parallel N               (default 8; YOLO 16; env TOOL_MAX_PARALLEL)")
-	fmt.Fprintln(w, "  --tool-timeout-seconds N            (default 60; YOLO 300; env TOOL_TIMEOUT_SECONDS)")
+	fmt.Fprintln(w, "  --tool-max-parallel N               (ordinary 8; goal-run 16; env TOOL_MAX_PARALLEL)")
+	fmt.Fprintln(w, "  --tool-timeout-seconds N            (ordinary 60; goal-run 300; env TOOL_TIMEOUT_SECONDS)")
 	fmt.Fprintln(w, "  --tool-retry-on-timeout             (default true;  env TOOL_RETRY_ON_TIMEOUT)")
 	fmt.Fprintln(w, "  --no-tool-retry-on-timeout          (disable retry)")
-	fmt.Fprintln(w, "All tools + unrestricted paths:  --yolo")
+	fmt.Fprintln(w, "All tools + unrestricted paths (does not select goal budgets):  --yolo")
 }
 
 func (a *app) runQuestion(ctx context.Context, question string) error {
@@ -364,10 +418,11 @@ func (a *app) runTurnLoopWithState(ctx context.Context, messages []contracts.Mes
 	if runtime != nil && strings.TrimSpace(runtime.sessionID) != "" {
 		agentID = runtime.sessionID
 	}
+	profile := a.runtimeProfileFor(runtime)
 	capability := newAppToolCapability(toolset, a, runtime)
 	result, err := (&agent.Engine{Provider: a.client.agentProvider()}).Run(ctx, agent.RunOptions{
 		Messages: messages, Question: question, Model: model, Reasoning: reasoning,
-		MaxToolIterations: a.cfg.maxIterations, AgentID: agentID, EmitOutput: emitOutput,
+		MaxToolIterations: profile.MaxIterations, AgentID: agentID, EmitOutput: emitOutput,
 		FinalOnly: a.cfg.finalOnly, Sink: a.sink, ToolCapability: capability,
 		ToolSummary: extractToolSummary, ContinuationState: continuation,
 	})
@@ -855,12 +910,14 @@ func (a *app) isToolEnabled(runtime *agentRuntime, name string) bool {
 }
 
 func (a *app) rootRuntime() *agentRuntime {
+	profile := a.cfg.ordinaryRuntimeProfile()
 	return &agentRuntime{
 		sessionID:         rootAgentID,
 		depth:             0,
 		role:              agentRoleCoordinator,
 		allowedTools:      cloneAllowedTools(a.cfg.allowedTools),
-		maxToolIterations: a.cfg.maxIterations,
+		maxToolIterations: profile.MaxIterations,
+		executionProfile:  profile,
 		model:             a.cfg.model,
 		reasoning:         a.cfg.reasoning,
 	}

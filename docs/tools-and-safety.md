@@ -117,7 +117,7 @@ and `/session-rename <name>` to assign a durable label. A bare
 `capelin-go -i --resume [ID|PREFIX]`.
 
 The `update_todos` tool replaces the complete ordered checklist. Valid statuses
-are `pending`, `in_progress`, `completed`, and `cancelled`. A YOLO `/goal`
+are `pending`, `in_progress`, `completed`, and `cancelled`. An accepted `/goal`
 requires a non-empty checklist with every item completed and a goal-only
 `complete_goal` call containing a non-empty summary and evidence list before it
 reports success. The completion claim is tied to the current goal generation
@@ -129,16 +129,37 @@ checklists, and iteration exhaustion are reported as incomplete and retain the
 active objective for bare `/goal` resume. Three consecutive recoverable-error
 turns also activate a bounded recovery guard. Goal execution is bounded
 independently from normal tool iterations by `--max-goal-iterations N` or
-`MAX_GOAL_ITERATIONS` (default `20`, YOLO fallback `200`).
+`MAX_GOAL_ITERATIONS` (ordinary default `20`, goal profile default `64`).
 
-YOLO budget fallbacks are larger but still bounded: root tool-use iterations
-`256`, goal-loop iterations `200`, worker depth `2`, worker parallelism `8`,
-worker tool-use iterations `100`, worker aggregate output `48000` characters,
-tool parallelism `16`, and per-tool timeout `300` seconds. Explicit flags and
-environment settings override these fallbacks. Customized saved values remain
-in effect; saved values equal to ordinary built-in defaults are treated as
-un-customized in YOLO mode. The generated settings file always retains the
-ordinary defaults.
+The accepted-goal profile is larger but still bounded: root tool-use
+iterations `256`, goal-loop iterations `64`, worker depth `2`, worker
+parallelism `8`, worker tool-use iterations `100`, worker aggregate output
+`48000` characters, tool parallelism `16`, and per-tool timeout `300` seconds.
+Explicit flags and environment settings override these fallbacks. Customized
+saved values remain in effect; saved values equal to ordinary built-in defaults
+are treated as generated baselines for goal fallback. The profile is resolved
+in memory, and the generated settings file always retains the ordinary
+defaults. `--yolo` remains required for `/goal` but does not select these
+budgets by itself.
+
+Ordinary non-goal work, including a non-goal `--yolo` invocation, retains root
+iterations `40`, worker depth/parallelism/iterations `1/4/20`, worker aggregate
+output `12000` characters, tool parallelism `8`, and a `60`-second tool
+timeout. Only an accepted `/goal` selects the larger values above.
+
+Provider defaults are `https://opencode.ai/zen/v1/chat/completions`,
+`deepseek-v4-flash-free`, `public`, and `high` for endpoint, model, token, and
+reasoning effort. CLI values override environment values, which override saved
+configuration, which override built-in defaults. Saved numeric values equal to
+ordinary defaults are generated baselines for goal fallback; custom saved
+values remain explicit. An active goal snapshot stores no budget-mode key:
+resuming it recomputes the current goal profile, while completing or stopping
+the goal restores ordinary limits for later turns.
+
+During long accepted-goal turns, the existing output sink emits a generic
+working heartbeat after about five seconds and every ten seconds, including
+total and current-turn elapsed time. It stops before terminal goal status
+output and is not persisted.
 
 The default mode favors reading, research, and controlled workspace access. Use repeatable `--allow-tool` flags for specific actions that change files or run programs.
 

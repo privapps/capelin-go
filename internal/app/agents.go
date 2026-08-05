@@ -1,6 +1,7 @@
 package app
 
 import (
+	configpkg "capelin-go/internal/config"
 	"capelin-go/internal/contracts"
 	"capelin-go/internal/policy"
 	"capelin-go/internal/subagents"
@@ -46,12 +47,67 @@ func defaultSubagentRuntimeConfig() subagentRuntimeConfig {
 	return subagents.DefaultConfig()
 }
 
+func toSubagentConfig(cfg configpkg.SubagentConfig) subagents.Config {
+	return subagents.Config{
+		MaxDepth:          cfg.MaxDepth,
+		MaxChildren:       cfg.MaxChildren,
+		MaxParallel:       cfg.MaxParallel,
+		DefaultTimeoutSec: cfg.DefaultTimeoutSec,
+		MaxTimeoutSec:     cfg.MaxTimeoutSec,
+		MaxToolIterations: cfg.MaxToolIterations,
+		MaxResultChars:    cfg.MaxResultChars,
+		MaxAggregateCount: cfg.MaxAggregateCount,
+		MaxAggregateChars: cfg.MaxAggregateChars,
+		Model:             cfg.Model,
+		ReasoningEffort:   cfg.ReasoningEffort,
+	}
+}
+
+func fromSubagentConfig(cfg subagents.Config) configpkg.SubagentConfig {
+	return configpkg.SubagentConfig{
+		MaxDepth:          cfg.MaxDepth,
+		MaxChildren:       cfg.MaxChildren,
+		MaxParallel:       cfg.MaxParallel,
+		DefaultTimeoutSec: cfg.DefaultTimeoutSec,
+		MaxTimeoutSec:     cfg.MaxTimeoutSec,
+		MaxToolIterations: cfg.MaxToolIterations,
+		MaxResultChars:    cfg.MaxResultChars,
+		MaxAggregateCount: cfg.MaxAggregateCount,
+		MaxAggregateChars: cfg.MaxAggregateChars,
+		Model:             cfg.Model,
+		ReasoningEffort:   cfg.ReasoningEffort,
+	}
+}
+
+func toSubagentProfile(profile configpkg.RuntimeProfile) subagents.RuntimeProfile {
+	return subagents.RuntimeProfile{
+		MaxIterations:      profile.MaxIterations,
+		MaxGoalIterations:  profile.MaxGoalIterations,
+		Subagents:          toSubagentConfig(profile.Subagents),
+		ToolMaxParallel:    profile.ToolMaxParallel,
+		ToolTimeoutSec:     profile.ToolTimeoutSec,
+		ToolRetryOnTimeout: profile.ToolRetryOnTimeout,
+	}
+}
+
+func fromSubagentProfile(profile subagents.RuntimeProfile) configpkg.RuntimeProfile {
+	return configpkg.RuntimeProfile{
+		MaxIterations:      profile.MaxIterations,
+		MaxGoalIterations:  profile.MaxGoalIterations,
+		Subagents:          fromSubagentConfig(profile.Subagents),
+		ToolMaxParallel:    profile.ToolMaxParallel,
+		ToolTimeoutSec:     profile.ToolTimeoutSec,
+		ToolRetryOnTimeout: profile.ToolRetryOnTimeout,
+	}
+}
+
 type agentRuntime struct {
 	sessionID         string
 	depth             int
 	role              agentRole
 	allowedTools      map[string]bool
 	maxToolIterations int
+	executionProfile  configpkg.RuntimeProfile
 	model             string
 	reasoning         string
 
@@ -65,6 +121,25 @@ type agentRuntime struct {
 	goalEnabled    bool
 	goalGeneration uint64
 	goalClaim      *goalCompletion
+}
+
+// selectExecutionProfile changes only this runtime's value profile and
+// returns a restoration function for the surrounding turn or goal scope.
+// Profiles are deliberately not stored on app config or session snapshots.
+func (r *agentRuntime) selectExecutionProfile(profile configpkg.RuntimeProfile) func() {
+	if r == nil {
+		return func() {}
+	}
+	previous := r.executionProfile
+	previousIterations := r.maxToolIterations
+	r.executionProfile = profile
+	if profile.MaxIterations > 0 {
+		r.maxToolIterations = profile.MaxIterations
+	}
+	return func() {
+		r.executionProfile = previous
+		r.maxToolIterations = previousIterations
+	}
 }
 
 func (r *agentRuntime) replaceTodos(todos []todoItem) {
@@ -263,12 +338,14 @@ func appRuntime(runtime *subagents.Runtime) *agentRuntime {
 	if runtime == nil {
 		return nil
 	}
+	profile := fromSubagentProfile(runtime.ExecutionProfile)
 	return &agentRuntime{
 		sessionID:         runtime.SessionID,
 		depth:             runtime.Depth,
 		role:              agentRole(runtime.Role),
 		allowedTools:      cloneAllowedTools(runtime.AllowedTools),
 		maxToolIterations: runtime.MaxToolIterations,
+		executionProfile:  profile,
 		model:             runtime.Model,
 		reasoning:         runtime.Reasoning,
 	}
@@ -284,6 +361,7 @@ func subagentRuntime(runtime *agentRuntime) *subagents.Runtime {
 		Role:              string(runtime.role),
 		AllowedTools:      cloneAllowedTools(runtime.allowedTools),
 		MaxToolIterations: runtime.maxToolIterations,
+		ExecutionProfile:  toSubagentProfile(runtime.executionProfile),
 		Model:             runtime.model,
 		Reasoning:         runtime.reasoning,
 	}

@@ -366,7 +366,8 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 		a.writeInteractiveSystem("[goal] --yolo is required before using /goal")
 		return false
 	}
-	if a.cfg.maxGoalIterations <= 0 {
+	goalProfile := a.cfg.goalRuntimeProfile()
+	if goalProfile.MaxGoalIterations <= 0 {
 		a.writeInteractiveSystem("[goal] invalid goal iteration limit")
 		return false
 	}
@@ -374,6 +375,8 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 		session.runtime = a.rootRuntime()
 		a.attachInteractiveRuntime(session)
 	}
+	restoreProfile := session.runtime.selectExecutionProfile(goalProfile)
+	defer restoreProfile()
 	objective = strings.TrimSpace(objective)
 	originalTodos := cloneTodos(session.todos)
 	originalGoal := cloneGoalState(session.activeGoal)
@@ -424,6 +427,12 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 		session.runtime.allowedTools = make(map[string]bool)
 	}
 	session.runtime.allowedTools[toolCompleteGoal] = true
+	heartbeat := newGoalHeartbeat(a.writeInteractiveSystem, goalProfile.MaxGoalIterations, a.goalHeartbeatInitialDelay, a.goalHeartbeatCadence)
+	defer heartbeat.stop()
+	terminalGoalStatus := func(message string) {
+		heartbeat.stop()
+		a.writeInteractiveSystem(message)
+	}
 	session.runtime.enableGoal(session.activeGoal.Generation)
 	defer func() {
 		delete(session.runtime.allowedTools, toolCompleteGoal)
@@ -433,13 +442,13 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 	previous := cloneTodos(session.todos)
 	unchanged := 0
 	recoveryStreak := 0
-	for iteration := 1; iteration <= a.cfg.maxGoalIterations; iteration++ {
+	for iteration := 1; iteration <= goalProfile.MaxGoalIterations; iteration++ {
 		if ctx.Err() != nil {
-			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: cancelled after %d iteration(s)", iteration-1))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: cancelled after %d iteration(s)", iteration-1))
 			_ = a.saveGoalSession(session)
 			return true
 		}
-		a.writeInteractiveSystem(fmt.Sprintf("[goal] iteration %d/%d", iteration, a.cfg.maxGoalIterations))
+		heartbeat.beginIteration(iteration)
 		prompt := goalContinuationPrompt
 		if objective != "" && iteration == 1 {
 			prompt = fmt.Sprintf("Start working toward this objective: %s\n\nCreate a fresh authoritative checklist with update_todos before doing the work. Make concrete progress, verify each completed item, and do not claim success while any checklist item remains incomplete. When the final checklist is complete, call complete_goal with a concise summary and non-empty evidence statements.", objective)
@@ -449,55 +458,56 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 			prompt = fmt.Sprintf("Continue working toward the objective %q. Make concrete progress on the next incomplete checklist item, then update the authoritative checklist with verified status. When every item is complete, call complete_goal with a non-empty summary and evidence list.", session.activeGoal.Objective)
 		}
 		stopped, err := a.runInteractiveTurnResult(ctx, session, prompt)
+		heartbeat.endTurn()
 		if err != nil {
 			if persistErr := a.saveGoalSession(session); persistErr != nil {
-				a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
+				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
 				return false
 			}
 			if stopped || ctx.Err() != nil || errors.Is(err, context.Canceled) {
-				a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: cancelled after %d iteration(s)", iteration))
+				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: cancelled after %d iteration(s)", iteration))
 				return true
 			}
 			if errors.Is(err, errSessionPersistence) {
-				a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", err))
+				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", err))
 				return false
 			}
 			var toolFailure fatalToolFailure
 			if errors.As(err, &toolFailure) {
-				a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: fatal tool failure: %v", toolFailure))
+				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: fatal tool failure: %v", toolFailure))
 				return false
 			}
-			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: provider or tool failure: %v", err))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: provider or tool failure: %v", err))
 			return false
 		}
 		if stopped || ctx.Err() != nil {
 			if persistErr := a.saveGoalSession(session); persistErr != nil {
-				a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
+				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
 				return false
 			}
-			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: cancelled after %d iteration(s)", iteration))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: cancelled after %d iteration(s)", iteration))
 			return true
 		}
 		if persistErr := a.saveGoalSession(session); persistErr != nil {
-			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
 			return false
 		}
 		current := cloneTodos(session.todos)
 		if len(current) == 0 {
-			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: checklist is empty after iteration %d", iteration))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: checklist is empty after iteration %d", iteration))
 			return false
 		}
 		if cancelled, ok := firstCancelledTodo(current); ok {
-			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: checklist item %q was cancelled", cancelled.ID))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: checklist item %q was cancelled", cancelled.ID))
 			return false
 		}
 		if todosComplete(current) {
 			if validGoalCompletion(session.activeGoal, current) {
 				if persistErr := a.saveGoalSession(session); persistErr != nil {
-					a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
+					terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
 					return false
 				}
-				a.writeInteractiveSystem(fmt.Sprintf("[goal] complete after %d iteration(s): %s", iteration, session.activeGoal.Completion.Summary))
+				terminalGoalStatus(fmt.Sprintf("[goal] complete after %d iteration(s): %s", iteration, session.activeGoal.Completion.Summary))
 				return false
 			}
 			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: checklist is complete after iteration %d, but the complete_goal handshake is missing or stale; continuing", iteration))
@@ -508,7 +518,7 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 			recoveryStreak = 0
 		}
 		if recoveryStreak >= maxConsecutiveGoalRecoveries {
-			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: recovery limit reached after %d iteration(s); %d consecutive recoverable tool-error turn(s)", iteration, recoveryStreak))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: recovery limit reached after %d iteration(s); %d consecutive recoverable tool-error turn(s)", iteration, recoveryStreak))
 			return false
 		}
 		if equalTodos(previous, current) {
@@ -517,12 +527,12 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 			unchanged = 0
 		}
 		if unchanged >= 2 {
-			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: stalled after %d iteration(s); checklist did not change", iteration))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: stalled after %d iteration(s); checklist did not change", iteration))
 			return false
 		}
 		previous = current
 	}
-	a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: iteration limit reached (%d)", a.cfg.maxGoalIterations))
+	terminalGoalStatus(fmt.Sprintf("[goal] incomplete: iteration limit reached (%d)", goalProfile.MaxGoalIterations))
 	return false
 }
 

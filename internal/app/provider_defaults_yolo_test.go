@@ -2,7 +2,7 @@ package app
 
 import "testing"
 
-func TestLoadConfigYoloPresetReachesApplicationRuntime(t *testing.T) {
+func TestLoadConfigYoloKeepsOrdinaryLimitsInApplicationRuntime(t *testing.T) {
 	isolateConfigFile(t)
 	for _, key := range []string{
 		"ENDPOINT", "MODEL", "TOKEN", "REASONING_EFFORT",
@@ -21,21 +21,27 @@ func TestLoadConfigYoloPresetReachesApplicationRuntime(t *testing.T) {
 	if cfg.endpoint != "https://opencode.ai/zen/v1/chat/completions" || cfg.model != "deepseek-v4-flash-free" || cfg.token != "public" || cfg.reasoning != "high" {
 		t.Fatalf("unexpected provider defaults: %+v", cfg)
 	}
-	if cfg.maxIterations != 256 || cfg.maxGoalIterations != 200 || cfg.toolMaxParallel != 16 || cfg.toolTimeoutSec != 300 {
-		t.Fatalf("unexpected application limits: %+v", cfg)
+	if cfg.maxIterations != 40 || cfg.maxGoalIterations != 20 || cfg.toolMaxParallel != 8 || cfg.toolTimeoutSec != 60 {
+		t.Fatalf("YOLO changed ordinary application limits: %+v", cfg)
 	}
-	if got := cfg.subagents; got.MaxDepth != 2 || got.MaxParallel != 8 || got.DefaultTimeoutSec != 600 || got.MaxToolIterations != 100 || got.MaxAggregateChars != 48000 {
-		t.Fatalf("unexpected application subagent limits: %+v", got)
+	if got := cfg.subagents; got.MaxDepth != 1 || got.MaxParallel != 4 || got.DefaultTimeoutSec != 600 || got.MaxToolIterations != 20 || got.MaxAggregateChars != 12000 {
+		t.Fatalf("YOLO changed ordinary application subagent limits: %+v", got)
 	}
 
 	a, err := newApp(cfg)
 	if err != nil {
 		t.Fatalf("newApp: %v", err)
 	}
-	if runtime := a.rootRuntime(); runtime.maxToolIterations != 256 {
-		t.Fatalf("root runtime lost YOLO iteration limit: %d", runtime.maxToolIterations)
+	if runtime := a.rootRuntime(); runtime.maxToolIterations != 40 {
+		t.Fatalf("root runtime did not retain ordinary iteration limit: %d", runtime.maxToolIterations)
 	}
-	if a.subagents.cfg.MaxDepth != 2 || a.subagents.cfg.MaxParallel != 8 || a.subagents.cfg.MaxToolIterations != 100 || a.subagents.cfg.MaxAggregateChars != 48000 {
-		t.Fatalf("subagent manager lost YOLO limits: %+v", a.subagents.cfg)
+	if runtime := a.rootRuntime(); runtime.executionProfile.MaxIterations != 40 || runtime.executionProfile.ToolMaxParallel != 8 || runtime.executionProfile.ToolTimeoutSec != 60 {
+		t.Fatalf("root runtime did not retain ordinary execution profile: %+v", runtime.executionProfile)
+	}
+	if cfg.goalProfile.MaxIterations != 256 || cfg.goalProfile.MaxGoalIterations != 64 || cfg.goalProfile.ToolMaxParallel != 16 || cfg.goalProfile.ToolTimeoutSec != 300 {
+		t.Fatalf("loaded application did not retain goal execution profile: %+v", cfg.goalProfile)
+	}
+	if a.subagents.cfg.MaxDepth != 1 || a.subagents.cfg.MaxParallel != 4 || a.subagents.cfg.MaxToolIterations != 20 || a.subagents.cfg.MaxAggregateChars != 12000 {
+		t.Fatalf("subagent manager did not retain ordinary limits: %+v", a.subagents.cfg)
 	}
 }

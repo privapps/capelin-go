@@ -240,6 +240,7 @@ func cloneInteractiveRuntime(runtime *agentRuntime) *agentRuntime {
 		role:              runtime.role,
 		allowedTools:      cloneAllowedTools(runtime.allowedTools),
 		maxToolIterations: runtime.maxToolIterations,
+		executionProfile:  runtime.executionProfile,
 		model:             runtime.model,
 		reasoning:         runtime.reasoning,
 		todos:             runtime.snapshotTodos(),

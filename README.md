@@ -94,7 +94,7 @@ current UUID and a `--resume <id>` hint when it exits. Startup resume accepts
 `./capelin-go -i --resume [ID|PREFIX]` (a bare `--resume` selects the newest
 valid snapshot).
 
-YOLO goal execution is bounded: completion requires a non-empty authoritative
+Goal execution is bounded: completion requires a non-empty authoritative
 checklist in which every item is `completed`, plus a valid goal-only
 `complete_goal` call with a non-empty summary and evidence list. A completed
 checklist without that handshake is progress, not success, and triggers another
@@ -102,11 +102,22 @@ continuation or an explicit incomplete safeguard outcome. The handshake is
 invalidated by later checklist changes or a new objective. Deterministic tool
 errors such as missing paths, invalid arguments, disabled tools, and failed
 commands are returned to the model so the goal can recover. Provider failures,
-cancellation, persistence failures, and unrecoverable runtime errors are
-reported as incomplete and remain resumable with bare `/goal`. Configure the
-outer limit independently with `--max-goal-iterations N` or
-`MAX_GOAL_ITERATIONS` (default 20, YOLO fallback 200); this does not change
-`--max-iterations` (default 40, YOLO fallback 256).
+cancellation, persistence failures, stalled checklist progress, and
+unrecoverable runtime errors are reported as incomplete and remain resumable
+with bare `/goal`. During an accepted goal, Capelin emits an immediate
+iteration status and a generic working heartbeat while a turn is active (about
+five seconds initially, then every ten seconds), including total and
+current-turn elapsed time. Configure the outer limit independently with
+`--max-goal-iterations N` or `MAX_GOAL_ITERATIONS` (ordinary default 20); this
+does not change ordinary `--max-iterations` (default 40). Accepted goals use a
+separate in-memory goal profile with outer iterations 64 and per-turn
+iterations 256 by default.
+`--yolo` remains the permission and safety gate; it does not select that
+profile. Goal profiles are selected only for accepted `/goal` runs and are
+removed when the goal completes, stops, or becomes incomplete, so subsequent
+ordinary turns return to ordinary limits. A persisted active goal stores its
+objective, checklist, and completion handshake only; on resume Capelin
+recomputes the current goal profile from the current configuration.
 
 Press Tab after `/` or a partial command to complete or display the available
 slash commands. Bare `exit` and `quit` are ordinary prompts and are sent to
@@ -323,26 +334,28 @@ Enable everything (all tools + unrestricted paths):
 - `TOKEN` — API token (default: `public`)
 - `REASONING_EFFORT` — passed through to the model backend (default: `high`); set to `none` or `nil` to omit the field entirely from the request
 - `SYSTEM_PROMPT` (or `systemPrompt`) — prompt override
-- `MAX_ITERATIONS` — root agent tool-call iteration cap (ordinary default: 40; YOLO fallback: 256; overridden by `--max-iterations`)
-- `MAX_GOAL_ITERATIONS` — outer `/goal` iteration cap (ordinary default: 20; YOLO fallback: 200; overridden by `--max-goal-iterations`); applies only to YOLO interactive goals
-- `SUBAGENT_MAX_DEPTH` — maximum subagent nesting depth (ordinary default: 1; YOLO fallback: 2; overridden by `--subagent-max-depth`)
+- `MAX_ITERATIONS` — root agent tool-call iteration cap (ordinary default: 40; goal profile default: 256; overridden by `--max-iterations`)
+- `MAX_GOAL_ITERATIONS` — outer `/goal` iteration cap (ordinary default: 20; goal profile default: 64; overridden by `--max-goal-iterations`); applies only to accepted interactive goals
+- `SUBAGENT_MAX_DEPTH` — maximum subagent nesting depth (ordinary default: 1; goal profile default: 2; overridden by `--subagent-max-depth`)
 - `SUBAGENT_MAX_CHILDREN` — maximum active subagents (pending/queued/running) a single parent can hold at once (default: 8; overridden by `--subagent-max-children`)
-- `SUBAGENT_MAX_PARALLEL` — maximum concurrently running parallel subagents (ordinary default: 4; YOLO fallback: 8; overridden by `--subagent-max-parallel`)
-- `SUBAGENT_TIMEOUT_SECONDS` — default subagent execution timeout in seconds (default and YOLO fallback: 600; overridden by `--subagent-timeout-seconds`)
+- `SUBAGENT_MAX_PARALLEL` — maximum concurrently running parallel subagents (ordinary default: 4; goal profile default: 8; overridden by `--subagent-max-parallel`)
+- `SUBAGENT_TIMEOUT_SECONDS` — default subagent execution timeout in seconds (ordinary and goal profile default: 600; overridden by `--subagent-timeout-seconds`)
 - `SUBAGENT_MAX_RESULT_CHARS` — maximum characters returned per subagent result (default: 8000; overridden by `--subagent-max-result-chars`)
-- `SUBAGENT_MAX_AGGREGATE_CHARS` — maximum total characters across all subagent results in a single turn (ordinary default: 12000; YOLO fallback: 48000; overridden by `--subagent-max-aggregate-chars`)
-- `SUBAGENT_MAX_ITERATIONS` — maximum tool-call iterations per subagent (ordinary default: 20; YOLO fallback: 100; overridden by `--subagent-max-iterations`)
+- `SUBAGENT_MAX_AGGREGATE_CHARS` — maximum total characters across all subagent results in a single turn (ordinary default: 12000; goal profile default: 48000; overridden by `--subagent-max-aggregate-chars`)
+- `SUBAGENT_MAX_ITERATIONS` — maximum tool-call iterations per subagent (ordinary default: 20; goal profile default: 100; overridden by `--subagent-max-iterations`)
 - `SUBAGENT_MODEL` — model ID used for subagents (default: inherits `MODEL`; overridden by `--subagent-model`)
 - `SUBAGENT_REASONING_EFFORT` — reasoning effort for subagents (default: inherits `REASONING_EFFORT`; set to `none` or `nil` to omit; overridden by `--subagent-reasoning-effort`)
-- `TOOL_MAX_PARALLEL` — maximum concurrent tools (ordinary default: 8; YOLO fallback: 16; overridden by `--tool-max-parallel`)
-- `TOOL_TIMEOUT_SECONDS` — per-tool timeout in seconds (ordinary default: 60; YOLO fallback: 300; overridden by `--tool-timeout-seconds`)
+- `TOOL_MAX_PARALLEL` — maximum concurrent tools (ordinary default: 8; goal profile default: 16; overridden by `--tool-max-parallel`)
+- `TOOL_TIMEOUT_SECONDS` — per-tool timeout in seconds (ordinary default: 60; goal profile default: 300; overridden by `--tool-timeout-seconds`)
 
-When `--yolo` is active, these YOLO values are fallbacks only. CLI flags and
-environment variables always win; saved numeric values that differ from the
-ordinary defaults are preserved. Saved values equal to ordinary defaults are
-treated as uncustomized so a returning YOLO invocation receives the larger
-bounded preset. The generated config file always retains ordinary provider and
-limit defaults.
+CLI flags override environment values, which override saved configuration,
+which overrides built-in defaults. Accepted goals resolve a separate in-memory
+profile from those same sources. Saved numeric values that differ from the
+ordinary defaults are preserved in the goal profile; saved values equal to the
+ordinary defaults are treated as generated baselines and receive goal
+fallbacks. Goal resolution never writes goal-specific settings or changes the
+ordinary configuration. `--yolo` changes permissions and remains required by
+`/goal`, but does not select goal budgets by itself.
 
 Reasoning-capable providers can return native reasoning metadata alongside a
 tool call. Capelin replays that metadata in the provider's required format for
@@ -359,6 +372,9 @@ On first run capelin-go creates `~/.local/capelin-go/config.ini` with default va
 # capelin-go configuration
 # Edit this file to set persistent defaults.
 # Priority: CLI flags > environment variables > this file > built-in defaults.
+# The values below are ordinary baselines. An accepted /goal in a --yolo
+# session uses a separate in-memory goal-run profile; --yolo alone does not
+# select it, and ordinary limits return after the goal stops.
 
 ENDPOINT = https://opencode.ai/zen/v1/chat/completions
 MODEL = deepseek-v4-flash-free

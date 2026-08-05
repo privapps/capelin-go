@@ -61,6 +61,28 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 }
 
+func TestPrintUsageDescribesProviderAndRuntimeProfileContract(t *testing.T) {
+	var help strings.Builder
+	PrintUsage(&help, "capelin-go")
+	text := help.String()
+	for _, want := range []string{
+		"ENDPOINT=https://opencode.ai/zen/v1/chat/completions",
+		"MODEL=deepseek-v4-flash-free",
+		"TOKEN=public",
+		"REASONING_EFFORT=high",
+		"CLI flags > environment > saved config > built-in defaults",
+		"Ordinary limits:",
+		"Goal-run limits:",
+		"Saved numeric values equal to ordinary defaults are baseline values",
+		"--yolo enables permissions and path access only; it does not select goal budgets",
+		"stopping/completing a goal restores ordinary limits",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("help missing %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestLoadConfigReasoningPassThrough(t *testing.T) {
 	isolateConfigFile(t)
 	t.Setenv("BASE_URL", "http://localhost:8235/v1")

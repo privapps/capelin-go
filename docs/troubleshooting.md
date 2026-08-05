@@ -162,7 +162,12 @@ continue the saved active objective, or start a new objective with
 
 Set the outer limit independently with `--max-goal-iterations N` or
 `MAX_GOAL_ITERATIONS`. This does not change the normal per-turn
-`--max-iterations` setting.
+`--max-iterations` setting. Accepted goals use a default outer fallback of 64
+iterations (ordinary baseline 20, per-turn goal limit 256). While a goal turn
+is active, the interactive sink reports an immediate iteration status and a
+generic working heartbeat after about five seconds and every ten seconds,
+including total and current-turn elapsed time. The reporter is informational,
+stops before terminal goal output, and is not persisted in session snapshots.
 
 ## The server rejects my API request
 

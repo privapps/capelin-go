@@ -34,6 +34,24 @@ func isolateLoad(t *testing.T) string {
 	return path
 }
 
+func writeConfig(t *testing.T, path string, values map[string]string) {
+	t.Helper()
+	lines := make([]string, 0, len(values))
+	for _, key := range []string{"ENDPOINT", "MODEL", "TOKEN", "REASONING_EFFORT"} {
+		if value, ok := values[key]; ok {
+			lines = append(lines, key+" = "+value)
+		}
+	}
+	for _, key := range numericConfigKeys {
+		if value, ok := values[key]; ok {
+			lines = append(lines, key+" = "+value)
+		}
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
 func TestLoadFirstRunUsesProviderDefaultsAndGeneratesOrdinaryConfig(t *testing.T) {
 	path := isolateLoad(t)
 
@@ -44,15 +62,7 @@ func TestLoadFirstRunUsesProviderDefaultsAndGeneratesOrdinaryConfig(t *testing.T
 	if cfg.Endpoint != defaultEndpoint || cfg.Model != defaultModel || cfg.Token != defaultToken || cfg.Reasoning != defaultReasoning {
 		t.Fatalf("unexpected provider defaults: endpoint=%q model=%q token=%q reasoning=%q", cfg.Endpoint, cfg.Model, cfg.Token, cfg.Reasoning)
 	}
-	if cfg.MaxIterations != defaultMaxIterations || cfg.MaxGoalIterations != defaultMaxGoalIterations {
-		t.Fatalf("unexpected ordinary iteration defaults: root=%d goal=%d", cfg.MaxIterations, cfg.MaxGoalIterations)
-	}
-	if got := cfg.Subagents; got.MaxDepth != defaultSubagentMaxDepth || got.MaxChildren != defaultSubagentMaxChildren || got.MaxParallel != defaultSubagentMaxParallel || got.DefaultTimeoutSec != defaultSubagentDefaultTimeoutSec || got.MaxToolIterations != defaultSubagentToolIterations || got.MaxResultChars != defaultSubagentResultChars || got.MaxAggregateCount != defaultSubagentAggregateCount || got.MaxAggregateChars != defaultSubagentAggregateChars || got.MaxTimeoutSec != defaultSubagentMaxTimeoutSec {
-		t.Fatalf("unexpected ordinary subagent defaults: %+v", got)
-	}
-	if cfg.ToolMaxParallel != defaultToolMaxParallel || cfg.ToolTimeoutSec != defaultToolTimeoutSec {
-		t.Fatalf("unexpected ordinary tool defaults: parallel=%d timeout=%d", cfg.ToolMaxParallel, cfg.ToolTimeoutSec)
-	}
+	assertOrdinaryDefaults(t, cfg.OrdinaryProfile())
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -66,6 +76,11 @@ func TestLoadFirstRunUsesProviderDefaultsAndGeneratesOrdinaryConfig(t *testing.T
 		"REASONING_EFFORT = " + defaultReasoning,
 		"MAX_ITERATIONS = 40",
 		"MAX_GOAL_ITERATIONS = 20",
+		"SUBAGENT_MAX_DEPTH = 1",
+		"SUBAGENT_MAX_PARALLEL = 4",
+		"SUBAGENT_MAX_ITERATIONS = 20",
+		"TOOL_MAX_PARALLEL = 8",
+		"TOOL_TIMEOUT_SECONDS = 60",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Fatalf("generated config missing %q:\n%s", want, contents)
@@ -73,193 +88,291 @@ func TestLoadFirstRunUsesProviderDefaultsAndGeneratesOrdinaryConfig(t *testing.T
 	}
 }
 
-func TestLoadYoloUsesBoundedPresetWithoutChangingSavedProviderDefaults(t *testing.T) {
+func TestLoadExistingConfigRetainsValuesAndAddsOnlyMissingSupportedKeys(t *testing.T) {
 	path := isolateLoad(t)
+	writeConfig(t, path, map[string]string{
+		"ENDPOINT":         "https://custom.example/v1/chat/completions",
+		"MODEL":            "custom-model",
+		"TOKEN":            "custom-token",
+		"REASONING_EFFORT": "low",
+		"MAX_ITERATIONS":   "77",
+	})
 
-	cfg, err := Load([]string{"--yolo", "task"})
-	if err != nil {
+	if _, err := Load([]string{"task"}); err != nil {
 		t.Fatalf("Load: %v", err)
-	}
-	if cfg.Endpoint != defaultEndpoint || cfg.Model != defaultModel || cfg.Token != defaultToken || cfg.Reasoning != defaultReasoning {
-		t.Fatalf("YOLO changed provider defaults: endpoint=%q model=%q token=%q reasoning=%q", cfg.Endpoint, cfg.Model, cfg.Token, cfg.Reasoning)
-	}
-	if cfg.MaxIterations != yoloMaxIterations || cfg.MaxGoalIterations != yoloMaxGoalIterations {
-		t.Fatalf("unexpected YOLO iteration defaults: root=%d goal=%d", cfg.MaxIterations, cfg.MaxGoalIterations)
-	}
-	if got := cfg.Subagents; got.MaxDepth != yoloSubagentMaxDepth || got.MaxChildren != defaultSubagentMaxChildren || got.MaxParallel != yoloSubagentMaxParallel || got.DefaultTimeoutSec != yoloSubagentTimeoutSec || got.MaxToolIterations != yoloSubagentToolIterations || got.MaxResultChars != defaultSubagentResultChars || got.MaxAggregateCount != defaultSubagentAggregateCount || got.MaxAggregateChars != yoloSubagentAggregateChars || got.MaxTimeoutSec != defaultSubagentMaxTimeoutSec {
-		t.Fatalf("unexpected YOLO subagent defaults: %+v", got)
-	}
-	if cfg.ToolMaxParallel != yoloToolMaxParallel || cfg.ToolTimeoutSec != yoloToolTimeoutSec {
-		t.Fatalf("unexpected YOLO tool defaults: parallel=%d timeout=%d", cfg.ToolMaxParallel, cfg.ToolTimeoutSec)
-	}
-
-	saved, err := readConfigFile(path)
-	if err != nil {
-		t.Fatalf("read generated config: %v", err)
-	}
-	if saved["MAX_ITERATIONS"] != "40" || saved["MAX_GOAL_ITERATIONS"] != "20" || saved["SUBAGENT_MAX_ITERATIONS"] != "20" || saved["TOOL_MAX_PARALLEL"] != "8" || saved["TOOL_TIMEOUT_SECONDS"] != "60" {
-		t.Fatalf("YOLO rewrote ordinary saved limits: %#v", saved)
-	}
-}
-
-func TestLoadYoloPreservesCustomizedSavedValues(t *testing.T) {
-	path := isolateLoad(t)
-	contents := strings.Join([]string{
-		"ENDPOINT = https://custom.example/v1/chat/completions",
-		"MODEL = custom-model",
-		"TOKEN = custom-token",
-		"REASONING_EFFORT = low",
-		"MAX_ITERATIONS = 77",
-		"MAX_GOAL_ITERATIONS = 88",
-		"SUBAGENT_MAX_DEPTH = 3",
-		"SUBAGENT_MAX_PARALLEL = 6",
-		"SUBAGENT_TIMEOUT_SECONDS = 123",
-		"SUBAGENT_MAX_AGGREGATE_CHARS = 24000",
-		"SUBAGENT_MAX_ITERATIONS = 55",
-		"TOOL_MAX_PARALLEL = 9",
-		"TOOL_TIMEOUT_SECONDS = 90",
-		"",
-	}, "\n")
-	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	cfg, err := Load([]string{"--yolo", "task"})
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.Endpoint != "https://custom.example/v1/chat/completions" || cfg.Model != "custom-model" || cfg.Token != "custom-token" || cfg.Reasoning != "low" {
-		t.Fatalf("custom provider settings were not preserved: %+v", cfg)
-	}
-	if cfg.MaxIterations != 77 || cfg.MaxGoalIterations != 88 || cfg.Subagents.MaxDepth != 3 || cfg.Subagents.MaxParallel != 6 || cfg.Subagents.DefaultTimeoutSec != 123 || cfg.Subagents.MaxAggregateChars != 24000 || cfg.Subagents.MaxToolIterations != 55 || cfg.ToolMaxParallel != 9 || cfg.ToolTimeoutSec != 90 {
-		t.Fatalf("custom saved values were not preserved: %+v", cfg)
 	}
 	saved, err := readConfigFile(path)
 	if err != nil {
 		t.Fatalf("read migrated config: %v", err)
 	}
-	if saved["ENDPOINT"] != "https://custom.example/v1/chat/completions" || saved["MODEL"] != "custom-model" || saved["TOKEN"] != "custom-token" || saved["REASONING_EFFORT"] != "low" || saved["MAX_ITERATIONS"] != "77" {
-		t.Fatalf("migration rewrote existing values: %#v", saved)
+	for key, want := range map[string]string{
+		"ENDPOINT":         "https://custom.example/v1/chat/completions",
+		"MODEL":            "custom-model",
+		"TOKEN":            "custom-token",
+		"REASONING_EFFORT": "low",
+		"MAX_ITERATIONS":   "77",
+	} {
+		if saved[key] != want {
+			t.Fatalf("existing %s was changed: got %q want %q", key, saved[key], want)
+		}
 	}
-	if _, ok := saved["SUBAGENT_MAX_CHILDREN"]; !ok {
-		t.Fatal("migration did not append missing keys")
-	}
-}
-
-func TestLoadExplicitCLIAndEnvironmentValuesOverrideYoloPreset(t *testing.T) {
-	isolateLoad(t)
-	t.Setenv("MAX_ITERATIONS", "41")
-	t.Setenv("MAX_GOAL_ITERATIONS", "42")
-	t.Setenv("SUBAGENT_MAX_DEPTH", "43")
-	t.Setenv("SUBAGENT_MAX_PARALLEL", "44")
-	t.Setenv("SUBAGENT_TIMEOUT_SECONDS", "45")
-	t.Setenv("SUBAGENT_MAX_AGGREGATE_CHARS", "46")
-	t.Setenv("SUBAGENT_MAX_ITERATIONS", "47")
-	t.Setenv("TOOL_MAX_PARALLEL", "48")
-	t.Setenv("TOOL_TIMEOUT_SECONDS", "49")
-
-	cfg, err := Load([]string{"--yolo", "--max-iterations", "51", "--subagent-max-parallel", "52", "--tool-timeout-seconds", "53", "task"})
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.MaxIterations != 51 || cfg.MaxGoalIterations != 42 || cfg.Subagents.MaxDepth != 43 || cfg.Subagents.MaxParallel != 52 || cfg.Subagents.DefaultTimeoutSec != 45 || cfg.Subagents.MaxAggregateChars != 46 || cfg.Subagents.MaxToolIterations != 47 || cfg.ToolMaxParallel != 48 || cfg.ToolTimeoutSec != 53 {
-		t.Fatalf("explicit values did not win over YOLO preset: %+v", cfg)
+	for _, key := range numericConfigKeys {
+		if _, ok := saved[key]; !ok {
+			t.Fatalf("migration did not append missing supported key %s", key)
+		}
 	}
 }
 
-func TestLoadProviderPrecedenceIsEnvironmentThenFileThenBuiltIn(t *testing.T) {
+func TestLoadExistingConfigMissingEndpointAddsDefaultAndPreservesValues(t *testing.T) {
 	path := isolateLoad(t)
-	if err := os.WriteFile(path, []byte(strings.Join([]string{
-		"ENDPOINT = https://file.example/v1/chat/completions",
-		"MODEL = file-model",
-		"TOKEN = file-token",
-		"REASONING_EFFORT = low",
-		"",
-	}, "\n")), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	writeConfig(t, path, map[string]string{
+		"MODEL":            "custom-model",
+		"TOKEN":            "custom-token",
+		"REASONING_EFFORT": "low",
+		"MAX_ITERATIONS":   "77",
+	})
 
 	cfg, err := Load([]string{"task"})
 	if err != nil {
-		t.Fatalf("Load from file: %v", err)
-	}
-	if cfg.Endpoint != "https://file.example/v1/chat/completions" || cfg.Model != "file-model" || cfg.Token != "file-token" || cfg.Reasoning != "low" {
-		t.Fatalf("file provider settings were not applied: %+v", cfg)
-	}
-
-	t.Setenv("ENDPOINT", "https://env.example/v1/chat/completions")
-	t.Setenv("MODEL", "env-model")
-	t.Setenv("TOKEN", "env-token")
-	t.Setenv("REASONING_EFFORT", "high")
-	cfg, err = Load([]string{"task"})
-	if err != nil {
-		t.Fatalf("Load from environment: %v", err)
-	}
-	if cfg.Endpoint != "https://env.example/v1/chat/completions" || cfg.Model != "env-model" || cfg.Token != "env-token" || cfg.Reasoning != "high" {
-		t.Fatalf("environment provider settings did not override file: %+v", cfg)
-	}
-}
-
-func TestLoadYoloUsesOrdinaryGeneratedValuesAsModeFallbacks(t *testing.T) {
-	path := isolateLoad(t)
-	ordinary := strings.Join([]string{
-		"ENDPOINT = " + defaultEndpoint,
-		"MODEL = " + defaultModel,
-		"TOKEN = " + defaultToken,
-		"REASONING_EFFORT = " + defaultReasoning,
-		"MAX_ITERATIONS = 40",
-		"MAX_GOAL_ITERATIONS = 20",
-		"SUBAGENT_MAX_DEPTH = 1",
-		"SUBAGENT_MAX_PARALLEL = 4",
-		"SUBAGENT_TIMEOUT_SECONDS = 600",
-		"SUBAGENT_MAX_AGGREGATE_CHARS = 12000",
-		"SUBAGENT_MAX_ITERATIONS = 20",
-		"TOOL_MAX_PARALLEL = 8",
-		"TOOL_TIMEOUT_SECONDS = 60",
-		"",
-	}, "\n")
-	if err := os.WriteFile(path, []byte(ordinary), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	cfg, err := Load([]string{"--yolo", "task"})
-	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.MaxIterations != yoloMaxIterations || cfg.MaxGoalIterations != yoloMaxGoalIterations || cfg.ToolMaxParallel != yoloToolMaxParallel || cfg.ToolTimeoutSec != yoloToolTimeoutSec {
-		t.Fatalf("ordinary saved values did not activate YOLO root/tool fallbacks: %+v", cfg)
+	if cfg.Endpoint != defaultEndpoint {
+		t.Fatalf("missing ENDPOINT did not receive default: got %q want %q", cfg.Endpoint, defaultEndpoint)
 	}
-	if cfg.Subagents.MaxDepth != yoloSubagentMaxDepth || cfg.Subagents.MaxParallel != yoloSubagentMaxParallel || cfg.Subagents.DefaultTimeoutSec != yoloSubagentTimeoutSec || cfg.Subagents.MaxAggregateChars != yoloSubagentAggregateChars || cfg.Subagents.MaxToolIterations != yoloSubagentToolIterations {
-		t.Fatalf("ordinary saved values did not activate YOLO subagent fallbacks: %+v", cfg.Subagents)
+	if cfg.Model != "custom-model" || cfg.Token != "custom-token" || cfg.Reasoning != "low" || cfg.MaxIterations != 77 {
+		t.Fatalf("existing values were not preserved: model=%q token=%q reasoning=%q maxIterations=%d", cfg.Model, cfg.Token, cfg.Reasoning, cfg.MaxIterations)
 	}
 
 	saved, err := readConfigFile(path)
 	if err != nil {
-		t.Fatalf("read config after YOLO load: %v", err)
+		t.Fatalf("read migrated config: %v", err)
 	}
-	if saved["MAX_ITERATIONS"] != "40" || saved["MAX_GOAL_ITERATIONS"] != "20" || saved["SUBAGENT_MAX_ITERATIONS"] != "20" || saved["TOOL_MAX_PARALLEL"] != "8" || saved["TOOL_TIMEOUT_SECONDS"] != "60" {
-		t.Fatalf("YOLO load rewrote generated ordinary settings: %#v", saved)
+	if saved["ENDPOINT"] != defaultEndpoint {
+		t.Fatalf("migration did not add ENDPOINT: got %q want %q", saved["ENDPOINT"], defaultEndpoint)
+	}
+	for key, want := range map[string]string{
+		"MODEL":            "custom-model",
+		"TOKEN":            "custom-token",
+		"REASONING_EFFORT": "low",
+		"MAX_ITERATIONS":   "77",
+	} {
+		if saved[key] != want {
+			t.Fatalf("migration changed existing %s: got %q want %q", key, saved[key], want)
+		}
 	}
 }
 
-func TestLoadRejectsInvalidExplicitNumericValues(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		key  string
+func TestLoadYoloKeepsOrdinaryProfileAndOnlyChangesPermissions(t *testing.T) {
+	path := isolateLoad(t)
+	ordinary, err := Load([]string{"task"})
+	if err != nil {
+		t.Fatalf("ordinary Load: %v", err)
+	}
+	savedBefore, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read generated config: %v", err)
+	}
+
+	yolo, err := Load([]string{"--yolo", "task"})
+	if err != nil {
+		t.Fatalf("YOLO Load: %v", err)
+	}
+	if !yolo.Yolo {
+		t.Fatal("YOLO flag did not remain enabled")
+	}
+	if got, want := yolo.OrdinaryProfile(), ordinary.OrdinaryProfile(); got != want {
+		t.Fatalf("YOLO changed ordinary profile: got=%+v want=%+v", got, want)
+	}
+	if len(yolo.AllowedTools) <= len(ordinary.AllowedTools) {
+		t.Fatalf("YOLO did not expand permissions: ordinary=%d yolo=%d", len(ordinary.AllowedTools), len(yolo.AllowedTools))
+	}
+	savedAfter, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config after YOLO: %v", err)
+	}
+	if string(savedAfter) != string(savedBefore) {
+		t.Fatal("YOLO changed persisted ordinary configuration")
+	}
+}
+
+func TestGoalProfileUsesGoalDefaultsWithoutChangingOrdinaryConfig(t *testing.T) {
+	path := isolateLoad(t)
+	cfg, err := Load([]string{"--yolo", "task"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	savedBefore, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read generated config: %v", err)
+	}
+	ordinaryBefore := cfg.OrdinaryProfile()
+	goal := cfg.GoalProfile()
+
+	assertOrdinaryDefaults(t, ordinaryBefore)
+	if goal.MaxIterations != 256 || goal.MaxGoalIterations != 64 {
+		t.Fatalf("unexpected goal iterations: root=%d outer=%d", goal.MaxIterations, goal.MaxGoalIterations)
+	}
+	if got := goal.Subagents; got.MaxDepth != 2 || got.MaxChildren != defaultSubagentMaxChildren || got.MaxParallel != 8 || got.DefaultTimeoutSec != 600 || got.MaxToolIterations != 100 || got.MaxResultChars != defaultSubagentResultChars || got.MaxAggregateCount != defaultSubagentAggregateCount || got.MaxAggregateChars != 48000 || got.MaxTimeoutSec != defaultSubagentMaxTimeoutSec {
+		t.Fatalf("unexpected goal subagent profile: %+v", got)
+	}
+	if goal.ToolMaxParallel != 16 || goal.ToolTimeoutSec != 300 || !goal.ToolRetryOnTimeout {
+		t.Fatalf("unexpected goal tool profile: %+v", goal)
+	}
+	if got := cfg.OrdinaryProfile(); got != ordinaryBefore {
+		t.Fatalf("goal resolution mutated ordinary profile: before=%+v after=%+v", ordinaryBefore, got)
+	}
+	savedAfter, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config after goal resolution: %v", err)
+	}
+	if string(savedAfter) != string(savedBefore) {
+		t.Fatal("goal resolution changed persisted configuration")
+	}
+	if strings.Contains(string(savedAfter), "GOAL_PROFILE") {
+		t.Fatal("goal resolution persisted a goal-specific key")
+	}
+}
+
+func TestGoalProfilePrecedenceAcrossSources(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		env      map[string]string
+		saved    map[string]string
+		wantOrd  RuntimeProfile
+		wantGoal RuntimeProfile
 	}{
-		{name: "environment", key: "MAX_ITERATIONS"},
-		{name: "saved config", key: "SUBAGENT_MAX_PARALLEL"},
-	} {
+		{
+			name:     "CLI overrides environment and saved values",
+			args:     []string{"--max-iterations", "31", "--max-goal-iterations", "32", "--subagent-max-depth", "33", "--subagent-max-parallel", "34", "--subagent-max-iterations", "35", "--subagent-max-aggregate-chars", "36", "--tool-max-parallel", "37", "--tool-timeout-seconds", "38", "task"},
+			env:      map[string]string{"MAX_ITERATIONS": "41", "MAX_GOAL_ITERATIONS": "42", "SUBAGENT_MAX_DEPTH": "43", "SUBAGENT_MAX_PARALLEL": "44", "SUBAGENT_MAX_ITERATIONS": "45", "SUBAGENT_MAX_AGGREGATE_CHARS": "46", "TOOL_MAX_PARALLEL": "47", "TOOL_TIMEOUT_SECONDS": "48"},
+			saved:    map[string]string{"MAX_ITERATIONS": "51", "MAX_GOAL_ITERATIONS": "52", "SUBAGENT_MAX_DEPTH": "53", "SUBAGENT_MAX_PARALLEL": "54", "SUBAGENT_MAX_ITERATIONS": "55", "SUBAGENT_MAX_AGGREGATE_CHARS": "56", "TOOL_MAX_PARALLEL": "57", "TOOL_TIMEOUT_SECONDS": "58"},
+			wantOrd:  RuntimeProfile{MaxIterations: 31, MaxGoalIterations: 32, Subagents: SubagentConfig{MaxDepth: 33, MaxChildren: 8, MaxParallel: 34, DefaultTimeoutSec: 600, MaxTimeoutSec: 1800, MaxToolIterations: 35, MaxResultChars: 8000, MaxAggregateCount: 12, MaxAggregateChars: 36}, ToolMaxParallel: 37, ToolTimeoutSec: 38, ToolRetryOnTimeout: true},
+			wantGoal: RuntimeProfile{MaxIterations: 31, MaxGoalIterations: 32, Subagents: SubagentConfig{MaxDepth: 33, MaxChildren: 8, MaxParallel: 34, DefaultTimeoutSec: 600, MaxTimeoutSec: 1800, MaxToolIterations: 35, MaxResultChars: 8000, MaxAggregateCount: 12, MaxAggregateChars: 36}, ToolMaxParallel: 37, ToolTimeoutSec: 38, ToolRetryOnTimeout: true},
+		},
+		{
+			name:     "environment overrides saved values for both profiles",
+			env:      map[string]string{"MAX_ITERATIONS": "41", "MAX_GOAL_ITERATIONS": "42", "SUBAGENT_MAX_DEPTH": "43", "SUBAGENT_MAX_PARALLEL": "44", "SUBAGENT_MAX_ITERATIONS": "45", "SUBAGENT_MAX_AGGREGATE_CHARS": "46", "TOOL_MAX_PARALLEL": "47", "TOOL_TIMEOUT_SECONDS": "48"},
+			saved:    map[string]string{"MAX_ITERATIONS": "51", "MAX_GOAL_ITERATIONS": "52", "SUBAGENT_MAX_DEPTH": "53", "SUBAGENT_MAX_PARALLEL": "54", "SUBAGENT_MAX_ITERATIONS": "55", "SUBAGENT_MAX_AGGREGATE_CHARS": "56", "TOOL_MAX_PARALLEL": "57", "TOOL_TIMEOUT_SECONDS": "58"},
+			wantOrd:  RuntimeProfile{MaxIterations: 41, MaxGoalIterations: 42, Subagents: SubagentConfig{MaxDepth: 43, MaxChildren: 8, MaxParallel: 44, DefaultTimeoutSec: 600, MaxTimeoutSec: 1800, MaxToolIterations: 45, MaxResultChars: 8000, MaxAggregateCount: 12, MaxAggregateChars: 46}, ToolMaxParallel: 47, ToolTimeoutSec: 48, ToolRetryOnTimeout: true},
+			wantGoal: RuntimeProfile{MaxIterations: 41, MaxGoalIterations: 42, Subagents: SubagentConfig{MaxDepth: 43, MaxChildren: 8, MaxParallel: 44, DefaultTimeoutSec: 600, MaxTimeoutSec: 1800, MaxToolIterations: 45, MaxResultChars: 8000, MaxAggregateCount: 12, MaxAggregateChars: 46}, ToolMaxParallel: 47, ToolTimeoutSec: 48, ToolRetryOnTimeout: true},
+		},
+		{
+			name:     "custom saved values override goal fallbacks",
+			saved:    map[string]string{"MAX_ITERATIONS": "51", "MAX_GOAL_ITERATIONS": "52", "SUBAGENT_MAX_DEPTH": "53", "SUBAGENT_MAX_PARALLEL": "54", "SUBAGENT_MAX_ITERATIONS": "55", "SUBAGENT_MAX_AGGREGATE_CHARS": "56", "TOOL_MAX_PARALLEL": "57", "TOOL_TIMEOUT_SECONDS": "58"},
+			wantOrd:  RuntimeProfile{MaxIterations: 51, MaxGoalIterations: 52, Subagents: SubagentConfig{MaxDepth: 53, MaxChildren: 8, MaxParallel: 54, DefaultTimeoutSec: 600, MaxTimeoutSec: 1800, MaxToolIterations: 55, MaxResultChars: 8000, MaxAggregateCount: 12, MaxAggregateChars: 56}, ToolMaxParallel: 57, ToolTimeoutSec: 58, ToolRetryOnTimeout: true},
+			wantGoal: RuntimeProfile{MaxIterations: 51, MaxGoalIterations: 52, Subagents: SubagentConfig{MaxDepth: 53, MaxChildren: 8, MaxParallel: 54, DefaultTimeoutSec: 600, MaxTimeoutSec: 1800, MaxToolIterations: 55, MaxResultChars: 8000, MaxAggregateCount: 12, MaxAggregateChars: 56}, ToolMaxParallel: 57, ToolTimeoutSec: 58, ToolRetryOnTimeout: true},
+		},
+		{
+			name:     "saved ordinary defaults use goal fallbacks",
+			saved:    map[string]string{"MAX_ITERATIONS": "40", "MAX_GOAL_ITERATIONS": "20", "SUBAGENT_MAX_DEPTH": "1", "SUBAGENT_MAX_PARALLEL": "4", "SUBAGENT_MAX_ITERATIONS": "20", "SUBAGENT_MAX_AGGREGATE_CHARS": "12000", "TOOL_MAX_PARALLEL": "8", "TOOL_TIMEOUT_SECONDS": "60"},
+			wantOrd:  RuntimeProfile{MaxIterations: 40, MaxGoalIterations: 20, Subagents: SubagentConfig{MaxDepth: 1, MaxChildren: 8, MaxParallel: 4, DefaultTimeoutSec: 600, MaxTimeoutSec: 1800, MaxToolIterations: 20, MaxResultChars: 8000, MaxAggregateCount: 12, MaxAggregateChars: 12000}, ToolMaxParallel: 8, ToolTimeoutSec: 60, ToolRetryOnTimeout: true},
+			wantGoal: RuntimeProfile{MaxIterations: 256, MaxGoalIterations: 64, Subagents: SubagentConfig{MaxDepth: 2, MaxChildren: 8, MaxParallel: 8, DefaultTimeoutSec: 600, MaxTimeoutSec: 1800, MaxToolIterations: 100, MaxResultChars: 8000, MaxAggregateCount: 12, MaxAggregateChars: 48000}, ToolMaxParallel: 16, ToolTimeoutSec: 300, ToolRetryOnTimeout: true},
+		},
+	}
+
+	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			path := isolateLoad(t)
-			if tc.name == "environment" {
-				t.Setenv(tc.key, "0")
-			} else if err := os.WriteFile(path, []byte("ENDPOINT = "+defaultEndpoint+"\n"+tc.key+" = 0\n"), 0o644); err != nil {
-				t.Fatalf("WriteFile: %v", err)
+			for key, value := range tc.env {
+				t.Setenv(key, value)
 			}
-			if _, err := Load([]string{"--yolo", "task"}); err == nil {
-				t.Fatalf("Load accepted invalid %s value", tc.name)
+			values := map[string]string{"ENDPOINT": defaultEndpoint}
+			for key, value := range tc.saved {
+				values[key] = value
+			}
+			if len(tc.saved) > 0 {
+				writeConfig(t, path, values)
+			}
+			cfg, err := Load(tc.args)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			tc.wantOrd.Subagents.Model = defaultModel
+			tc.wantOrd.Subagents.ReasoningEffort = defaultReasoning
+			tc.wantGoal.Subagents.Model = defaultModel
+			tc.wantGoal.Subagents.ReasoningEffort = defaultReasoning
+			if got := cfg.OrdinaryProfile(); got != tc.wantOrd {
+				t.Fatalf("ordinary profile: got=%+v want=%+v", got, tc.wantOrd)
+			}
+			if got := cfg.GoalProfile(); got != tc.wantGoal {
+				t.Fatalf("goal profile: got=%+v want=%+v", got, tc.wantGoal)
 			}
 		})
+	}
+}
+
+func TestExplicitDefaultCLIAndEnvironmentValuesRemainExplicitForGoals(t *testing.T) {
+	t.Run("CLI", func(t *testing.T) {
+		isolateLoad(t)
+		cfg, err := Load([]string{"--max-iterations", "40", "--tool-timeout-seconds", "60", "task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		goal := cfg.GoalProfile()
+		if goal.MaxIterations != 40 || goal.ToolTimeoutSec != 60 {
+			t.Fatalf("explicit CLI defaults received goal fallbacks: %+v", goal)
+		}
+	})
+	t.Run("environment", func(t *testing.T) {
+		isolateLoad(t)
+		t.Setenv("MAX_ITERATIONS", "40")
+		t.Setenv("TOOL_TIMEOUT_SECONDS", "60")
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		goal := cfg.GoalProfile()
+		if goal.MaxIterations != 40 || goal.ToolTimeoutSec != 60 {
+			t.Fatalf("explicit environment defaults received goal fallbacks: %+v", goal)
+		}
+	})
+}
+
+func TestLoadRejectsInvalidNonPositiveNumericValuesFromEverySource(t *testing.T) {
+	flags := map[string]string{
+		"MAX_ITERATIONS":               "--max-iterations",
+		"MAX_GOAL_ITERATIONS":          "--max-goal-iterations",
+		"SUBAGENT_MAX_DEPTH":           "--subagent-max-depth",
+		"SUBAGENT_MAX_CHILDREN":        "--subagent-max-children",
+		"SUBAGENT_MAX_PARALLEL":        "--subagent-max-parallel",
+		"SUBAGENT_TIMEOUT_SECONDS":     "--subagent-timeout-seconds",
+		"SUBAGENT_MAX_RESULT_CHARS":    "--subagent-max-result-chars",
+		"SUBAGENT_MAX_AGGREGATE_CHARS": "--subagent-max-aggregate-chars",
+		"SUBAGENT_MAX_ITERATIONS":      "--subagent-max-iterations",
+		"TOOL_MAX_PARALLEL":            "--tool-max-parallel",
+		"TOOL_TIMEOUT_SECONDS":         "--tool-timeout-seconds",
+	}
+	for key, flag := range flags {
+		t.Run("CLI/"+key, func(t *testing.T) {
+			isolateLoad(t)
+			if _, err := Load([]string{flag, "0", "task"}); err == nil {
+				t.Fatalf("Load accepted invalid CLI value for %s", key)
+			}
+		})
+		t.Run("environment/"+key, func(t *testing.T) {
+			isolateLoad(t)
+			t.Setenv(key, "0")
+			if _, err := Load([]string{"task"}); err == nil {
+				t.Fatalf("Load accepted invalid environment value for %s", key)
+			}
+		})
+		t.Run("saved/"+key, func(t *testing.T) {
+			path := isolateLoad(t)
+			writeConfig(t, path, map[string]string{"ENDPOINT": defaultEndpoint, key: "0"})
+			if _, err := Load([]string{"task"}); err == nil {
+				t.Fatalf("Load accepted invalid saved value for %s", key)
+			}
+		})
+	}
+}
+
+func assertOrdinaryDefaults(t *testing.T, profile RuntimeProfile) {
+	t.Helper()
+	if profile.MaxIterations != 40 || profile.MaxGoalIterations != 20 || profile.ToolMaxParallel != 8 || profile.ToolTimeoutSec != 60 || !profile.ToolRetryOnTimeout {
+		t.Fatalf("unexpected ordinary profile: %+v", profile)
+	}
+	if got := profile.Subagents; got.MaxDepth != 1 || got.MaxChildren != 8 || got.MaxParallel != 4 || got.DefaultTimeoutSec != 600 || got.MaxTimeoutSec != 1800 || got.MaxToolIterations != 20 || got.MaxResultChars != 8000 || got.MaxAggregateCount != 12 || got.MaxAggregateChars != 12000 {
+		t.Fatalf("unexpected ordinary subagent profile: %+v", got)
 	}
 }
