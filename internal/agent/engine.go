@@ -119,14 +119,14 @@ func (e *Engine) Run(ctx context.Context, options RunOptions) (Result, error) {
 
 	for iter := 0; iter < maxIterations; iter++ {
 		if err := ctx.Err(); err != nil {
-			return Result{Messages: state.Messages()}, err
+			return Result{Messages: state.Messages(), ContinuationState: exportContinuationState(e.Provider, state)}, err
 		}
 		if iter == maxIterations-3 && maxIterations > 3 {
 			e.Provider.AppendUserPrompt(state, "[SYSTEM] You have "+itoa(maxIterations-iter)+" iterations remaining. Wrap up and produce a final answer now.")
 		}
 		response, err := e.completeWithRetry(ctx, state, options)
 		if err != nil {
-			return Result{Messages: state.Messages()}, err
+			return Result{Messages: state.Messages(), ContinuationState: exportContinuationState(e.Provider, state)}, err
 		}
 		if content := trim(response.Content()); content != "" {
 			lastContent = content
@@ -146,7 +146,7 @@ func (e *Engine) Run(ctx context.Context, options RunOptions) (Result, error) {
 			return Result{Messages: state.Messages(), Answer: lastContent, Reasoning: reasoning.String(), ContinuationState: exportContinuationState(e.Provider, state)}, nil
 		}
 		if options.ToolRunner == nil {
-			return Result{Messages: state.Messages(), Answer: lastContent, Reasoning: reasoning.String()}, context.Canceled
+			return Result{Messages: state.Messages(), Answer: lastContent, Reasoning: reasoning.String(), ContinuationState: exportContinuationState(e.Provider, state)}, context.Canceled
 		}
 		for _, call := range calls {
 			if options.EmitOutput {
@@ -181,7 +181,7 @@ func (e *Engine) Run(ctx context.Context, options RunOptions) (Result, error) {
 		if lastContent != "" {
 			return Result{Messages: state.Messages(), Answer: lastContent, Reasoning: reasoning.String(), ContinuationState: exportContinuationState(e.Provider, state)}, nil
 		}
-		return Result{Messages: state.Messages()}, errorf("exceeded maximum tool iterations (%d) and final-answer call failed: %v", maxIterations, err)
+		return Result{Messages: state.Messages(), ContinuationState: exportContinuationState(e.Provider, state)}, errorf("exceeded maximum tool iterations (%d) and final-answer call failed: %v", maxIterations, err)
 	}
 	if content := trim(response.Content()); content != "" {
 		if options.EmitOutput {

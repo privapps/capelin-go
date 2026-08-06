@@ -3,8 +3,11 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"capelin-go/internal/policy"
 )
 
 var numericConfigKeys = []string{
@@ -27,7 +30,7 @@ func isolateLoad(t *testing.T) string {
 	t.Setenv("CAPELIN_CONFIG_FILE", path)
 	for _, key := range append([]string{
 		"ENDPOINT", "MODEL", "TOKEN", "REASONING_EFFORT", "SYSTEM_PROMPT",
-		"SUBAGENT_MODEL", "SUBAGENT_REASONING_EFFORT",
+		"SUBAGENT_MODEL", "SUBAGENT_REASONING_EFFORT", "IDLE_HOOK_COMMAND", "IDLE_HOOK_ARGS",
 	}, numericConfigKeys...) {
 		t.Setenv(key, "")
 	}
@@ -37,7 +40,7 @@ func isolateLoad(t *testing.T) string {
 func writeConfig(t *testing.T, path string, values map[string]string) {
 	t.Helper()
 	lines := make([]string, 0, len(values))
-	for _, key := range []string{"ENDPOINT", "MODEL", "TOKEN", "REASONING_EFFORT"} {
+	for _, key := range []string{"ENDPOINT", "MODEL", "TOKEN", "REASONING_EFFORT", "IDLE_HOOK_COMMAND", "IDLE_HOOK_ARGS"} {
 		if value, ok := values[key]; ok {
 			lines = append(lines, key+" = "+value)
 		}
@@ -81,6 +84,8 @@ func TestLoadFirstRunUsesProviderDefaultsAndGeneratesOrdinaryConfig(t *testing.T
 		"SUBAGENT_MAX_ITERATIONS = 20",
 		"TOOL_MAX_PARALLEL = 8",
 		"TOOL_TIMEOUT_SECONDS = 60",
+		"IDLE_HOOK_COMMAND =",
+		"IDLE_HOOK_ARGS = []",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Fatalf("generated config missing %q:\n%s", want, contents)
@@ -374,5 +379,115 @@ func assertOrdinaryDefaults(t *testing.T, profile RuntimeProfile) {
 	}
 	if got := profile.Subagents; got.MaxDepth != 1 || got.MaxChildren != 8 || got.MaxParallel != 4 || got.DefaultTimeoutSec != 600 || got.MaxTimeoutSec != 1800 || got.MaxToolIterations != 20 || got.MaxResultChars != 8000 || got.MaxAggregateCount != 12 || got.MaxAggregateChars != 12000 {
 		t.Fatalf("unexpected ordinary subagent profile: %+v", got)
+	}
+}
+
+func TestIdleHookConfigurationPrecedenceAndValidation(t *testing.T) {
+	t.Run("environment overrides saved values", func(t *testing.T) {
+		path := isolateLoad(t)
+		writeConfig(t, path, map[string]string{
+			"IDLE_HOOK_COMMAND": "saved-hook",
+			"IDLE_HOOK_ARGS":    `["saved"]`,
+		})
+		t.Setenv("IDLE_HOOK_COMMAND", "env-hook")
+		t.Setenv("IDLE_HOOK_ARGS", `["env", "argument"]`)
+		cfg, err := Load([]string{"--allow-tool", policy.ExecuteProgram, "task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.IdleHookCommand != "env-hook" || !reflect.DeepEqual(cfg.IdleHookArgs, []string{"env", "argument"}) {
+			t.Fatalf("environment hook values did not override saved values: command=%q args=%#v", cfg.IdleHookCommand, cfg.IdleHookArgs)
+		}
+	})
+
+	t.Run("malformed arguments are rejected for configured command", func(t *testing.T) {
+		path := isolateLoad(t)
+		writeConfig(t, path, map[string]string{
+			"IDLE_HOOK_COMMAND": "hook",
+			"IDLE_HOOK_ARGS":    `{"not":"an array"}`,
+		})
+		_, err := Load([]string{"--allow-tool", policy.ExecuteProgram, "task"})
+		if err == nil || !strings.Contains(err.Error(), "IDLE_HOOK_ARGS") {
+			t.Fatalf("malformed hook arguments were not rejected clearly: %v", err)
+		}
+	})
+
+	t.Run("null array elements are rejected", func(t *testing.T) {
+		path := isolateLoad(t)
+		writeConfig(t, path, map[string]string{
+			"IDLE_HOOK_COMMAND": "hook",
+			"IDLE_HOOK_ARGS":    `["valid", null]`,
+		})
+		_, err := Load([]string{"--allow-tool", policy.ExecuteProgram, "task"})
+		if err == nil || !strings.Contains(err.Error(), "IDLE_HOOK_ARGS") {
+			t.Fatalf("null hook argument was not rejected clearly: %v", err)
+		}
+	})
+
+	t.Run("blank command disables hook", func(t *testing.T) {
+		path := isolateLoad(t)
+		writeConfig(t, path, map[string]string{
+			"IDLE_HOOK_COMMAND": "   ",
+			"IDLE_HOOK_ARGS":    `{"not":"an array"}`,
+		})
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("blank hook command should disable hook: %v", err)
+		}
+		if cfg.IdleHookCommand != "" || len(cfg.IdleHookArgs) != 0 {
+			t.Fatalf("blank hook was not disabled: command=%q args=%#v", cfg.IdleHookCommand, cfg.IdleHookArgs)
+		}
+	})
+
+	t.Run("permission is required in local mode", func(t *testing.T) {
+		path := isolateLoad(t)
+		writeConfig(t, path, map[string]string{"IDLE_HOOK_COMMAND": "hook"})
+		_, err := Load([]string{"task"})
+		if err == nil || !strings.Contains(err.Error(), "execute_program") || !strings.Contains(err.Error(), "--allow-tool") {
+			t.Fatalf("missing actionable hook permission error: %v", err)
+		}
+	})
+}
+
+func TestIdleHookSettingsAreMigratedWithoutChangingExistingValues(t *testing.T) {
+	path := isolateLoad(t)
+	writeConfig(t, path, map[string]string{"MODEL": "preserved", "IDLE_HOOK_COMMAND": "saved-hook", "IDLE_HOOK_ARGS": `["one"]`})
+	if _, err := Load([]string{"--allow-tool", policy.ExecuteProgram, "task"}); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	saved, err := readConfigFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved["MODEL"] != "preserved" || saved["IDLE_HOOK_COMMAND"] != "saved-hook" || saved["IDLE_HOOK_ARGS"] != `["one"]` {
+		t.Fatalf("migration changed existing values: %#v", saved)
+	}
+	if _, ok := saved["IDLE_HOOK_COMMAND"]; !ok {
+		t.Fatal("migration omitted IDLE_HOOK_COMMAND")
+	}
+	if _, ok := saved["IDLE_HOOK_ARGS"]; !ok {
+		t.Fatal("migration omitted IDLE_HOOK_ARGS")
+	}
+}
+
+func TestServerModeIgnoresLocalIdleHookConfiguration(t *testing.T) {
+	path := isolateLoad(t)
+	writeConfig(t, path, map[string]string{
+		"ENDPOINT":          defaultEndpoint,
+		"IDLE_HOOK_COMMAND": "server-must-ignore",
+		"IDLE_HOOK_ARGS":    `{"not":"an array"}`,
+	})
+	t.Setenv("IDLE_HOOK_COMMAND", "environment-hook")
+	t.Setenv("IDLE_HOOK_ARGS", `not-json`)
+
+	cfg, err := Load([]string{"--server-port", "8899"})
+	if err != nil {
+		t.Fatalf("server Load rejected local-only hook settings: %v", err)
+	}
+	if cfg.IdleHookCommand != "" || len(cfg.IdleHookArgs) != 0 {
+		t.Fatalf("server config retained local hook: command=%q args=%#v", cfg.IdleHookCommand, cfg.IdleHookArgs)
+	}
+	if cfg.ServerPort != 8899 || !cfg.ServerSecurityEnabled {
+		t.Fatalf("server mode contract changed: port=%d security=%v", cfg.ServerPort, cfg.ServerSecurityEnabled)
 	}
 }

@@ -50,6 +50,11 @@ func startServer(cfg config) error {
 		toolListSubagents: true, toolReadSubagent: true, toolCancelSubagent: true,
 	}
 	serverCfg := cfg
+	// Server requests are remote work: never carry a local idle hook into the
+	// server composition, even when a caller constructs config directly instead
+	// of using config.Load's server-mode exclusion.
+	serverCfg.idleHookCommand = ""
+	serverCfg.idleHookArgs = nil
 	serverCfg.allowedTools = cloneAllowedTools(serverAllowedTools)
 	a := &app{
 		cfg:       serverCfg,

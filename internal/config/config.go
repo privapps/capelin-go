@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -113,6 +114,8 @@ type Config struct {
 	ServerAllowedTargets      string
 	ServerAllowPrivateTargets string
 	ServerSecurityEnabled     bool
+	IdleHookCommand           string
+	IdleHookArgs              []string
 	ToolMaxParallel           int  // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
 	ToolTimeoutSec            int  // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
 	ToolRetryOnTimeout        bool // retry once on timeout (0 = disable; empty = default true)
@@ -253,7 +256,8 @@ func (c *SubagentConfig) normalize() {
 var ErrHelpRequested = errors.New("help requested")
 
 func Load(args []string) (Config, error) {
-	fileCfg, err := ensureConfigFileForMode(hasServerPortFlag(args))
+	serverMode := hasServerPortFlag(args)
+	fileCfg, err := ensureConfigFileForMode(serverMode)
 	if err != nil {
 		return Config{}, fmt.Errorf("config file: %w", err)
 	}
@@ -576,6 +580,18 @@ func Load(args []string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	idleHookCommand := ""
+	var idleHookArgs []string
+	if !serverMode {
+		idleHookCommand = readCfg("IDLE_HOOK_COMMAND", fileCfg, "")
+		idleHookArgs, err = readIdleHookArgs(idleHookCommand, fileCfg)
+		if err != nil {
+			return Config{}, err
+		}
+		if strings.TrimSpace(idleHookCommand) != "" && !yolo && !allowedTools[policy.ExecuteProgram] {
+			return Config{}, errors.New("IDLE_HOOK_COMMAND requires execute_program permission; start with --allow-tool execute_program or --yolo")
+		}
+	}
 	workspaceRoot, err := os.Getwd()
 	if err != nil {
 		return Config{}, fmt.Errorf("resolving workspace root: %w", err)
@@ -680,7 +696,9 @@ func Load(args []string) (Config, error) {
 		ServerAllowedOrigins:      readCfg("SERVER_ALLOWED_ORIGINS", fileCfg, ""),
 		ServerAllowedTargets:      readCfg("SERVER_ALLOWED_TARGETS", fileCfg, ""),
 		ServerAllowPrivateTargets: readCfg("SERVER_ALLOW_PRIVATE_TARGETS", fileCfg, "false"),
-		ServerSecurityEnabled:     serverPort > 0,
+		ServerSecurityEnabled:     serverMode,
+		IdleHookCommand:           idleHookCommand,
+		IdleHookArgs:              idleHookArgs,
 		ToolMaxParallel:           toolMaxParallel,
 		ToolTimeoutSec:            toolTimeoutSec,
 		ToolRetryOnTimeout:        toolRetryOnTimeout != 0,
@@ -844,6 +862,36 @@ func readReasoningEffort(fileCfg map[string]string) (string, error) {
 	return value, nil
 }
 
+func readIdleHookArgs(command string, fileCfg map[string]string) ([]string, error) {
+	if strings.TrimSpace(command) == "" {
+		return nil, nil
+	}
+	raw := readCfg("IDLE_HOOK_ARGS", fileCfg, "")
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	if strings.EqualFold(strings.TrimSpace(raw), "null") {
+		return nil, errors.New("IDLE_HOOK_ARGS must be a JSON string array")
+	}
+	var rawArgs []json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &rawArgs); err != nil || rawArgs == nil {
+		if err == nil {
+			err = errors.New("value is not an array")
+		}
+		return nil, fmt.Errorf("IDLE_HOOK_ARGS must be a JSON string array: %w", err)
+	}
+	args := make([]string, len(rawArgs))
+	for i, rawArg := range rawArgs {
+		if strings.TrimSpace(string(rawArg)) == "null" {
+			return nil, fmt.Errorf("IDLE_HOOK_ARGS must be a JSON string array: element %d is null", i)
+		}
+		if err := json.Unmarshal(rawArg, &args[i]); err != nil {
+			return nil, fmt.Errorf("IDLE_HOOK_ARGS must be a JSON string array: element %d: %w", i, err)
+		}
+	}
+	return args, nil
+}
+
 // configFilePath returns the path to the user-level config file.
 // If the env var CAPELIN_CONFIG_FILE is set, it is used as-is (useful for tests
 // and users who want a non-default location).
@@ -895,6 +943,11 @@ SUBAGENT_REASONING_EFFORT =
 TOOL_MAX_PARALLEL = 8
 TOOL_TIMEOUT_SECONDS = 60
 TOOL_RETRY_ON_TIMEOUT = true
+
+# Local one-shot idle hook (requires --allow-tool execute_program or --yolo).
+# IDLE_HOOK_ARGS is a JSON string array and is executed without a shell.
+IDLE_HOOK_COMMAND =
+IDLE_HOOK_ARGS = []
 
 # Server mode security (empty means no browser or dynamic outbound access).
 SERVER_ALLOWED_ORIGINS =

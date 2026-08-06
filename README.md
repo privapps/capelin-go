@@ -31,7 +31,7 @@
 - fetch blocks localhost/private network targets
 - subagents inherit parent tool policy and can only further restrict allowed tools
 - subagents enforce depth/children/timeout limits and bounded parallel workers
-- when a parent is at `MaxChildren`, `create_subagent` defaults to `overflow_mode="wait_for_slot"` (bounded by timeout, default 300s); use `overflow_mode="fail_fast"` for immediate rejection
+- when a parent reaches `MaxChildren`, `create_subagent` keeps a bounded pending/queued allowance without blocking the parent tool batch; a full allowance returns an actionable capacity error that can be retried after terminal children release capacity
 - **`--yolo`**: enables all opt-in tools and removes path confinement (shorthand for enabling everything)
 
 ## Build
@@ -64,7 +64,17 @@ Interactive mode (multi-turn REPL with shared conversation history):
 ./capelin-go -i
 ```
 
-Interactive slash commands:
+A leading `/goal` in an initial prompt supplied with `--interactive` uses the
+same bounded goal workflow as entering `/goal` at the REPL:
+
+```bash
+./capelin-go --interactive --yolo '/goal inspect the repository and verify the result'
+```
+
+Other initial prompts remain ordinary interactive turns. Existing local slash
+commands such as `/save`, `/compact`, and session commands are handled only
+when entered at the REPL.
+
 
 - `/exit` or `/quit` ends the session without sending a prompt to the model.
 - `/save` writes the latest successful textual assistant response to
@@ -82,11 +92,26 @@ Interactive slash commands:
   session. Each row includes a label, recent direct input, message count, update
   time, and checklist progress. `/session-resume [ID|PREFIX]` switches to an exact,
   unique-prefix, or newest saved session.
-- `/session-rename <name>` sets a durable display name; `/session-rename --clear`
-  restores the derived topic label.
 
 - `/goal <objective>` — start a new bounded checklist-driven objective; requires `--yolo`
 - `/goal` — continue the current incomplete checklist; requires `--yolo`
+
+For shell automation, a quoted leading `/goal <objective>` is also supported in
+one-shot mode:
+
+```bash
+./capelin-go --yolo '/goal inspect the repository and verify the result'
+./capelin-go --yolo '/goal $implement apply the requested change'
+```
+
+Quote the complete argument so the shell preserves both the command and any
+`$skill` references. A one-shot `/goal` must include an objective; it never
+implicitly selects a saved goal. Accepted goals create a durable session under
+`.capelin-go/sessions/`, and the command prints a `--resume <id>` hint. A goal
+exits non-zero unless its checklist is non-empty and complete, its
+`complete_goal` evidence handshake is valid, and the final session save
+succeeds. Incomplete goals retain their latest state for interactive resume
+with `--interactive --resume <id>` followed by bare `/goal`.
 
 Interactive sessions are saved atomically under `.capelin-go/sessions/` after
 successful turns, checklist updates, switches, and exit. The REPL prints the
@@ -297,6 +322,15 @@ Subagent orchestration is enabled by default — no flags needed:
 ./capelin-go "break this task into workers and aggregate results"
 ```
 
+Creation and execution remain separate phases. A batch of `create_subagent`
+calls returns promptly, including handles that are pending; `run_subagent` then
+queues those handles and the scheduler starts them within the configured
+`SUBAGENT_MAX_CHILDREN` and `SUBAGENT_MAX_PARALLEL` limits. If the bounded
+pending/queued allowance is full, the tool returns a recoverable capacity error;
+run admitted handles, await or cancel them, and retry after terminal work
+releases capacity. Listing and aggregate reads expose `pending`, `queued`,
+`running`, `completed`, `failed`, `cancelled`, and `timed_out` states.
+
 Tune subagent limits (all have env var equivalents, see below):
 
 ```bash
@@ -337,7 +371,7 @@ Enable everything (all tools + unrestricted paths):
 - `MAX_ITERATIONS` — root agent tool-call iteration cap (ordinary default: 40; goal profile default: 256; overridden by `--max-iterations`)
 - `MAX_GOAL_ITERATIONS` — outer `/goal` iteration cap (ordinary default: 20; goal profile default: 64; overridden by `--max-goal-iterations`); applies only to accepted interactive goals
 - `SUBAGENT_MAX_DEPTH` — maximum subagent nesting depth (ordinary default: 1; goal profile default: 2; overridden by `--subagent-max-depth`)
-- `SUBAGENT_MAX_CHILDREN` — maximum active subagents (pending/queued/running) a single parent can hold at once (default: 8; overridden by `--subagent-max-children`)
+- `SUBAGENT_MAX_CHILDREN` — maximum child execution slots a single parent can hold at once (default: 8; overridden by `--subagent-max-children`); bounded pending/queued admission remains separate and does not raise this execution limit
 - `SUBAGENT_MAX_PARALLEL` — maximum concurrently running parallel subagents (ordinary default: 4; goal profile default: 8; overridden by `--subagent-max-parallel`)
 - `SUBAGENT_TIMEOUT_SECONDS` — default subagent execution timeout in seconds (ordinary and goal profile default: 600; overridden by `--subagent-timeout-seconds`)
 - `SUBAGENT_MAX_RESULT_CHARS` — maximum characters returned per subagent result (default: 8000; overridden by `--subagent-max-result-chars`)
@@ -415,3 +449,20 @@ ENDPOINT = https://api.openai.com/v1/responses
 When the endpoint path ends with `/responses`, capelin-go sends the official Responses API format, including `input`, flat function tools, and `reasoning.effort`. Function calls are continued with matching `function_call_output` items, and requests are stateless: capelin-go does not use `previous_response_id`.
 
 Endpoints that do not end with `/responses` continue to use Chat Completions. Provider-specific Responses variants and streaming are not supported.
+
+## Local idle hooks
+
+Local users can configure `IDLE_HOOK_COMMAND` and `IDLE_HOOK_ARGS` in the
+saved configuration or environment. `IDLE_HOOK_ARGS` is a JSON string array;
+values follow CLI > environment > saved config > built-in defaults precedence.
+A non-empty hook requires `--allow-tool execute_program` or `--yolo`, runs the
+executable directly without a shell, and retains the normal program safety,
+workspace, timeout, output, and cancellation safeguards. It runs once after a
+local one-shot terminal outcome or finalized interactive turn; interactive
+hooks are backgrounded and serialized, one-shot shutdown drains them, and
+failures are logged without changing the original result.
+
+The hook is strictly local. Server-mode synchronous and asynchronous HTTP
+requests never invoke it, even when the server is started with YOLO or
+program-execution permission. Server tool restrictions and HTTP delivery
+contracts are unchanged.

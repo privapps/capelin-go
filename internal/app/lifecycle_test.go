@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -317,26 +318,74 @@ func TestSessionStoreDerivesLegacyMetadataAndRoundTripsNames(t *testing.T) {
 	}
 }
 
-func TestInteractiveSessionRenameRejectsEmptyAndClearsName(t *testing.T) {
+func TestHistoricalNamedSessionRemainsLoadableResumableAndListed(t *testing.T) {
 	testApp := newInteractiveTurnTestApp(t)
-	session, err := testApp.app.newInteractiveSession([]types.Message{{Role: "system", Content: "test"}, {Role: "user", Content: "topic"}})
+	store := testApp.app.sessionStore
+	if store == nil {
+		var err error
+		store, err = newSessionStore(testApp.workspaceRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		testApp.app.sessionStore = store
+	}
+	historical := sessionSnapshot{
+		SessionUUID: generateUUID(),
+		Messages: []types.Message{
+			{Role: "system", Content: "test"},
+			{Role: "user", Content: "historical prompt"},
+			{Role: "assistant", Content: "historical answer"},
+		},
+		Name:      "  historical name  ",
+		Topic:     "derived topic",
+		LastInput: "historical prompt",
+		Todos:     []todoItem{},
+	}
+	if err := store.save(historical); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := store.resolve(historical.SessionUUID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := testApp.app.renameInteractiveSession(session, "named"); err != nil {
+	if loaded.Name != "historical name" {
+		t.Fatalf("historical name did not load: %#v", loaded)
+	}
+	if got := sessionDisplayLabel(loaded); got != "historical name" {
+		t.Fatalf("name-first display label = %q, want historical name", got)
+	}
+
+	current, err := testApp.app.newInteractiveSession([]types.Message{{Role: "system", Content: "current"}})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := testApp.app.renameInteractiveSession(session, ""); err == nil {
-		t.Fatal("empty session name unexpectedly succeeded")
+	if err := testApp.app.switchToSavedSession(current, historical.SessionUUID); err != nil {
+		t.Fatalf("resume historical session: %v", err)
 	}
-	if session.name != "named" {
-		t.Fatalf("empty rename changed current name: %q", session.name)
+	if current.name != "historical name" || len(current.messages) != len(historical.Messages) {
+		t.Fatalf("resumed historical session lost metadata or messages: name=%q messages=%d", current.name, len(current.messages))
 	}
-	if err := testApp.app.renameInteractiveSession(session, "--clear"); err != nil {
+
+	read, write, err := os.Pipe()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if session.name != "" {
-		t.Fatalf("clear did not remove explicit session name: %q", session.name)
+	originalStderr := os.Stderr
+	os.Stderr = write
+	listErr := testApp.app.listInteractiveSessions(current)
+	_ = write.Close()
+	os.Stderr = originalStderr
+	listing, readErr := io.ReadAll(read)
+	_ = read.Close()
+	if listErr != nil {
+		t.Fatalf("list historical session: %v", listErr)
+	}
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(listing), historical.SessionUUID) || !strings.Contains(string(listing), "historical name") {
+		t.Fatalf("historical name was not present in session list: %q", listing)
 	}
 }
 

@@ -50,6 +50,10 @@ func writeServerRequestError(w http.ResponseWriter, err error) bool {
 
 func (a *app) newServerExecutionApp(execution *serverExecutionRequest) (*app, *agentRuntime) {
 	serverCfg := a.cfg
+	// A server execution is always remote and must not inherit local lifecycle
+	// side effects from the composing application.
+	serverCfg.idleHookCommand = ""
+	serverCfg.idleHookArgs = nil
 	serverCfg.allowedTools = cloneAllowedTools(execution.serverAllowedTools)
 	httpClient := serverHTTPClient
 	if a.client != nil && a.client.http != nil {

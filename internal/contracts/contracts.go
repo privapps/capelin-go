@@ -4,6 +4,10 @@ package contracts
 
 import "encoding/json"
 
+// CapelinUserAgent identifies HTTP requests owned by the Capelin runtime. It is
+// intentionally not applied to transparent/raw proxy forwarding.
+const CapelinUserAgent = "Capelin-Go"
+
 // Message represents an LLM conversation message.
 type Message struct {
 	Role             string     `json:"role"`

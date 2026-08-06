@@ -69,16 +69,38 @@ func isRetryableStatus(status int) bool {
 	return status == 408 || status == 409 || status == 425 || status == 429 || status >= 500
 }
 
+type userAgentTransport struct {
+	base http.RoundTripper
+}
+
+func (t userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	request := req.Clone(req.Context())
+	request.Header.Set("User-Agent", contracts.CapelinUserAgent)
+	return t.base.RoundTrip(request)
+}
+
+func clientWithUserAgent(client *http.Client) *http.Client {
+	copy := *client
+	base := client.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	copy.Transport = userAgentTransport{base: base}
+	return &copy
+}
+
 func doJSON(ctx context.Context, cfg Config, body []byte) ([]byte, string, error) {
 	client := cfg.HTTP
 	if client == nil {
 		client = http.DefaultClient
 	}
+	client = clientWithUserAgent(client)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.Endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", contracts.CapelinUserAgent)
 	if cfg.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	}

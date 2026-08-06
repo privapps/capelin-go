@@ -50,7 +50,6 @@ const (
 )
 
 const (
-	browserUA        = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 	toolTimeout      = 60 * time.Second
 	toolTimeoutMax   = 600 // 10 minutes – absolute cap for any tool timeout
 	maxPageChars     = 14000
@@ -129,9 +128,31 @@ var toolHTTPClient = &http.Client{
 		if len(via) >= 5 {
 			return fmt.Errorf("too many redirects")
 		}
-		req.Header.Set("User-Agent", browserUA)
+		if req != nil {
+			req.Header.Set("User-Agent", contracts.CapelinUserAgent)
+		}
 		return nil
 	},
+}
+
+type userAgentTransport struct {
+	base http.RoundTripper
+}
+
+func (t userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	request := req.Clone(req.Context())
+	request.Header.Set("User-Agent", contracts.CapelinUserAgent)
+	return t.base.RoundTrip(request)
+}
+
+func clientWithUserAgent(client *http.Client) *http.Client {
+	copy := *client
+	base := client.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	copy.Transport = userAgentTransport{base: base}
+	return &copy
 }
 
 type webSearchArgs struct {
@@ -445,7 +466,7 @@ func specCreateSubagent() contracts.Tool {
 		Type: "function",
 		Function: contracts.ToolSpec{
 			Name:        CreateSubagent,
-			Description: "Create a worker subagent session with inherited-and-restricted tool policy. Does not start execution.",
+			Description: "Create a worker subagent session with inherited-and-restricted tool policy. Does not start execution. Admission is non-blocking: large fan-outs are kept in bounded pending/queued batches, and a full allowance returns a recoverable capacity error for retry after terminal children release capacity.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -469,11 +490,11 @@ func specCreateSubagent() contracts.Tool {
 					},
 					"overflow_mode": map[string]any{
 						"type":        "string",
-						"description": `Behavior when parent is at --subagent-max-children: "wait_for_slot" (default, blocks until active child slot is free) or "fail_fast" (return error immediately).`,
+						"description": `Behavior when parent is at --subagent-max-children: "wait_for_slot" (default, admit bounded pending/queued work without blocking the parent tool batch) or "fail_fast" (return error immediately).`,
 					},
 					"wait_timeout_seconds": map[string]any{
 						"type":        "integer",
-						"description": "Timeout for overflow_mode=wait_for_slot. Defaults to --subagent-timeout-seconds (300s unless configured).",
+						"description": "Legacy wait-for-slot timeout validation. Admission never waits synchronously; retry a capacity error after a terminal child releases capacity. Defaults to --subagent-timeout-seconds (600s unless configured).",
 					},
 				},
 				"required":             []string{"question"},
@@ -488,7 +509,7 @@ func specRunSubagent() contracts.Tool {
 		Type: "function",
 		Function: contracts.ToolSpec{
 			Name:        RunSubagent,
-			Description: "Start a created subagent. For parallel execution of multiple subagents: call run_subagent with wait=false for ALL subagents first (non-blocking fire), then call await_subagent for each to collect results. Use wait=true only when running a single subagent or intentionally serializing.",
+			Description: "Start a created subagent. Creation and execution are separate phases. For parallel execution of multiple subagents: call run_subagent with wait=false for ALL admitted handles first (queued work is scheduled within bounded limits), then call await_subagent for each to collect results. Retry an actionable capacity error after terminal children release capacity.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -634,10 +655,10 @@ func runDuckDuckGoSearch(ctx context.Context, query string) ([]searchResult, err
 		return nil, fmt.Errorf("web search: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", browserUA)
+	req.Header.Set("User-Agent", contracts.CapelinUserAgent)
 	req.Header.Set("DNT", "1")
 
-	resp, err := toolHTTPClient.Do(req)
+	resp, err := clientWithUserAgent(toolHTTPClient).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("web search: %w", err)
 	}
@@ -677,9 +698,9 @@ func runBingSearch(ctx context.Context, query string) ([]searchResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bing search: %w", err)
 	}
-	req.Header.Set("User-Agent", browserUA)
+	req.Header.Set("User-Agent", contracts.CapelinUserAgent)
 
-	resp, err := toolHTTPClient.Do(req)
+	resp, err := clientWithUserAgent(toolHTTPClient).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("bing search: %w", err)
 	}
@@ -845,13 +866,13 @@ func runFetchPageWithClient(ctx context.Context, targetURL string, client *http.
 	if err != nil {
 		return "", fmt.Errorf("fetch page: %w", err)
 	}
-	req.Header.Set("User-Agent", browserUA)
+	req.Header.Set("User-Agent", contracts.CapelinUserAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,*/*")
 
 	if client == nil {
 		client = toolHTTPClient
 	}
-	resp, err := client.Do(req)
+	resp, err := clientWithUserAgent(client).Do(req)
 	if err != nil {
 		return "", fmt.Errorf("fetch page: %w", err)
 	}

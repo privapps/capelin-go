@@ -72,6 +72,8 @@ type config struct {
 	serverPort         int
 	securityPolicy     serverSecurityPolicy
 	securityEnabled    bool
+	idleHookCommand    string
+	idleHookArgs       []string
 	toolMaxParallel    int  // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
 	toolTimeoutSec     int  // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
 	toolRetryOnTimeout bool // retry once on timeout (0 = disable; empty = default true)
@@ -91,6 +93,7 @@ type app struct {
 	sink                      contracts.OutputSink
 	dataStore                 *dataStore
 	sessionStore              *sessionStore
+	idleHooks                 *idleHookRunner
 	asyncRunner               func(string, *serverExecutionRequest)
 	interactiveIdleHook       func()
 	goalHeartbeatInitialDelay time.Duration
@@ -98,21 +101,24 @@ type app struct {
 }
 
 type interactiveSession struct {
-	messages       []contracts.Message
-	providerState  *contracts.ContinuationState
-	runtime        *agentRuntime
-	lastResponse   string
-	loadedSkills   map[string]bool
-	id             string
-	createdAt      time.Time
-	todos          []todoItem
-	activeGoal     *goalState
-	name           string
-	topic          string
-	lastInput      string
-	save           func() error
-	ephemeral      bool
-	goalTurn       bool
+	messages      []contracts.Message
+	providerState *contracts.ContinuationState
+	runtime       *agentRuntime
+	lastResponse  string
+	loadedSkills  map[string]bool
+	id            string
+	createdAt     time.Time
+	todos         []todoItem
+	activeGoal    *goalState
+	name          string
+	topic         string
+	lastInput     string
+	save          func() error
+	ephemeral     bool
+	goalTurn      bool
+	// goalCompleted is transient and becomes true only after the goal engine's
+	// final verified state has been durably saved.
+	goalCompleted  bool
 	successMessage string
 	skipCommit     bool
 }
@@ -216,6 +222,16 @@ func newApp(cfg config) (*app, error) {
 		sink:         sink,
 		sessionStore: sessionStore,
 	}
+	if strings.TrimSpace(cfg.idleHookCommand) != "" {
+		instance.idleHooks = newIdleHookRunner(
+			cfg.idleHookCommand,
+			cfg.idleHookArgs,
+			cfg.workspaceRoot,
+			cfg.yolo,
+			defaultIdleHookExecutor,
+			os.Stderr,
+		)
+	}
 	subagentCfg := cfg.subagents
 	instance.subagents = newSubagentManager(subagentCfg, instance.runSubagentSession)
 	return instance, nil
@@ -272,6 +288,8 @@ func loadConfig(args []string) (config, error) {
 		serverPort:         parsed.ServerPort,
 		securityPolicy:     securityPolicy,
 		securityEnabled:    parsed.ServerSecurityEnabled,
+		idleHookCommand:    parsed.IdleHookCommand,
+		idleHookArgs:       append([]string(nil), parsed.IdleHookArgs...),
 		toolMaxParallel:    parsed.ToolMaxParallel,
 		toolTimeoutSec:     parsed.ToolTimeoutSec,
 		toolRetryOnTimeout: parsed.ToolRetryOnTimeout,
@@ -338,6 +356,7 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "  --final-only               one-shot mode: suppress intermediate tool output, show only the final answer")
 	fmt.Fprintln(w, "  --debug                    dump HTTP request and response to stderr")
 	fmt.Fprintln(w, "Env: ENDPOINT, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS, MAX_GOAL_ITERATIONS")
+	fmt.Fprintln(w, "     IDLE_HOOK_COMMAND, IDLE_HOOK_ARGS (JSON string array; local one-shot and interactive, requires execute_program permission)")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT")
@@ -353,7 +372,7 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "Goal loop limit: --max-goal-iterations N (ordinary baseline 20; goal-run default 64; env MAX_GOAL_ITERATIONS; accepted /goal only)")
 	fmt.Fprintln(w, "Interactive goal: /goal <objective> starts a fresh checklist; bare /goal resumes an incomplete one (requires --yolo)")
 	fmt.Fprintln(w, "Goal completion: a completed checklist must be followed by a valid complete_goal summary and evidence claim")
-	fmt.Fprintln(w, "Interactive sessions: /compact, /session-new [prompt], /session-list, /session-rename <name|--clear>, /session-resume [ID|PREFIX], /exit, /quit")
+	fmt.Fprintln(w, "Interactive sessions: /compact, /session-new [prompt], /session-list, /session-resume [ID|PREFIX], /exit, /quit")
 	fmt.Fprintln(w, "Interactive /compact summarizes retained conversation history without tools; it accepts no arguments and can be cancelled.")
 	fmt.Fprintln(w, "Subagent limits (flags, env vars, or config file):")
 	fmt.Fprintln(w, "  --subagent-max-depth N              (ordinary 1; goal-run 2; env SUBAGENT_MAX_DEPTH)")
@@ -375,18 +394,135 @@ func PrintUsage(w io.Writer, executable string) {
 }
 
 func (a *app) runQuestion(ctx context.Context, question string) error {
+	defer a.finishOneShotIdleHook()
+	if objective, ok := leadingCommandArgument(question, "/goal"); ok {
+		return a.runOneShotGoal(ctx, objective)
+	}
 	if !a.cfg.finalOnly {
 		fmt.Fprintf(os.Stderr, "[capelin-go] Task: %s\n\n", question)
 	}
 	question, _ = prepareSkillPrompt(question, a.skills, nil)
-	messages := []contracts.Message{
+	initialMessages := []contracts.Message{
 		{Role: "system", Content: a.systemPromptWithSkills()},
 	}
-	_, _, _, err := a.runTurnLoop(ctx, messages, question, a.rootRuntime(), a.toolset, true)
+	session, err := a.newInteractiveSession(initialMessages)
+	if err != nil {
+		return fmt.Errorf("one-shot session creation failed: %w", err)
+	}
+	// The hint is emitted immediately after allocation, before any provider or
+	// final-save work, so it remains available on every post-creation outcome.
+	fmt.Fprintf(os.Stderr, "[capelin-go] session %s; resume with --resume %s\n", session.id, session.id)
+
+	// Store the request before the first provider call. The turn engine receives
+	// initialMessages separately because providers append the question while
+	// constructing their protocol state.
+	session.messages = append(cloneMessages(initialMessages), contracts.Message{Role: "user", Content: question})
+	session.lastInput = strings.TrimSpace(question)
+	if session.topic == "" {
+		session.topic = session.lastInput
+	}
+	runtime := a.rootRuntime()
+	runtime.sessionID = session.id
+	session.runtime = runtime
+	a.attachInteractiveRuntime(session)
+	a.attachInteractiveSaver(session)
+
+	var persistenceErrors []error
+	if err := a.saveInteractiveSession(session); err != nil {
+		persistenceErrors = append(persistenceErrors, err)
+	}
+
+	if finalOnly, ok := a.sink.(*output.FinalOnlySink); ok {
+		// Ordinary one-shot execution uses the durable session ID as its agent
+		// identity. Keep the final-only sink aligned so it still emits the root
+		// answer while suppressing all intermediate events.
+		finalOnly.RootAgentID = session.id
+	}
+	resultMessages, answer, _, providerState, executionErr := a.runTurnLoopWithState(ctx, initialMessages, question, runtime, a.toolset, true, session.providerState)
+	if len(resultMessages) > 0 {
+		session.messages = cloneMessages(resultMessages)
+	}
+	session.providerState = cloneProviderState(providerState)
+	if strings.TrimSpace(answer) != "" {
+		session.lastResponse = strings.TrimSpace(answer)
+	}
+	session.todos = runtime.snapshotTodos()
+	if fatal := runtime.recordedFatalError(); fatal != nil {
+		fatalErr := fatalToolFailure{err: fatal}
+		if executionErr == nil {
+			executionErr = fatalErr
+		} else {
+			executionErr = errors.Join(executionErr, fatalErr)
+		}
+	}
+	if err := a.saveInteractiveSession(session); err != nil {
+		persistenceErrors = append(persistenceErrors, err)
+	}
+	if finalOnly, ok := a.sink.(*output.FinalOnlySink); ok {
+		finalOnly.FlushContent()
+	}
+
+	var persistenceErr error
+	if len(persistenceErrors) > 0 {
+		persistenceErr = errors.Join(persistenceErrors...)
+	}
+	return joinOneShotErrors(executionErr, persistenceErr)
+}
+
+func joinOneShotErrors(executionErr, persistenceErr error) error {
+	if executionErr == nil && persistenceErr == nil {
+		return nil
+	}
+	if executionErr == nil {
+		return fmt.Errorf("one-shot session persistence failed: %w", persistenceErr)
+	}
+	if persistenceErr == nil {
+		return executionErr
+	}
+	return errors.Join(
+		fmt.Errorf("one-shot execution failed: %w", executionErr),
+		fmt.Errorf("one-shot session persistence failed: %w", persistenceErr),
+	)
+}
+
+// runOneShotGoal adapts the durable interactive goal workflow to the public
+// one-shot application seam. It deliberately validates the objective and the
+// YOLO gate before creating a session or touching the provider.
+func (a *app) runOneShotGoal(ctx context.Context, objective string) error {
+	objective = strings.TrimSpace(objective)
+	if objective == "" {
+		return errors.New("one-shot goal requires an objective")
+	}
+	if !a.cfg.yolo {
+		return errors.New("[goal] --yolo is required before using /goal")
+	}
+	if !a.cfg.finalOnly {
+		fmt.Fprintf(os.Stderr, "[capelin-go] Goal: %s\n\n", objective)
+	}
+
+	session, err := a.newInteractiveSession([]contracts.Message{{Role: "system", Content: a.systemPromptWithSkills()}})
+	if err != nil {
+		return fmt.Errorf("one-shot goal session creation failed: %w", err)
+	}
+
+	stopped := a.runGoal(ctx, session, objective)
+	persistErr := a.saveGoalSession(session)
+	// A hint is useful even when the last save failed: an earlier goal turn may
+	// still have left a valid durable snapshot that can be resumed interactively.
+	fmt.Fprintf(os.Stderr, "[capelin-go] session %s; resume with --resume %s\n", session.id, session.id)
+	if persistErr != nil {
+		return fmt.Errorf("one-shot goal incomplete: session persistence failure: %w", persistErr)
+	}
+	if stopped || ctx.Err() != nil {
+		return errors.New("one-shot goal incomplete: cancelled")
+	}
+	if !session.goalCompleted || !validGoalCompletion(session.activeGoal, session.todos) {
+		return errors.New("one-shot goal incomplete: checklist and completion handshake are not verified")
+	}
 	if fs, ok := a.sink.(*output.FinalOnlySink); ok {
 		fs.FlushContent()
 	}
-	return err
+	return nil
 }
 
 func (a *app) runConversation(ctx context.Context, question string, runtime *agentRuntime, toolset []contracts.Tool, emitOutput bool) (string, error) {
@@ -429,6 +565,20 @@ func (a *app) runTurnLoopWithState(ctx context.Context, messages []contracts.Mes
 	return result.Messages, result.Answer, result.Reasoning, result.ContinuationState, err
 }
 
+func (a *app) runInteractiveInitialQuestion(ctx context.Context, session *interactiveSession, question string) bool {
+	// Initial prompts use the same leading-command seam as one-shot requests.
+	// Only /goal is dispatched here; all other initial text remains an ordinary
+	// interactive turn, preserving the REPL's local-command behavior.
+	if objective, ok := leadingCommandArgument(question, "/goal"); ok {
+		stopped := a.runGoal(ctx, session, objective)
+		a.triggerInteractiveIdleHook()
+		return stopped
+	}
+	stopped := a.runInteractiveTurn(ctx, session, question)
+	a.triggerInteractiveIdleHook()
+	return stopped
+}
+
 // runInteractive runs a REPL loop, maintaining conversation history across turns.
 // An optional initialQuestion is handled as the first turn before prompting stdin.
 func (a *app) runInteractive(ctx context.Context) error {
@@ -436,11 +586,12 @@ func (a *app) runInteractive(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	defer a.finishInteractiveIdleHook()
 	defer a.finishInteractiveSession(session)
 
 	if a.cfg.initialQuestion != "" {
 		fmt.Fprintf(os.Stderr, "[capelin-go] Task: %s\n\n", a.cfg.initialQuestion)
-		if a.runInteractiveTurn(ctx, session, a.cfg.initialQuestion) {
+		if a.runInteractiveInitialQuestion(ctx, session, a.cfg.initialQuestion) {
 			return nil
 		}
 	}
@@ -517,9 +668,7 @@ func (a *app) runInteractiveReadlineSession(ctx context.Context, session *intera
 			a.finishInteractiveTurn(controller, session, outcome)
 		},
 		func() {
-			if a.interactiveIdleHook != nil {
-				a.interactiveIdleHook()
-			}
+			a.triggerInteractiveIdleHook()
 		},
 	)
 	defer func() {
@@ -530,6 +679,7 @@ func (a *app) runInteractiveReadlineSession(ctx context.Context, session *intera
 		if err := a.saveInteractiveSession(session); err != nil {
 			fmt.Fprintf(os.Stderr, "[capelin-go] warning: could not save session: %v\n", err)
 		}
+		a.finishInteractiveIdleHook()
 	}()
 	monitorDone := make(chan struct{})
 	go func() {
@@ -584,13 +734,16 @@ func (a *app) runInteractiveFallbackSession(ctx context.Context, session *intera
 		func(outcome interactiveTurnOutcome) {
 			a.finishInteractiveTurn(controller, session, outcome)
 		},
-		nil,
+		func() {
+			a.triggerInteractiveIdleHook()
+		},
 	)
 	defer func() {
 		controller.wait()
 		if err := a.saveInteractiveSession(session); err != nil {
 			fmt.Fprintf(os.Stderr, "[capelin-go] warning: could not save session: %v\n", err)
 		}
+		a.finishInteractiveIdleHook()
 	}()
 	monitorDone := make(chan struct{})
 	go func() {
@@ -668,12 +821,6 @@ func (a *app) handleInteractiveInput(ctx context.Context, session *interactiveSe
 			}
 			if arg != "" {
 				return a.runInteractiveTurn(ctx, session, arg)
-			}
-			return false
-		}
-		if arg, ok := interactiveCommandArgument(input, "/session-rename"); ok {
-			if err := a.renameInteractiveSession(session, arg); err != nil {
-				fmt.Fprintf(os.Stderr, "[capelin-go] /session-rename failed: %v\n", err)
 			}
 			return false
 		}

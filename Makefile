@@ -18,7 +18,7 @@ all: dist
 build:
 	@out=$(BUILD_DIR)/$(APP)-$(GOOS)-$(GOARCH); \
 	if [ "$(GOOS)" = "windows" ]; then out=$${out}.exe; fi; \
-	GOOS=$(GOOS) GOARCH=$(GOARCH) go build $(LDFLAGS) -o $$out .
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build $(LDFLAGS) -o $$out .
 
 # Build for all platforms in PLATFORMS into dist/capelin-go-<os>-<arch>*
 dist:
@@ -28,7 +28,7 @@ dist:
 		out=$(BUILD_DIR)/$(APP)-$$os-$$arch; \
 		if [ "$$os" = "windows" ]; then out=$${out}.exe; fi; \
 		echo "Building $$os/$$arch -> $$out"; \
-		GOOS=$$os GOARCH=$$arch go build $(LDFLAGS) -o $$out . || exit 1; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build $(LDFLAGS) -o $$out . || exit 1; \
 	done
 
 test:

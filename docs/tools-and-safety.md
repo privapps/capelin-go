@@ -90,6 +90,20 @@ Worker assistants are useful when a task contains independent parts. Ask Capelin
 
 Workers inherit the parent task's permissions and can only use a smaller set of tools, never a larger one. They can be started in parallel, monitored, read, or cancelled. Their results and combined output are length-limited.
 
+Creation and execution are deliberately two phases. A parent tool batch can
+create a large fan-out without synchronously waiting for a child slot: handles
+are reported as `pending`, and `run_subagent` moves them to `queued` until the
+scheduler can run them. The configured active-child and parallel-worker limits
+remain unchanged. When the bounded admission allowance is full, creation
+returns an actionable capacity error; run or cancel admitted work, await
+terminal results, and retry the failed creation. Parent cancellation finalizes
+pending/queued work and cancels running descendants.
+
+`list_subagents` and `read_subagent` expose consistent lifecycle states:
+`pending`, `queued`, `running`, `completed`, `failed`, `cancelled`, and
+`timed_out`. Aggregate reads include separate pending and queued counts as well
+as terminal counts, so partial fan-ins remain useful while work is in flight.
+
 New-install defaults are:
 
 | Limit | Default |
@@ -111,9 +125,8 @@ Writes are atomic, and malformed snapshots are skipped when listing sessions
 or choosing the newest valid resume target.
 
 Use `/session-list` to inspect saved conversations, `/session-new` to start a
-separate conversation, `/session-resume [ID|PREFIX]` to switch conversations,
-and `/session-rename <name>` to assign a durable label. A bare
-`/session-resume` selects the newest valid snapshot. Startup resume uses
+separate conversation, and `/session-resume [ID|PREFIX]` to switch conversations.
+A bare `/session-resume` selects the newest valid snapshot. Startup resume uses
 `capelin-go -i --resume [ID|PREFIX]`.
 
 The `update_todos` tool replaces the complete ordered checklist. Valid statuses
@@ -170,3 +183,34 @@ The default mode favors reading, research, and controlled workspace access. Use 
 ```
 
 In server mode, the tool set is always restricted to public web access and worker-assistant tools. `--yolo` does not expose local file or program tools through the server.
+
+## Local idle hooks
+
+A local idle hook runs after a local one-shot task reaches a terminal outcome or
+an interactive turn is finalized and the prompt becomes idle. Configure the
+executable and its fixed argument vector with `IDLE_HOOK_COMMAND` and
+`IDLE_HOOK_ARGS`, where `IDLE_HOOK_ARGS` is a JSON string array:
+
+```ini
+IDLE_HOOK_COMMAND = ./bin/notify-idle
+IDLE_HOOK_ARGS = ["completed", "local"]
+```
+
+Environment values override non-empty saved configuration values, following the
+normal precedence order: CLI flags, environment, saved config, then built-in
+defaults. A blank command disables the hook. A configured hook requires
+`--allow-tool execute_program` or `--yolo`; configuration alone does not grant
+program-execution permission. The executable and arguments are passed directly
+without a shell, and the existing workspace, dangerous-command, output-limit,
+timeout, and process-cancellation safeguards remain in force.
+
+Hooks run once per eligible local terminal transition. Interactive hooks run in
+the background after state finalization and are serialized; local one-shot runs
+drain the hook before exiting. Hook failures are bounded diagnostics on stderr
+and never replace the original task or session result.
+
+Server mode is explicitly local-hook-free. Synchronous and asynchronous HTTP
+requests ignore `IDLE_HOOK_COMMAND` and `IDLE_HOOK_ARGS`, including with
+`--yolo` or program-execution permission. Remote requests cannot trigger the
+hook indirectly, and the server's restricted tool catalog and delivery behavior
+remain unchanged.

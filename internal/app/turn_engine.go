@@ -32,11 +32,15 @@ func (e fatalToolFailure) Unwrap() error { return e.err }
 // policy. It contributes only concrete dispatch and application-specific error
 // and timeout hooks.
 type appToolRunner struct {
-	runner  agent.ToolRunner
-	runtime *agentRuntime
+	runner        agent.ToolRunner
+	runtime       *agentRuntime
+	bindParentCtx func(context.Context)
 }
 
 func (r appToolRunner) Run(ctx context.Context, calls []contracts.ToolCall) []agent.ToolResult {
+	if r.bindParentCtx != nil {
+		r.bindParentCtx(ctx)
+	}
 	results := r.runner.Run(ctx, calls)
 	// A parent cancellation is a runtime stop condition even when the
 	// per-call runner already converted the child context error into a tool
@@ -71,44 +75,51 @@ func newAppToolCapability(toolset []contracts.Tool, a *app, runtime *agentRuntim
 	profile := a.runtimeProfileFor(runtime)
 	return appToolCapability{
 		catalog: append([]contracts.Tool(nil), toolset...),
-		runner: appToolRunner{runtime: runtime, runner: agent.NewToolRunner(
-			agent.ToolRunnerConfig{
-				MaxParallel:    profile.ToolMaxParallel,
-				Timeout:        time.Duration(profile.ToolTimeoutSec) * time.Second,
-				RetryOnTimeout: profile.ToolRetryOnTimeout,
+		runner: appToolRunner{
+			runtime: runtime,
+			bindParentCtx: func(ctx context.Context) {
+				if a.subagents != nil {
+					a.subagents.bindParentContext(runtime, ctx)
+				}
 			},
-			func(ctx context.Context, call contracts.ToolCall) (string, error) {
-				return a.runToolForRuntime(ctx, runtime, call)
-			},
-			agent.ToolRunnerHooks{
-				ResolveTimeout: func(call contracts.ToolCall, defaultTimeout time.Duration) time.Duration {
-					if seconds := parseToolTimeout(call); seconds > 0 {
-						return time.Duration(seconds) * time.Second
-					}
-					return defaultTimeout
+			runner: agent.NewToolRunner(
+				agent.ToolRunnerConfig{
+					MaxParallel:    profile.ToolMaxParallel,
+					Timeout:        time.Duration(profile.ToolTimeoutSec) * time.Second,
+					RetryOnTimeout: profile.ToolRetryOnTimeout,
 				},
-				HandleResult: func(call contracts.ToolCall, output string) contracts.ToolResult {
-					result := contracts.ToolResult{Call: call, Output: output}
-					if commandFailed(call, output) {
-						runtime.recordRecoverableToolError(fmt.Errorf("%s reported a command failure", call.Function.Name))
-						result.IsError = true
-					}
-					return result
+				func(ctx context.Context, call contracts.ToolCall) (string, error) {
+					return a.runToolForRuntime(ctx, runtime, call)
 				},
-				HandleError: func(call contracts.ToolCall, err error) contracts.ToolResult {
-					if fatalToolError(err) {
-						runtime.recordFatalError(err)
-					} else {
-						runtime.recordRecoverableToolError(err)
-					}
-					return contracts.ToolResult{
-						Call:    call,
-						Output:  fmt.Sprintf("Tool error: %v", err),
-						IsError: true,
-					}
+				agent.ToolRunnerHooks{
+					ResolveTimeout: func(call contracts.ToolCall, defaultTimeout time.Duration) time.Duration {
+						if seconds := parseToolTimeout(call); seconds > 0 {
+							return time.Duration(seconds) * time.Second
+						}
+						return defaultTimeout
+					},
+					HandleResult: func(call contracts.ToolCall, output string) contracts.ToolResult {
+						result := contracts.ToolResult{Call: call, Output: output}
+						if commandFailed(call, output) {
+							runtime.recordRecoverableToolError(fmt.Errorf("%s reported a command failure", call.Function.Name))
+							result.IsError = true
+						}
+						return result
+					},
+					HandleError: func(call contracts.ToolCall, err error) contracts.ToolResult {
+						if fatalToolError(err) {
+							runtime.recordFatalError(err)
+						} else {
+							runtime.recordRecoverableToolError(err)
+						}
+						return contracts.ToolResult{
+							Call:    call,
+							Output:  fmt.Sprintf("Tool error: %v", err),
+							IsError: true,
+						}
+					},
 				},
-			},
-		)},
+			)},
 	}
 }
 

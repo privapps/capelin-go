@@ -462,14 +462,6 @@ func (a *app) handleInteractiveInputAsync(
 			return a.runInteractiveTurnResult(turnCtx, worker, arg)
 		})
 	}
-	if arg, ok := interactiveCommandArgument(input, "/session-rename"); ok {
-		var err error
-		controller.withSession(func() { err = a.renameInteractiveSession(session, arg) })
-		if err != nil {
-			a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] /session-rename failed: %v", err))
-		}
-		return false
-	}
 	if arg, ok := interactiveCommandArgument(input, "/session-resume"); ok {
 		var err error
 		controller.withSession(func() { err = a.switchToSavedSession(session, arg) })

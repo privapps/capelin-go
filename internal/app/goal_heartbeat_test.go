@@ -150,12 +150,12 @@ func TestInteractiveGoalHeartbeatReportsBlockedTurnAndStopsBeforeTerminalStatus(
 
 	initial := waitForGoalHeartbeatEvent(t, events, "iteration 1/1 working")
 	if !strings.Contains(initial, "total elapsed") || !strings.Contains(initial, "current turn elapsed") ||
-		!strings.Contains(initial, "subagents 0 active; todos 0/0 completed; current: none") {
+		!strings.Contains(initial, "subagents 0 active; states pending=0 queued=0 running=0 completed=0 failed=0 cancelled=0 timed_out=0; todos 0/0 completed; current: none") {
 		t.Fatalf("immediate goal status omitted elapsed-time fields: %q", initial)
 	}
 	subsequent := waitForGoalHeartbeatEvent(t, events, "iteration 1/1 working")
 	if !strings.Contains(subsequent, "current turn elapsed") ||
-		!strings.Contains(subsequent, "subagents 0 active; todos 0/0 completed; current: none") {
+		!strings.Contains(subsequent, "subagents 0 active; states pending=0 queued=0 running=0 completed=0 failed=0 cancelled=0 timed_out=0; todos 0/0 completed; current: none") {
 		t.Fatalf("subsequent heartbeat omitted current-turn elapsed time: %q", subsequent)
 	}
 
@@ -294,7 +294,7 @@ func TestInteractiveGoalHeartbeatReportsOrderedCurrentChecklistAndActiveSubagent
 	}
 
 	heartbeat := waitForGoalHeartbeatEvent(t, events, "iteration 1/1 working")
-	wantProgress := "subagents 1 active; todos 1/3 completed; current: first item, third item"
+	wantProgress := "subagents 1 active; states pending=1 queued=0 running=0 completed=0 failed=0 cancelled=0 timed_out=0; todos 1/3 completed; current: first item, third item"
 	if !strings.Contains(heartbeat, wantProgress) {
 		t.Fatalf("heartbeat omitted ordered runtime progress: got %q, want substring %q", heartbeat, wantProgress)
 	}
@@ -519,7 +519,7 @@ func TestGoalHeartbeatFormattingHandlesElapsedTimeAndStopIdempotently(t *testing
 	heartbeat.stop()
 	heartbeat.beginIteration(3)
 
-	if len(messages) != 1 || messages[0] != "[goal] iteration 2/64 working; total elapsed 03s; current turn elapsed 00s; subagents 0 active; todos 0/0 completed; current: none" {
+	if len(messages) != 1 || messages[0] != "[goal] iteration 2/64 working; total elapsed 03s; current turn elapsed 00s; subagents 0 active; states pending=0 queued=0 running=0 completed=0 failed=0 cancelled=0 timed_out=0; todos 0/0 completed; current: none" {
 		t.Fatalf("unexpected deterministic heartbeat message: %#v", messages)
 	}
 	if heartbeat.started {
@@ -577,7 +577,7 @@ func TestGoalHeartbeatProgressCountsUseOneSnapshotPerHeartbeat(t *testing.T) {
 	if len(messages) != 1 {
 		t.Fatalf("expected one heartbeat, got %d: %#v", len(messages), messages)
 	}
-	want := "[goal] iteration 2/8 working; total elapsed 1m02s; current turn elapsed 00s; subagents 3 active; todos 1/5 completed; current: three item, five"
+	want := "[goal] iteration 2/8 working; total elapsed 1m02s; current turn elapsed 00s; subagents 3 active; states pending=1 queued=1 running=1 completed=1 failed=1 cancelled=1 timed_out=1; todos 1/5 completed; current: three item, five"
 	if messages[0] != want {
 		t.Fatalf("unexpected progress heartbeat: %q", messages[0])
 	}
@@ -607,7 +607,7 @@ func TestGoalHeartbeatFormatsSingleCurrentTodo(t *testing.T) {
 	heartbeat.beginIteration(1)
 	heartbeat.stop()
 
-	want := "[goal] iteration 1/1 working; total elapsed 03s; current turn elapsed 00s; subagents 0 active; todos 0/1 completed; current: verify output"
+	want := "[goal] iteration 1/1 working; total elapsed 03s; current turn elapsed 00s; subagents 0 active; states pending=0 queued=0 running=0 completed=0 failed=0 cancelled=0 timed_out=0; todos 0/1 completed; current: verify output"
 	if len(messages) != 1 || messages[0] != want {
 		t.Fatalf("unexpected single-current heartbeat: got %#v, want %q", messages, want)
 	}

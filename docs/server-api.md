@@ -61,6 +61,16 @@ The query-parameter form is usually easiest to generate safely.
 
 The server adds its own instructions to the conversation. Through server mode, the assistant can search the public web, read public pages, and use worker assistants. It cannot access local files, change files, run local programs, or load local skills.
 
+Server-mode worker scheduling uses the same bounded two-phase contract as local
+mode. A batch of `create_subagent` calls returns handles without waiting for
+active-child capacity; `run_subagent` queues admitted handles and the scheduler
+honors the configured child and parallel-worker limits. A full bounded
+allowance returns a recoverable capacity error for retry after terminal work
+releases capacity. Cancellation finalizes pending/queued children and stops
+running descendants. Worker listings and aggregate reads expose pending,
+queued, running, completed, failed, cancelled, and timed-out states. Server
+permissions and network restrictions are unchanged.
+
 ## Read the response
 
 The response follows the usual chat-completion shape:
@@ -161,3 +171,25 @@ The server allows cross-origin browser requests and accepts `GET`, `PUT`, `POST`
 | `async capacity exhausted` | Too many async jobs are already active |
 
 For more cases, see the [Troubleshooting FAQ](troubleshooting.md).
+
+## Local idle hooks and server mode
+
+`IDLE_HOOK_COMMAND` and `IDLE_HOOK_ARGS` configure a local-only idle hook. The
+command is run once after a local one-shot terminal outcome or after an
+interactive turn has been finalized and the prompt is idle. `IDLE_HOOK_ARGS`
+must be a JSON string array. Environment values override non-empty saved values
+using the normal CLI > environment > saved config > built-in defaults
+precedence. A blank command is disabled.
+
+A configured hook requires `--allow-tool execute_program` or `--yolo`. It uses
+direct executable invocation without a shell and retains the existing workspace,
+dangerous-command, bounded-output, timeout, and process-cancellation safeguards.
+Interactive hooks run in the background and are serialized; one-shot shutdown
+drains them. Hook failures are reported as bounded stderr diagnostics without
+changing the original task result.
+
+These settings never apply to this HTTP server. Both synchronous and
+asynchronous requests ignore a configured local hook, even with YOLO or
+program-execution permission. Server responses, async result delivery,
+admission limits, error handling, and the restricted server tool catalog are
+unchanged.

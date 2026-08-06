@@ -165,6 +165,10 @@ type subagentSession struct {
 	done      chan struct{}
 	doneOnce  sync.Once
 	cancel    context.CancelFunc
+	// queueDeadline bounds the time a started child may remain queued before
+	// execution. It is set when run_subagent starts the child so the existing
+	// create-then-run timeout behavior remains intact.
+	queueDeadline time.Time
 }
 
 type subagentRunner func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error)
@@ -175,11 +179,26 @@ type subagentManager struct {
 
 	mu             sync.Mutex
 	slotCond       *sync.Cond
-	serialMu       sync.Mutex
 	nextID         atomic.Uint64
 	sessions       map[string]*subagentSession
 	childrenByNode map[string][]string
+	// activeChildren tracks children that have acquired an execution slot. It
+	// keeps MaxChildren independent from the bounded admission queue: pending
+	// handles can be created promptly, but only the configured number may run.
+	activeChildren map[string]int
 	parallelActive int
+	serialActive   bool
+
+	// parentContexts tracks the lifetime of the currently active parent turn.
+	// It is separate from a child session context so create-then-run remains
+	// usable across tool calls while cancellation can still clean up work that
+	// has not reached execution yet.
+	parentContexts map[string]*parentContextBinding
+}
+
+type parentContextBinding struct {
+	ctx  context.Context
+	stop chan struct{}
 }
 
 // Config controls the lifecycle and resource policy for child agents. The
@@ -298,6 +317,15 @@ func (m *Manager) Read(parent *Runtime, args ReadArgs) (any, error) {
 	return m.core.read(internalRuntime(parent), args)
 }
 
+// BindParentContext associates a parent turn context with its child tree so
+// cancellation can finalize pending work and stop queued or running children.
+func (m *Manager) BindParentContext(parent *Runtime, ctx context.Context) {
+	if m == nil || m.core == nil || parent == nil {
+		return
+	}
+	m.core.bindParentContext(parent.SessionID, ctx)
+}
+
 // Snapshot returns a stable tool-result view of a session.
 func (m *Manager) Snapshot(session *Session, includeOutput bool) Envelope {
 	if m == nil || m.core == nil || session == nil {
@@ -315,6 +343,8 @@ func newSubagentManager(cfg subagentRuntimeConfig, runner subagentRunner) *subag
 		runner:         runner,
 		sessions:       map[string]*subagentSession{},
 		childrenByNode: map[string][]string{},
+		activeChildren: map[string]int{},
+		parentContexts: map[string]*parentContextBinding{},
 	}
 	m.slotCond = sync.NewCond(&m.mu)
 	return m
@@ -372,6 +402,9 @@ func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("create_subagent: %w", err)
+	}
 	question := strings.TrimSpace(args.Question)
 	if question == "" {
 		return nil, errors.New("create_subagent question is required")
@@ -390,10 +423,10 @@ func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args
 	if err != nil {
 		return nil, err
 	}
-	waitTimeoutSec := 0
 	if overflowMode == createSubagentOverflowWaitForSlot {
-		waitTimeoutSec, err = m.resolveWaitTimeoutSeconds(args.WaitTimeoutSeconds, limits)
-		if err != nil {
+		// Retain validation of the legacy argument, but never spend the
+		// parent tool-batch budget waiting for it to become available.
+		if _, err := m.resolveWaitTimeoutSeconds(args.WaitTimeoutSeconds, limits); err != nil {
 			return nil, err
 		}
 	}
@@ -404,14 +437,24 @@ func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("create_subagent: %w", err)
+	}
 
-	for m.activeChildrenLocked(parent.sessionID) >= limits.MaxChildren {
-		if overflowMode == createSubagentOverflowFailFast {
-			return nil, fmt.Errorf("max children exceeded for parent %q (%d)", parent.sessionID, limits.MaxChildren)
-		}
-		if err := m.waitForChildSlotLocked(ctx, parent.sessionID, waitTimeoutSec, limits.MaxChildren); err != nil {
-			return nil, err
-		}
+	// Creation is deliberately non-blocking. A parent tool batch may contain
+	// creates that can only be made runnable by a later batch of run calls, so
+	// waiting here would deadlock the batch at the child-capacity boundary.
+	// MaxChildren limits work that may hold an execution slot, while a bounded
+	// admission allowance keeps overflow handles recoverable without permitting
+	// unbounded session growth. Count every non-terminal handle here: once a
+	// queued handle has been run it must still consume queue capacity until it
+	// finishes, otherwise repeated create/run batches could grow without bound.
+	admitted := m.admittedChildrenLocked(parent.sessionID)
+	if admitted >= limits.MaxChildren && overflowMode == createSubagentOverflowFailFast {
+		return nil, fmt.Errorf("max children exceeded for parent %q (%d)", parent.sessionID, limits.MaxChildren)
+	}
+	if admitted >= limits.MaxChildren+limits.MaxParallel {
+		return nil, fmt.Errorf("subagent admission capacity exceeded for parent %q; run admitted children and retry after a child reaches a terminal state", parent.sessionID)
 	}
 
 	id := fmt.Sprintf("subagent-%d", m.nextID.Add(1))
@@ -495,10 +538,19 @@ func (m *subagentManager) run(ctx context.Context, parent *agentRuntime, args ru
 	session.started = true
 	session.ExecutionMode = mode
 	session.Status = subagentStatusQueued
+	session.queueDeadline = time.Now().Add(session.Timeout)
 	if args.Wait {
 		session.parentCtx = ctx
 	} else {
+		// The application tool dispatcher receives a short-lived per-call
+		// context, so use the parent-turn binding when one is available. Direct
+		// manager callers still get useful cancellation semantics from ctx.
 		session.parentCtx = context.Background()
+		if binding := m.parentContexts[parent.sessionID]; binding != nil {
+			session.parentCtx = binding.ctx
+		} else if ctx != nil && ctx.Done() != nil {
+			session.parentCtx = ctx
+		}
 	}
 	runSession := session
 	queued := cloneSession(session)
@@ -512,10 +564,45 @@ func (m *subagentManager) run(ctx context.Context, parent *agentRuntime, args ru
 	return queued, nil
 }
 
+func (m *subagentManager) acquireChildSlot(session *subagentSession) bool {
+	return m.waitForAdmission(session,
+		func() bool { return m.activeChildren[session.ParentID] >= session.limits.MaxChildren },
+		func() { m.activeChildren[session.ParentID]++ },
+	)
+}
+
+func (m *subagentManager) releaseChildSlot(session *subagentSession) {
+	m.mu.Lock()
+	if active := m.activeChildren[session.ParentID]; active > 1 {
+		m.activeChildren[session.ParentID] = active - 1
+	} else {
+		delete(m.activeChildren, session.ParentID)
+	}
+	m.slotCond.Broadcast()
+	m.mu.Unlock()
+}
+
 func (m *subagentManager) acquireParallel(session *subagentSession) bool {
+	return m.waitForAdmission(session,
+		func() bool { return m.parallelActive >= session.limits.MaxParallel },
+		func() { m.parallelActive++ },
+	)
+}
+
+func (m *subagentManager) acquireSerial(session *subagentSession) bool {
+	return m.waitForAdmission(session,
+		func() bool { return m.serialActive },
+		func() { m.serialActive = true },
+	)
+}
+
+// waitForAdmission waits for one scheduler resource while also observing the
+// parent context and the child deadline. The condition variable has no native
+// timed wait, so both cancellation and deadline callbacks wake it explicitly.
+func (m *subagentManager) waitForAdmission(session *subagentSession, unavailable func() bool, reserve func()) bool {
 	ctx := session.parentCtx
 	stopCtxWatch := make(chan struct{})
-	if ctx != nil {
+	if ctx != nil && ctx.Done() != nil {
 		go func() {
 			select {
 			case <-ctx.Done():
@@ -526,21 +613,42 @@ func (m *subagentManager) acquireParallel(session *subagentSession) bool {
 			}
 		}()
 	}
+	var deadlineTimer *time.Timer
+	if !session.queueDeadline.IsZero() {
+		deadlineTimer = time.AfterFunc(time.Until(session.queueDeadline), func() {
+			m.mu.Lock()
+			m.slotCond.Broadcast()
+			m.mu.Unlock()
+		})
+	}
 	defer close(stopCtxWatch)
+	if deadlineTimer != nil {
+		defer deadlineTimer.Stop()
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for m.parallelActive >= session.limits.MaxParallel {
-		if session.Status == subagentStatusCancelled || (ctx != nil && ctx.Err() != nil) {
+	for unavailable() {
+		if m.admissionUnavailableLocked(session) {
 			return false
 		}
 		m.slotCond.Wait()
 	}
-	if session.Status == subagentStatusCancelled || (ctx != nil && ctx.Err() != nil) {
+	if m.admissionUnavailableLocked(session) {
 		return false
 	}
-	m.parallelActive++
+	reserve()
 	return true
+}
+
+func (m *subagentManager) admissionUnavailableLocked(session *subagentSession) bool {
+	if session.Status == subagentStatusCancelled {
+		return true
+	}
+	if ctx := session.parentCtx; ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	return !session.queueDeadline.IsZero() && !time.Now().Before(session.queueDeadline)
 }
 
 func (m *subagentManager) releaseParallel() {
@@ -552,36 +660,48 @@ func (m *subagentManager) releaseParallel() {
 	m.mu.Unlock()
 }
 
+func (m *subagentManager) releaseSerial() {
+	m.mu.Lock()
+	m.serialActive = false
+	m.slotCond.Broadcast()
+	m.mu.Unlock()
+}
+
 func (m *subagentManager) execute(session *subagentSession) {
+	childAcquired := m.acquireChildSlot(session)
+	if !childAcquired {
+		m.finalizeBeforeExecution(session)
+		return
+	}
+	defer m.releaseChildSlot(session)
+
 	parallelAcquired := false
+	serialAcquired := false
 	if session.ExecutionMode == "sequential" {
-		m.serialMu.Lock()
+		serialAcquired = m.acquireSerial(session)
+		if !serialAcquired {
+			m.finalizeBeforeExecution(session)
+			return
+		}
 	} else {
 		parallelAcquired = m.acquireParallel(session)
 		if !parallelAcquired {
-			m.mu.Lock()
-			if !isTerminalSubagentStatus(session.Status) {
-				session.Status = subagentStatusCancelled
-				session.Error = "subagent cancelled before execution"
-				session.FinishedAt = time.Now().UTC()
-				session.closeDone()
-				m.slotCond.Broadcast()
-			}
-			m.mu.Unlock()
+			m.finalizeBeforeExecution(session)
 			return
 		}
 	}
 	defer func() {
-		if session.ExecutionMode == "sequential" {
-			m.serialMu.Unlock()
+		if serialAcquired {
+			m.releaseSerial()
 		} else if parallelAcquired {
 			m.releaseParallel()
 		}
 	}()
 
 	m.mu.Lock()
-	if session.Status == subagentStatusCancelled {
+	if session.Status == subagentStatusCancelled || m.admissionUnavailableLocked(session) {
 		m.mu.Unlock()
+		m.finalizeBeforeExecution(session)
 		return
 	}
 	startedAt := time.Now().UTC()
@@ -591,7 +711,22 @@ func (m *subagentManager) execute(session *subagentSession) {
 	if baseCtx == nil {
 		baseCtx = context.Background()
 	}
-	execCtx, cancel := context.WithTimeout(baseCtx, session.Timeout)
+	execTimeout := session.Timeout
+	if !session.queueDeadline.IsZero() {
+		remaining := time.Until(session.queueDeadline)
+		if remaining < execTimeout {
+			execTimeout = remaining
+		}
+	}
+	if execTimeout <= 0 {
+		session.Status = subagentStatusTimedOut
+		session.Error = fmt.Sprintf("subagent timed out after %s", session.Timeout)
+		session.FinishedAt = time.Now().UTC()
+		session.closeDone()
+		m.mu.Unlock()
+		return
+	}
+	execCtx, cancel := context.WithTimeout(baseCtx, execTimeout)
 	session.cancel = cancel
 	m.mu.Unlock()
 
@@ -633,6 +768,24 @@ func (m *subagentManager) execute(session *subagentSession) {
 		session.Status = subagentStatusCompleted
 		session.Error = ""
 	}
+	session.closeDone()
+	m.slotCond.Broadcast()
+}
+
+func (m *subagentManager) finalizeBeforeExecution(session *subagentSession) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if isTerminalSubagentStatus(session.Status) {
+		return
+	}
+	if !session.queueDeadline.IsZero() && !time.Now().Before(session.queueDeadline) {
+		session.Status = subagentStatusTimedOut
+		session.Error = fmt.Sprintf("subagent timed out after %s", session.Timeout)
+	} else {
+		session.Status = subagentStatusCancelled
+		session.Error = "subagent cancelled before execution"
+	}
+	session.FinishedAt = time.Now().UTC()
 	session.closeDone()
 	m.slotCond.Broadcast()
 }
@@ -869,62 +1022,15 @@ func (m *subagentManager) resolveWaitTimeoutSeconds(requested int, limits subage
 	return requested, nil
 }
 
-func (m *subagentManager) activeChildrenLocked(parentID string) int {
-	ids := m.childrenByNode[parentID]
+func (m *subagentManager) admittedChildrenLocked(parentID string) int {
 	count := 0
-	for _, id := range ids {
+	for _, id := range m.childrenByNode[parentID] {
 		session := m.sessions[id]
-		if session == nil || isTerminalSubagentStatus(session.Status) {
-			continue
+		if session != nil && !isTerminalSubagentStatus(session.Status) {
+			count++
 		}
-		count++
 	}
 	return count
-}
-
-func (m *subagentManager) waitForChildSlotLocked(ctx context.Context, parentID string, timeoutSec, maxChildren int) error {
-	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
-	cancelledByContext := false
-	stopCtxWatch := make(chan struct{})
-	if ctx != nil {
-		go func() {
-			select {
-			case <-ctx.Done():
-				m.mu.Lock()
-				cancelledByContext = true
-				m.slotCond.Broadcast()
-				m.mu.Unlock()
-			case <-stopCtxWatch:
-			}
-		}()
-	}
-	defer close(stopCtxWatch)
-
-	for m.activeChildrenLocked(parentID) >= maxChildren {
-		if cancelledByContext {
-			return fmt.Errorf("wait_for_slot: %w", ctx.Err())
-		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return fmt.Errorf("wait_for_slot timed out after %ds for parent %q (%d)", timeoutSec, parentID, maxChildren)
-		}
-		timedOut := false
-		timer := time.AfterFunc(remaining, func() {
-			m.mu.Lock()
-			timedOut = true
-			m.slotCond.Broadcast()
-			m.mu.Unlock()
-		})
-		m.slotCond.Wait()
-		if cancelledByContext {
-			_ = timer.Stop()
-			return fmt.Errorf("wait_for_slot: %w", ctx.Err())
-		}
-		if !timer.Stop() && timedOut && m.activeChildrenLocked(parentID) >= maxChildren {
-			return fmt.Errorf("wait_for_slot timed out after %ds for parent %q (%d)", timeoutSec, parentID, maxChildren)
-		}
-	}
-	return nil
 }
 
 func isTerminalSubagentStatus(status subagentStatus) bool {
@@ -973,6 +1079,8 @@ type subagentAggregateEnvelope struct {
 	Cancelled       int                `json:"cancelled"`
 	TimedOut        int                `json:"timed_out"`
 	Running         int                `json:"running"`
+	Pending         int                `json:"pending"`
+	Queued          int                `json:"queued"`
 	QueuedOrPending int                `json:"queued_or_pending"`
 	Items           []subagentEnvelope `json:"items"`
 	CombinedOutput  string             `json:"combined_output,omitempty"`
@@ -998,6 +1106,12 @@ func buildAggregateEnvelope(items []subagentEnvelope, maxChars int) subagentAggr
 			agg.TimedOut++
 		case string(subagentStatusRunning):
 			agg.Running++
+		case string(subagentStatusPending):
+			agg.Pending++
+			agg.QueuedOrPending++
+		case string(subagentStatusQueued):
+			agg.Queued++
+			agg.QueuedOrPending++
 		default:
 			agg.QueuedOrPending++
 		}
@@ -1073,4 +1187,74 @@ func (s *subagentSession) closeDone() {
 	s.doneOnce.Do(func() {
 		close(s.done)
 	})
+}
+
+// bindParentContext connects a parent turn's lifetime to its child tree. A
+// non-cancellable context is still retained as the lifetime source for normal
+// two-phase tool calls, but does not need a watcher.
+func (m *subagentManager) bindParentContext(parentID string, ctx context.Context) {
+	if m == nil || strings.TrimSpace(parentID) == "" || ctx == nil {
+		return
+	}
+	binding := &parentContextBinding{ctx: ctx, stop: make(chan struct{})}
+	m.mu.Lock()
+	if previous := m.parentContexts[parentID]; previous != nil {
+		close(previous.stop)
+	}
+	m.parentContexts[parentID] = binding
+	m.mu.Unlock()
+	if ctx.Done() == nil {
+		return
+	}
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			m.mu.Lock()
+			if m.parentContexts[parentID] == binding {
+				delete(m.parentContexts, parentID)
+				m.cancelChildrenLocked(parentID)
+			}
+			m.mu.Unlock()
+		case <-binding.stop:
+		}
+	}()
+}
+
+// cancelChildrenLocked finalizes work that has not entered the runner and
+// requests cancellation from work that is already running. It is called while
+// m.mu is held so every terminal transition wakes slot waiters.
+func (m *subagentManager) cancelChildrenLocked(parentID string) {
+	for _, session := range m.sessions {
+		if session.ParentID != parentID && !m.isDescendantOfLocked(session, parentID) {
+			continue
+		}
+		if isTerminalSubagentStatus(session.Status) {
+			continue
+		}
+		if session.cancel != nil {
+			session.cancel()
+			continue
+		}
+		session.Status = subagentStatusCancelled
+		session.Error = "subagent cancelled with its parent"
+		session.FinishedAt = time.Now().UTC()
+		session.closeDone()
+	}
+	m.slotCond.Broadcast()
+}
+
+func (m *subagentManager) isDescendantOfLocked(session *subagentSession, ancestorID string) bool {
+	current := session.ParentID
+	for current != "" {
+		if current == ancestorID {
+			return true
+		}
+		parent := m.sessions[current]
+		if parent == nil {
+			return false
+		}
+		current = parent.ParentID
+	}
+	return false
 }

@@ -23,7 +23,7 @@ const (
 
 var skillNameCommands = []string{
 	"/compact", "/exit", "/goal", "/quit", "/save",
-	"/session-list", "/session-new", "/session-rename", "/session-resume",
+	"/session-list", "/session-new", "/session-resume",
 }
 
 // prepareSkillPrompt resolves exact $name references in input and turns them

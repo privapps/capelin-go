@@ -378,6 +378,13 @@ func (m *subagentManager) ListAll() []contracts.SubagentNode {
 	return m.core.ListAll()
 }
 
+func (m *subagentManager) bindParentContext(parent *agentRuntime, ctx context.Context) {
+	if m == nil || m.core == nil || parent == nil {
+		return
+	}
+	m.core.BindParentContext(subagentRuntime(parent), ctx)
+}
+
 func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args createSubagentArgs) (*subagentSession, error) {
 	session, err := m.core.Create(ctx, subagentRuntime(parent), subagents.CreateArgs(args))
 	return appSession(session), err

@@ -175,12 +175,12 @@ func (h *goalHeartbeat) emitLocked(now time.Time) {
 		turn = "; current turn elapsed " + formatGoalHeartbeatDuration(elapsedSince(h.turnStartedAt, now))
 	}
 	progress := h.todoProgress()
-	activeAgents := h.activeSubagents()
+	subagents := h.subagentProgress()
 	current := strings.Join(progress.current, ", ")
 	if current == "" {
 		current = "none"
 	}
-	h.emitFn(fmt.Sprintf("[goal] iteration %d/%d working; total elapsed %s%s; subagents %d active; todos %d/%d completed; current: %s", h.iteration, h.iterationMax, formatGoalHeartbeatDuration(total), turn, activeAgents, progress.completed, progress.total, current))
+	h.emitFn(fmt.Sprintf("[goal] iteration %d/%d working; total elapsed %s%s; subagents %d active; states pending=%d queued=%d running=%d completed=%d failed=%d cancelled=%d timed_out=%d; todos %d/%d completed; current: %s", h.iteration, h.iterationMax, formatGoalHeartbeatDuration(total), turn, subagents.active(), subagents.pending, subagents.queued, subagents.running, subagents.completed, subagents.failed, subagents.cancelled, subagents.timedOut, progress.completed, progress.total, current))
 }
 
 type goalHeartbeatTodoProgress struct {
@@ -210,18 +210,44 @@ func normalizeGoalHeartbeatTodoContent(content string) string {
 	return strings.Join(strings.Fields(content), " ")
 }
 
-func (h *goalHeartbeat) activeSubagents() int {
+type goalHeartbeatSubagentProgress struct {
+	pending   int
+	queued    int
+	running   int
+	completed int
+	failed    int
+	cancelled int
+	timedOut  int
+}
+
+func (p goalHeartbeatSubagentProgress) active() int {
+	return p.pending + p.queued + p.running
+}
+
+func (h *goalHeartbeat) subagentProgress() goalHeartbeatSubagentProgress {
+	progress := goalHeartbeatSubagentProgress{}
 	if h == nil || h.agentSnapshot == nil {
-		return 0
+		return progress
 	}
-	active := 0
 	for _, agent := range h.agentSnapshot() {
 		switch agent.Status {
-		case string(subagentStatusPending), string(subagentStatusQueued), string(subagentStatusRunning):
-			active++
+		case string(subagentStatusPending):
+			progress.pending++
+		case string(subagentStatusQueued):
+			progress.queued++
+		case string(subagentStatusRunning):
+			progress.running++
+		case string(subagentStatusCompleted):
+			progress.completed++
+		case string(subagentStatusFailed):
+			progress.failed++
+		case string(subagentStatusCancelled):
+			progress.cancelled++
+		case string(subagentStatusTimedOut):
+			progress.timedOut++
 		}
 	}
-	return active
+	return progress
 }
 
 func elapsedSince(start, now time.Time) time.Duration {

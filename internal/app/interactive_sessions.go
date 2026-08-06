@@ -12,7 +12,13 @@ import (
 	"unicode/utf8"
 )
 
-func interactiveCommandArgument(input, command string) (string, bool) {
+// leadingCommandArgument recognizes a command only when it occupies the
+// beginning of the trimmed request. Keeping the boundary check here prevents
+// slash-like text such as /goalist or embedded prose from becoming commands.
+// It is the shared application seam for one-shot requests, interactive initial
+// prompts, and the interactive /goal command.
+func leadingCommandArgument(input, command string) (string, bool) {
+	input = strings.TrimSpace(input)
 	if input == command {
 		return "", true
 	}
@@ -25,6 +31,10 @@ func interactiveCommandArgument(input, command string) (string, bool) {
 		return strings.TrimSpace(remainder), true
 	}
 	return "", false
+}
+
+func interactiveCommandArgument(input, command string) (string, bool) {
+	return leadingCommandArgument(input, command)
 }
 
 func (a *app) writeInteractiveSystem(message string) {
@@ -278,24 +288,6 @@ func (a *app) listInteractiveSessions(current *interactiveSession) error {
 	return nil
 }
 
-func (a *app) renameInteractiveSession(session *interactiveSession, rawName string) error {
-	if session == nil {
-		return errors.New("interactive session is nil")
-	}
-	name := strings.TrimSpace(rawName)
-	if name == "--clear" {
-		session.name = ""
-	} else if name == "" {
-		return errors.New("session name is required (or use --clear)")
-	} else {
-		session.name = name
-	}
-	if err := a.saveInteractiveSession(session); err != nil {
-		return err
-	}
-	return nil
-}
-
 func sessionDisplayLabel(snapshot sessionSnapshot) string {
 	if name := strings.TrimSpace(snapshot.Name); name != "" {
 		return displaySessionText(name)
@@ -367,6 +359,7 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 		a.writeInteractiveSystem("[goal] --yolo is required before using /goal")
 		return false
 	}
+	session.goalCompleted = false
 	goalProfile := a.cfg.goalRuntimeProfile()
 	if goalProfile.MaxGoalIterations <= 0 {
 		a.writeInteractiveSystem("[goal] invalid goal iteration limit")
@@ -408,6 +401,7 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 			session.activeGoal.Objective = "Resume the current checklist"
 		}
 		if validGoalCompletion(session.activeGoal, current) {
+			session.goalCompleted = true
 			a.writeInteractiveSystem("[goal] complete: the persisted completion handshake is valid")
 			return false
 		}
@@ -455,11 +449,11 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 		heartbeat.beginIteration(iteration)
 		prompt := goalContinuationPrompt
 		if objective != "" && iteration == 1 {
-			prompt = fmt.Sprintf("Start working toward this objective: %s\n\nCreate a fresh authoritative checklist with update_todos before doing the work. Make concrete progress, verify each completed item, and do not claim success while any checklist item remains incomplete. When the final checklist is complete, call complete_goal with a concise summary and non-empty evidence statements.", objective)
+			prompt = fmt.Sprintf("Start working toward this objective: %s\n\nCreate a fresh authoritative checklist with update_todos before doing the work. Make concrete progress, verify each completed item, and do not claim success while any checklist item remains incomplete. When the final checklist is complete, call complete_goal with a concise summary and non-empty evidence statements. %s", objective, goalParallelismGuidance)
 		} else if todosComplete(session.todos) {
-			prompt = fmt.Sprintf("Continue working toward the objective %q. The authoritative checklist is complete, but the completion handshake is missing or stale. Verify the final state and call complete_goal with a non-empty summary and evidence list; do not change the checklist unless verification requires it.", session.activeGoal.Objective)
+			prompt = fmt.Sprintf("Continue working toward the objective %q. The authoritative checklist is complete, but the completion handshake is missing or stale. Verify the final state and call complete_goal with a non-empty summary and evidence list; do not change the checklist unless verification requires it. %s", session.activeGoal.Objective, goalParallelismGuidance)
 		} else if session.activeGoal != nil {
-			prompt = fmt.Sprintf("Continue working toward the objective %q. Make concrete progress on the next incomplete checklist item, then update the authoritative checklist with verified status. When every item is complete, call complete_goal with a non-empty summary and evidence list.", session.activeGoal.Objective)
+			prompt = fmt.Sprintf("Continue working toward the objective %q. Make concrete progress on the next incomplete checklist item, then update the authoritative checklist with verified status. When every item is complete, call complete_goal with a non-empty summary and evidence list. %s", session.activeGoal.Objective, goalParallelismGuidance)
 		}
 		stopped, err := a.runInteractiveTurnResult(ctx, session, prompt)
 		heartbeat.endTurn()
@@ -511,6 +505,7 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 					terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
 					return false
 				}
+				session.goalCompleted = true
 				terminalGoalStatus(fmt.Sprintf("[goal] complete after %d iteration(s): %s", iteration, session.activeGoal.Completion.Summary))
 				return false
 			}
@@ -547,7 +542,9 @@ func (a *app) saveGoalSession(session *interactiveSession) error {
 	return a.saveInteractiveSession(session)
 }
 
-const goalContinuationPrompt = "Continue working toward the objective. Make concrete progress on the next incomplete checklist item, then update the authoritative checklist with verified status. When every item is complete, call complete_goal with a non-empty summary and evidence list. Do not claim success while any checklist item remains incomplete."
+const goalParallelismGuidance = "When subagent tools are available and the work has independent pieces, create subagents with create_subagent, start them in parallel with run_subagent using wait=false, then await their results and integrate and verify them."
+
+const goalContinuationPrompt = "Continue working toward the objective. Make concrete progress on the next incomplete checklist item, then update the authoritative checklist with verified status. When every item is complete, call complete_goal with a non-empty summary and evidence list. Do not claim success while any checklist item remains incomplete. " + goalParallelismGuidance
 
 const maxConsecutiveGoalRecoveries = 3
 

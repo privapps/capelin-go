@@ -341,3 +341,86 @@ func TestResponsesInvalidContinuationFallsBackToNormalizedMessages(t *testing.T)
 		t.Fatalf("normalized fallback input=%#v", input)
 	}
 }
+
+func TestProviderRequestsUseCapelinUserAgent(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint func(string) string
+		response string
+	}{
+		{name: "chat completions", endpoint: func(base string) string { return base + "/chat" }, response: `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`},
+		{name: "responses", endpoint: func(base string) string { return base + "/responses" }, response: `{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var userAgents []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				userAgents = append(userAgents, r.Header.Get("User-Agent"))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(test.response))
+			}))
+			defer server.Close()
+
+			provider := New(Config{Endpoint: test.endpoint(server.URL), HTTP: server.Client()})
+			state := provider.Initialize(nil, "hello")
+			if _, err := provider.Complete(context.Background(), state, nil, "model", ""); err != nil {
+				t.Fatal(err)
+			}
+			if len(userAgents) != 1 || userAgents[0] != contracts.CapelinUserAgent {
+				t.Fatalf("user agents = %#v, want [%q]", userAgents, contracts.CapelinUserAgent)
+			}
+		})
+	}
+}
+
+func TestProviderRedirectsRetainCapelinUserAgent(t *testing.T) {
+	var userAgents []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userAgents = append(userAgents, r.Header.Get("User-Agent"))
+		if r.URL.Path == "/redirect/responses" {
+			w.Header().Set("Location", "/final/responses")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`))
+	}))
+	defer server.Close()
+
+	provider := New(Config{Endpoint: server.URL + "/redirect/responses", HTTP: server.Client()})
+	if _, err := provider.Complete(context.Background(), provider.Initialize(nil, "hello"), nil, "model", ""); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(userAgents, []string{contracts.CapelinUserAgent, contracts.CapelinUserAgent}) {
+		t.Fatalf("redirect user agents = %#v, want two Capelin-Go values", userAgents)
+	}
+}
+
+func TestProviderRetriesUseCapelinUserAgent(t *testing.T) {
+	var userAgents []string
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userAgents = append(userAgents, r.Header.Get("User-Agent"))
+		attempts++
+		if attempts == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	provider := NewChatCompletions(Config{Endpoint: server.URL, HTTP: server.Client()})
+	state := provider.Initialize(nil, "hello")
+	if _, err := provider.Complete(context.Background(), state, nil, "model", ""); err == nil {
+		t.Fatal("first retryable request unexpectedly succeeded")
+	}
+	if _, err := provider.Complete(context.Background(), state, nil, "model", ""); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(userAgents, []string{contracts.CapelinUserAgent, contracts.CapelinUserAgent}) {
+		t.Fatalf("retry user agents = %#v, want two Capelin-Go values", userAgents)
+	}
+}

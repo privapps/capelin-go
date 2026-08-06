@@ -674,7 +674,7 @@ func TestInteractiveCommandCompleterOffersAllCommands(t *testing.T) {
 	for _, candidate := range candidates {
 		got = append(got, string(candidate))
 	}
-	want := []string{"compact ", "exit ", "goal ", "quit ", "save ", "session-list ", "session-new ", "session-rename ", "session-resume "}
+	want := []string{"compact ", "exit ", "goal ", "quit ", "save ", "session-list ", "session-new ", "session-resume "}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected slash-command candidates: got %#v, want %#v", got, want)
 	}
@@ -717,6 +717,24 @@ func TestInteractiveBareExitAndQuitRemainModelPrompts(t *testing.T) {
 	want := []string{"exit", "quit"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("bare exit/quit were not model prompts: got %#v, want %#v", got, want)
+	}
+}
+
+func TestInteractiveRemovedSessionTextReachesModel(t *testing.T) {
+	testApp := newInteractiveTurnTestApp(t)
+	pipe, done := startInteractiveReadlinePipe(t, testApp, "")
+	pipe.send("/session-rename named session\r")
+	testApp.waitForTurn(t)
+	pipe.send("/session-rename\r")
+	testApp.waitForTurn(t)
+	pipe.send("/exit\r")
+	if err := <-done; err != nil {
+		t.Fatalf("interactive removed-command loop: %v", err)
+	}
+	got := testApp.userPrompts()
+	want := []string{"/session-rename named session", "/session-rename"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("removed command text was not sent as ordinary input: got %#v, want %#v", got, want)
 	}
 }
 

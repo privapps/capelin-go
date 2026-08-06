@@ -22,7 +22,27 @@ Put the task in quotes so the shell passes the complete sentence as one request:
 
 Capelin may search the web, read files, or ask worker assistants for help before it returns the answer. Normal answers are printed to standard output. Tool activity and status messages are printed separately, so scripts can use the answer without also receiving the progress messages.
 
-### Show only the final answer
+### Run a bounded goal from the shell
+
+A quoted leading `/goal <objective>` enters the same checklist-driven goal
+workflow used by interactive mode. The safety gate is explicit:
+
+```bash
+./capelin-go --yolo '/goal inspect the repository and verify the result'
+./capelin-go --yolo '/goal $implement apply the requested change'
+```
+
+Quote the complete shell argument so `$skill` references are passed to Capelin
+instead of expanded by the shell. A one-shot `/goal` without an objective is
+rejected before a session or provider request is created, and a one-shot goal
+without `--yolo` is rejected as well. One-shot goals leave a durable snapshot
+under `.capelin-go/sessions/` and print a `--resume <id>` hint. They return
+status zero only after a non-empty checklist, complete checklist items, a valid
+`complete_goal` summary/evidence handshake, and the final persistence all
+succeed; cancellation, failure, or any incomplete safeguard outcome returns a
+non-zero status. Resume an incomplete goal interactively with
+`--interactive --resume <id>` and then bare `/goal`.
+
 
 Use `--final-only` when another program needs clean output:
 
@@ -56,6 +76,18 @@ You can also start with a first question:
 ./capelin-go --interactive "inspect this folder and suggest a cleanup plan"
 ```
 
+A first question whose trimmed text is a leading `/goal <objective>` is
+interpreted as a goal command rather than ordinary model text and uses the same
+profile, checklist, skill preparation, status output, and completion handshake
+as an interactive `/goal` entered later:
+
+```bash
+./capelin-go --interactive --yolo '/goal inspect this folder and verify the result'
+```
+
+Initial prompts that do not begin with `/goal` remain ordinary turns. Existing
+REPL commands such as `/save`, `/compact`, and session commands are unchanged.
+
 Every ordinary line is sent as a new turn. Follow-up questions can refer to earlier answers without repeating the full context.
 
 ### Interactive commands
@@ -74,8 +106,6 @@ Every ordinary line is sent as a new turn. Follow-up questions can refer to earl
   session. It also shows a deterministic label, recent direct input, message
   count, update timestamp, and checklist progress. `/session-resume [ID|PREFIX]`
   switches to an exact ID, unique prefix, or newest valid snapshot.
-- `/session-rename <name>` sets a durable display name; `/session-rename --clear`
-  restores the derived topic label.
 - `/goal <objective>` starts a fresh checklist-driven objective, while bare
   `/goal` continues an incomplete checklist. These commands require `--yolo`.
 
@@ -277,6 +307,16 @@ Worker assistants can run one after another or in parallel. They have limits so 
 - maximum result per worker: `8000` characters;
 - maximum combined result: `12000` characters;
 - maximum tool-use rounds per worker: `20`.
+
+Worker creation is non-blocking and remains separate from execution. A large
+parent tool batch returns pending handles promptly; run calls place admitted
+handles in a bounded queue, and the scheduler starts them up to the configured
+active-child and parallel-worker limits. If that allowance is full, the
+creation result is an actionable capacity error. Run or cancel existing work,
+await terminal results, and retry the creation. `list_subagents` and aggregate
+`read_subagent` results distinguish `pending`, `queued`, `running`,
+`completed`, `failed`, `cancelled`, and `timed_out` states. Parent cancellation
+finalizes pending/queued work and stops running descendants.
 
 These values can be changed with matching `--subagent-*` flags, environment settings, or entries in `config.ini`. An existing settings file keeps its saved values, so an older installation may have different defaults.
 

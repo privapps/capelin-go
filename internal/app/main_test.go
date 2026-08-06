@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -76,6 +75,7 @@ func TestPrintUsageDescribesProviderAndRuntimeProfileContract(t *testing.T) {
 		"Saved numeric values equal to ordinary defaults are baseline values",
 		"--yolo enables permissions and path access only; it does not select goal budgets",
 		"stopping/completing a goal restores ordinary limits",
+		"IDLE_HOOK_COMMAND, IDLE_HOOK_ARGS",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("help missing %q:\n%s", want, text)
@@ -733,14 +733,20 @@ func TestSubagentMaxDepthAndChildren(t *testing.T) {
 	}
 }
 
-func TestSubagentCreateWaitsForChildSlotByDefault(t *testing.T) {
+func TestSubagentCreateDoesNotWaitForChildSlot(t *testing.T) {
 	cfg := defaultSubagentRuntimeConfig()
 	cfg.MaxDepth = 1
 	cfg.MaxChildren = 1
 	cfg.DefaultTimeoutSec = 2
 	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
-		time.Sleep(120 * time.Millisecond)
-		return "ok", nil
+		timer := time.NewTimer(120 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return "ok", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
 	})
 	root := &agentRuntime{
 		sessionID:         rootAgentID,
@@ -765,17 +771,20 @@ func TestSubagentCreateWaitsForChildSlotByDefault(t *testing.T) {
 	if second.ID == "" {
 		t.Fatal("expected second child to be created")
 	}
-	if time.Since(start) < 80*time.Millisecond {
-		t.Fatal("expected create to wait for a free child slot")
+	if time.Since(start) >= 80*time.Millisecond {
+		t.Fatal("create waited for a free child slot")
 	}
 }
 
-func TestSubagentCreateWaitForSlotTimeout(t *testing.T) {
+func TestSubagentCreateOverflowReturnsBoundedCapacityPromptly(t *testing.T) {
 	cfg := defaultSubagentRuntimeConfig()
 	cfg.MaxDepth = 1
 	cfg.MaxChildren = 1
+	cfg.MaxParallel = 4
+	cfg.DefaultTimeoutSec = 120
 	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
-		return "ok", nil
+		<-ctx.Done()
+		return "", ctx.Err()
 	})
 	root := &agentRuntime{
 		sessionID:         rootAgentID,
@@ -784,23 +793,29 @@ func TestSubagentCreateWaitForSlotTimeout(t *testing.T) {
 		maxToolIterations: 5,
 	}
 
-	if _, err := m.create(context.Background(), root, createSubagentArgs{Question: "a"}); err != nil {
-		t.Fatalf("first create failed: %v", err)
+	for i := 0; i < cfg.MaxChildren+cfg.MaxParallel; i++ {
+		if _, err := m.create(context.Background(), root, createSubagentArgs{Question: fmt.Sprintf("q-%d", i)}); err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
 	}
-	_, err := m.create(context.Background(), root, createSubagentArgs{Question: "b", WaitTimeoutSeconds: 1})
+	start := time.Now()
+	_, err := m.create(context.Background(), root, createSubagentArgs{Question: "overflow", WaitTimeoutSeconds: 120})
 	if err == nil {
-		t.Fatal("expected wait_for_slot timeout")
+		t.Fatal("expected bounded admission capacity error")
 	}
-	if !strings.Contains(err.Error(), "wait_for_slot timed out") {
-		t.Fatalf("expected wait timeout error, got %v", err)
+	if !strings.Contains(err.Error(), "admission capacity exceeded") {
+		t.Fatalf("unexpected capacity error: %v", err)
+	}
+	if time.Since(start) >= 80*time.Millisecond {
+		t.Fatal("overflow create waited for a child slot")
 	}
 }
 
-func TestSubagentCreateWaitForSlotRespectsContextCancellation(t *testing.T) {
+func TestSubagentCreateOverflowDoesNotWaitForCancelledContext(t *testing.T) {
 	cfg := defaultSubagentRuntimeConfig()
 	cfg.MaxDepth = 1
 	cfg.MaxChildren = 1
-	cfg.DefaultTimeoutSec = 300
+	cfg.MaxParallel = 1
 	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
 		return "ok", nil
 	})
@@ -811,18 +826,23 @@ func TestSubagentCreateWaitForSlotRespectsContextCancellation(t *testing.T) {
 		maxToolIterations: 5,
 	}
 
-	if _, err := m.create(context.Background(), root, createSubagentArgs{Question: "a"}); err != nil {
-		t.Fatalf("first create failed: %v", err)
+	for i := 0; i < cfg.MaxChildren+cfg.MaxParallel; i++ {
+		if _, err := m.create(context.Background(), root, createSubagentArgs{Question: fmt.Sprintf("q-%d", i)}); err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
 	}
-
 	waitCtx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
-	_, err := m.create(waitCtx, root, createSubagentArgs{Question: "b", WaitTimeoutSeconds: 300})
+	start := time.Now()
+	_, err := m.create(waitCtx, root, createSubagentArgs{Question: "overflow", WaitTimeoutSeconds: 300})
 	if err == nil {
-		t.Fatal("expected create to stop waiting when context is cancelled")
+		t.Fatal("expected bounded admission capacity error")
 	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected context deadline exceeded, got %v", err)
+	if !strings.Contains(err.Error(), "admission capacity exceeded") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if time.Since(start) >= 40*time.Millisecond {
+		t.Fatal("overflow create consumed the cancelled context timeout")
 	}
 }
 
