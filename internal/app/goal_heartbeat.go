@@ -1,7 +1,9 @@
 package app
 
 import (
+	"capelin-go/internal/contracts"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,23 +18,25 @@ const (
 // The mutex serializes progress writes with stop so terminal goal output can
 // be written only after the reporter has ceased emitting.
 type goalHeartbeat struct {
-	emitFn        func(string)
-	initialDelay  time.Duration
-	cadence       time.Duration
-	now           func() time.Time
-	startedAt     time.Time
-	stopCh        chan struct{}
-	done          chan struct{}
-	wg            sync.WaitGroup
-	mu            sync.Mutex
-	stopped       bool
-	started       bool
-	iteration     int
-	iterationMax  int
-	turnStartedAt time.Time
+	emitFn            func(string)
+	snapshotTodos     func() []todoItem
+	snapshotSubagents func() []contracts.SubagentNode
+	initialDelay      time.Duration
+	cadence           time.Duration
+	now               func() time.Time
+	startedAt         time.Time
+	stopCh            chan struct{}
+	done              chan struct{}
+	wg                sync.WaitGroup
+	mu                sync.Mutex
+	stopped           bool
+	started           bool
+	iteration         int
+	iterationMax      int
+	turnStartedAt     time.Time
 }
 
-func newGoalHeartbeat(emit func(string), iterationMax int, initialDelay, cadence time.Duration) *goalHeartbeat {
+func newGoalHeartbeat(emit func(string), iterationMax int, initialDelay, cadence time.Duration, snapshotTodos func() []todoItem, snapshotSubagents func() []contracts.SubagentNode) *goalHeartbeat {
 	if initialDelay <= 0 {
 		initialDelay = goalHeartbeatInitialDelay
 	}
@@ -40,14 +44,16 @@ func newGoalHeartbeat(emit func(string), iterationMax int, initialDelay, cadence
 		cadence = goalHeartbeatCadence
 	}
 	return &goalHeartbeat{
-		emitFn:       emit,
-		initialDelay: initialDelay,
-		cadence:      cadence,
-		now:          time.Now,
-		startedAt:    time.Now(),
-		stopCh:       make(chan struct{}),
-		done:         make(chan struct{}),
-		iterationMax: iterationMax,
+		emitFn:            emit,
+		snapshotTodos:     snapshotTodos,
+		snapshotSubagents: snapshotSubagents,
+		initialDelay:      initialDelay,
+		cadence:           cadence,
+		now:               time.Now,
+		startedAt:         time.Now(),
+		stopCh:            make(chan struct{}),
+		done:              make(chan struct{}),
+		iterationMax:      iterationMax,
 	}
 }
 
@@ -148,12 +154,41 @@ func (h *goalHeartbeat) emitLocked(now time.Time) {
 	if h.emitFn == nil || h.stopped || h.iteration <= 0 {
 		return
 	}
+	todos := []todoItem{}
+	if h.snapshotTodos != nil {
+		todos = h.snapshotTodos()
+	}
+	subagents := []contracts.SubagentNode{}
+	if h.snapshotSubagents != nil {
+		subagents = h.snapshotSubagents()
+	}
 	total := elapsedSince(h.startedAt, now)
 	turn := ""
 	if !h.turnStartedAt.IsZero() {
 		turn = "; current turn elapsed " + formatGoalHeartbeatDuration(elapsedSince(h.turnStartedAt, now))
 	}
-	h.emitFn(fmt.Sprintf("[goal] iteration %d/%d working; total elapsed %s%s", h.iteration, h.iterationMax, formatGoalHeartbeatDuration(total), turn))
+	completed := 0
+	current := make([]string, 0)
+	for _, todo := range todos {
+		if todo.Status == todoStatusCompleted {
+			completed++
+		}
+		if todo.Status == todoStatusInProgress {
+			current = append(current, normalizeGoalHeartbeatTodoContent(todo.Content))
+		}
+	}
+	currentText := "none"
+	if len(current) > 0 {
+		currentText = strings.Join(current, ", ")
+	}
+	activeSubagents := 0
+	for _, subagent := range subagents {
+		switch subagentStatus(subagent.Status) {
+		case subagentStatusPending, subagentStatusQueued, subagentStatusRunning:
+			activeSubagents++
+		}
+	}
+	h.emitFn(fmt.Sprintf("[goal] iteration %d/%d working; total elapsed %s%s; subagents %d active; todos %d/%d completed; current: %s", h.iteration, h.iterationMax, formatGoalHeartbeatDuration(total), turn, activeSubagents, completed, len(todos), currentText))
 }
 
 func elapsedSince(start, now time.Time) time.Duration {
@@ -167,5 +202,20 @@ func formatGoalHeartbeatDuration(value time.Duration) string {
 	if value < 0 {
 		value = 0
 	}
-	return value.Round(time.Second).String()
+	value = value.Round(time.Second)
+	hours := value / time.Hour
+	value %= time.Hour
+	minutes := value / time.Minute
+	seconds := (value % time.Minute) / time.Second
+	if hours > 0 {
+		return fmt.Sprintf("%dh%dm%02ds", hours, minutes, seconds)
+	}
+	if minutes > 0 {
+		return fmt.Sprintf("%dm%02ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%02ds", seconds)
+}
+
+func normalizeGoalHeartbeatTodoContent(content string) string {
+	return strings.Join(strings.Fields(content), " ")
 }

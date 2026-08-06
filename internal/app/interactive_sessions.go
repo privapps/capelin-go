@@ -427,7 +427,14 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 		session.runtime.allowedTools = make(map[string]bool)
 	}
 	session.runtime.allowedTools[toolCompleteGoal] = true
-	heartbeat := newGoalHeartbeat(a.writeInteractiveSystem, goalProfile.MaxGoalIterations, a.goalHeartbeatInitialDelay, a.goalHeartbeatCadence)
+	heartbeat := newGoalHeartbeat(
+		a.writeInteractiveSystem,
+		goalProfile.MaxGoalIterations,
+		a.goalHeartbeatInitialDelay,
+		a.goalHeartbeatCadence,
+		session.runtime.snapshotTodos,
+		a.subagents.ListAll,
+	)
 	defer heartbeat.stop()
 	terminalGoalStatus := func(message string) {
 		heartbeat.stop()
