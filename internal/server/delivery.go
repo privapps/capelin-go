@@ -67,7 +67,7 @@ type HandlerConfig struct {
 	LogRejectedOrigin func(string)
 	AuthorizeTarget   func(string) error
 	LogRejectedTarget func(string)
-	ProxyHandler      http.Handler
+	Proxy             *ProxyConfig
 }
 
 // Delivery is the synchronous/asynchronous HTTP delivery adapter.
@@ -92,8 +92,8 @@ func NewDelivery(config HandlerConfig) *Delivery {
 func NewHandler(config HandlerConfig) http.Handler {
 	delivery := NewDelivery(config)
 	mux := http.NewServeMux()
-	if config.ProxyHandler != nil {
-		mux.Handle("/-/", config.ProxyHandler)
+	if config.Proxy != nil {
+		mux.Handle("/-/", NewProxyHandler(*config.Proxy))
 	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

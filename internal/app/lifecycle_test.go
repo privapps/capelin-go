@@ -63,7 +63,7 @@ func TestSessionStoreFailedReplacementPreservesPreviousSnapshot(t *testing.T) {
 	if err := store.save(snapshot); err == nil {
 		t.Fatal("injected save unexpectedly succeeded")
 	}
-	store.writeAtomic = func(path string, data []byte) error { return atomicWriteFile(path, data, 0o600) }
+	store.writeAtomic = func(path string, data []byte) error { return os.WriteFile(path, data, 0o600) }
 	loaded, err := store.resolve(snapshot.SessionUUID)
 	if err != nil {
 		t.Fatal(err)
@@ -281,7 +281,7 @@ func TestSessionStoreDerivesLegacyMetadataAndRoundTripsNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot := sessionSnapshot{
+	snapshot := sessionView{
 		SessionUUID: generateUUID(),
 		Messages: []types.Message{
 			{Role: "system", Content: "test"},
@@ -329,7 +329,7 @@ func TestHistoricalNamedSessionRemainsLoadableResumableAndListed(t *testing.T) {
 		}
 		testApp.app.sessionStore = store
 	}
-	historical := sessionSnapshot{
+	historical := sessionView{
 		SessionUUID: generateUUID(),
 		Messages: []types.Message{
 			{Role: "system", Content: "test"},
@@ -386,6 +386,40 @@ func TestHistoricalNamedSessionRemainsLoadableResumableAndListed(t *testing.T) {
 	}
 	if !strings.Contains(string(listing), historical.SessionUUID) || !strings.Contains(string(listing), "historical name") {
 		t.Fatalf("historical name was not present in session list: %q", listing)
+	}
+}
+
+func TestApplicationSessionWorkflowLoadsLegacyAliases(t *testing.T) {
+	store, err := newSessionStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "00000000-0000-4000-8000-000000000009"
+	legacy := `{"session_id":"` + id + `","created_at":"2026-08-04T11:00:00Z","updated_at":"2026-08-04T11:05:00Z","last_response":"legacy answer","last_input":"legacy prompt","messages":[{"role":"system","content":"test"},{"role":"user","content":"legacy prompt"},{"role":"assistant","content":"legacy answer"}],"todos":[{"id":"work","content":"legacy work","source":"history","status":"completed"}],"activeGoal":{"objective":"legacy objective","generation":2},"continuationState":{"provider":"responses","version":1,"data":{"input":[]}}}`
+	if err := os.MkdirAll(store.directory(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.directory(), id+".json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := store.resolve(id[:12])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SessionUUID != id || loaded.LastContent != "legacy answer" || loaded.LastInput != "legacy prompt" || loaded.Topic != "legacy prompt" {
+		t.Fatalf("legacy aliases lost session metadata: %#v", loaded)
+	}
+	if len(loaded.Messages) != 3 || len(loaded.Todos) != 1 || loaded.Todos[0].Status != todoStatusCompleted {
+		t.Fatalf("legacy aliases lost workflow state: %#v", loaded)
+	}
+	if loaded.ActiveGoal == nil || loaded.ActiveGoal.Objective != "legacy objective" || loaded.ProviderState == nil || loaded.ProviderState.Provider != "responses" {
+		t.Fatalf("legacy aliases lost continuation state: %#v", loaded)
+	}
+
+	resumed := (&app{}).sessionFromSnapshot(loaded)
+	if resumed.id != id || resumed.lastResponse != "legacy answer" || len(resumed.messages) != 3 || len(resumed.todos) != 1 || resumed.providerState == nil {
+		t.Fatalf("application resume lost canonical session state: %#v", resumed)
 	}
 }
 

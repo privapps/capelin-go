@@ -41,9 +41,6 @@ var serverHTTPClient = &http.Client{
 }
 
 func startServer(cfg config) error {
-	activeServerPolicy = &cfg.securityPolicy
-	proxyHTTPClient = cfg.securityPolicy.secureHTTPClient()
-	proxyHTTPClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	serverAllowedTools := map[string]bool{
 		toolWebSearch: true, toolFetchPage: true,
 		toolCreateSubagent: true, toolRunSubagent: true, toolAwaitSubagent: true,
@@ -85,48 +82,13 @@ func startServer(cfg config) error {
 	return nil
 }
 
-type serverExecutionRequest struct {
-	remoteBase         string
-	remoteToken        string
-	model              string
-	reasoning          string
-	messages           []contracts.Message
-	question           string
-	serverAllowedTools map[string]bool
-}
-
-type serverExecutionResult struct {
-	content   string
-	reasoning string
-}
-
-type serverExecutor interface {
-	Execute(context.Context, *serverExecutionRequest) (serverExecutionResult, error)
-}
-
-type serverExecutorFunc func(context.Context, *serverExecutionRequest) (serverExecutionResult, error)
-
-func (f serverExecutorFunc) Execute(ctx context.Context, request *serverExecutionRequest) (serverExecutionResult, error) {
-	return f(ctx, request)
-}
-
-type serverExecutorAdapter struct{ executor serverExecutor }
-
-func (a serverExecutorAdapter) Execute(ctx context.Context, request *server.ExecutionRequest) (server.ExecutionResult, error) {
-	if a.executor == nil {
-		return server.ExecutionResult{}, context.Canceled
-	}
-	result, err := a.executor.Execute(ctx, appServerRequest(request))
-	return server.ExecutionResult{Content: result.content, Reasoning: result.reasoning}, err
-}
-
 type applicationServerExecutor struct{ app *app }
 
 func (e applicationServerExecutor) Execute(ctx context.Context, request *server.ExecutionRequest) (server.ExecutionResult, error) {
 	if e.app == nil {
 		return server.ExecutionResult{}, context.Canceled
 	}
-	serverApp, runtime := e.app.newServerExecutionApp(appServerRequest(request))
+	serverApp, runtime := e.app.newServerExecutionApp(request)
 	_, content, reasoning, err := serverApp.runTurnLoop(ctx, request.Messages, request.Question, runtime, serverApp.toolset, false)
 	if err != nil {
 		return server.ExecutionResult{}, err
@@ -134,37 +96,8 @@ func (e applicationServerExecutor) Execute(ctx context.Context, request *server.
 	return server.ExecutionResult{Content: content, Reasoning: reasoning}, nil
 }
 
-func (a *app) serverExecutor() serverExecutor {
-	return applicationServerExecutorForApp{app: a}
-}
-
-type applicationServerExecutorForApp struct{ app *app }
-
-func (e applicationServerExecutorForApp) Execute(ctx context.Context, request *serverExecutionRequest) (serverExecutionResult, error) {
-	result, err := applicationServerExecutor{app: e.app}.Execute(ctx, toServerRequest(request))
-	return serverExecutionResult{content: result.Content, reasoning: result.Reasoning}, err
-}
-
-func toServerRequest(request *serverExecutionRequest) *server.ExecutionRequest {
-	if request == nil {
-		return nil
-	}
-	return &server.ExecutionRequest{
-		RemoteBase: request.remoteBase, RemoteToken: request.remoteToken, Model: request.model,
-		Reasoning: request.reasoning, Messages: request.messages, Question: request.question,
-		AllowedTools: cloneAllowedTools(request.serverAllowedTools),
-	}
-}
-
-func appServerRequest(request *server.ExecutionRequest) *serverExecutionRequest {
-	if request == nil {
-		return nil
-	}
-	return &serverExecutionRequest{
-		remoteBase: request.RemoteBase, remoteToken: request.RemoteToken, model: request.Model,
-		reasoning: request.Reasoning, messages: request.Messages, question: request.Question,
-		serverAllowedTools: cloneAllowedTools(request.AllowedTools),
-	}
+func (a *app) serverExecutor() server.Executor {
+	return applicationServerExecutor{app: a}
 }
 
 func serverHandlerConfig(a *app, allowed map[string]bool, executor server.Executor) server.HandlerConfig {
@@ -180,7 +113,18 @@ func serverHandlerConfig(a *app, allowed map[string]bool, executor server.Execut
 			return err
 		}
 		config.LogRejectedTarget = a.cfg.securityPolicy.logRejectedTarget
-		config.ProxyHandler = http.HandlerFunc(proxyHandler)
+		proxyClient := a.proxyHTTP
+		if proxyClient == nil {
+			proxyClient = a.cfg.securityPolicy.secureHTTPClient()
+		}
+		config.Proxy = &server.ProxyConfig{
+			Client: proxyClient,
+			AuthorizeTarget: func(raw string) error {
+				_, err := a.cfg.securityPolicy.authorizeTarget(raw)
+				return err
+			},
+			LogRejectedTarget: a.cfg.securityPolicy.logRejectedTarget,
+		}
 	}
 	return config
 }
@@ -189,9 +133,9 @@ func newServerHandler(a *app, allowed map[string]bool) http.Handler {
 	return newServerHandlerWithExecutor(a, allowed, a.serverExecutor())
 }
 
-func newServerHandlerWithExecutor(a *app, allowed map[string]bool, executor serverExecutor) http.Handler {
+func newServerHandlerWithExecutor(a *app, allowed map[string]bool, executor server.Executor) http.Handler {
 	server.SetAsyncSemaphore(asyncSem)
-	return server.NewHandler(serverHandlerConfig(a, allowed, serverExecutorAdapter{executor: executor}))
+	return server.NewHandler(serverHandlerConfig(a, allowed, executor))
 }
 
 func (a *app) handleChatCompletion(w http.ResponseWriter, r *http.Request, allowed map[string]bool) {
@@ -200,11 +144,9 @@ func (a *app) handleChatCompletion(w http.ResponseWriter, r *http.Request, allow
 
 func (a *app) handleAsyncChatCompletion(w http.ResponseWriter, r *http.Request, allowed map[string]bool) {
 	server.SetAsyncSemaphore(asyncSem)
-	config := serverHandlerConfig(a, allowed, serverExecutorAdapter{executor: a.serverExecutor()})
+	config := serverHandlerConfig(a, allowed, a.serverExecutor())
 	if a.asyncRunner != nil {
-		config.AsyncOverride = func(id string, request *server.ExecutionRequest) {
-			a.asyncRunner(id, appServerRequest(request))
-		}
+		config.AsyncOverride = a.asyncRunner
 	}
 	server.NewHandler(config).ServeHTTP(w, r)
 }
@@ -227,12 +169,18 @@ func writeChatCompletionResponse(w http.ResponseWriter, model, content, reasonin
 func generateUUID() string { return server.GenerateUUID() }
 
 func (a *app) runAsyncTask(uuid, remoteBase, remoteToken, model, reasoning string, messages []contracts.Message, question string, allowed map[string]bool) {
-	a.runAsyncExecution(uuid, &serverExecutionRequest{remoteBase: remoteBase, remoteToken: remoteToken, model: model, reasoning: reasoning, messages: messages, question: question, serverAllowedTools: cloneAllowedTools(allowed)})
+	a.runAsyncExecution(uuid, &server.ExecutionRequest{
+		RemoteBase: remoteBase, RemoteToken: remoteToken, Model: model, Reasoning: reasoning,
+		Messages: messages, Question: question, AllowedTools: cloneAllowedTools(allowed),
+	})
 }
 
-func (a *app) runAsyncExecution(uuid string, execution *serverExecutionRequest) {
-	delivery := server.NewDelivery(serverHandlerConfig(a, execution.serverAllowedTools, serverExecutorAdapter{executor: a.serverExecutor()}))
-	delivery.RunAsync(uuid, toServerRequest(execution))
+func (a *app) runAsyncExecution(uuid string, execution *server.ExecutionRequest) {
+	if execution == nil {
+		return
+	}
+	delivery := server.NewDelivery(serverHandlerConfig(a, execution.AllowedTools, a.serverExecutor()))
+	delivery.RunAsync(uuid, execution)
 }
 
 func (a *app) storeAsyncResult(uuid, data string) {

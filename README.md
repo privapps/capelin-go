@@ -111,7 +111,8 @@ implicitly selects a saved goal. Accepted goals create a durable session under
 exits non-zero unless its checklist is non-empty and complete, its
 `complete_goal` evidence handshake is valid, and the final session save
 succeeds. Incomplete goals retain their latest state for interactive resume
-with `--interactive --resume <id>` followed by bare `/goal`.
+with `--interactive --resume <id>` followed by bare `/goal`. Clear conversational
+requests such as `finish the goal` also continue a persisted active goal.
 
 Interactive sessions are saved atomically under `.capelin-go/sessions/` after
 successful turns, checklist updates, switches, and exit. The REPL prints the

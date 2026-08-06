@@ -265,7 +265,7 @@ func TestInteractiveCompactionPersistenceFailureRollsBackAndRecovers(t *testing.
 		t.Fatalf("persistence failure output was misleading: %v", systemEvents)
 	}
 
-	testApp.app.sessionStore.writeAtomic = func(path string, data []byte) error { return atomicWriteFile(path, data, 0o600) }
+	testApp.app.sessionStore.writeAtomic = func(path string, data []byte) error { return os.WriteFile(path, data, 0o600) }
 	pipe.send("recover prompt\r")
 	testApp.waitForTurn(t)
 	_ = pipe.Close()

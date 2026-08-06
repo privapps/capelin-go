@@ -23,14 +23,14 @@ func TestServerDeliveryUsesApplicationExecutorForBothModes(t *testing.T) {
 		dataStore: newDataStore(),
 	}
 	var mu sync.Mutex
-	var requests []*serverExecutionRequest
-	executor := serverExecutorFunc(func(_ context.Context, request *serverExecutionRequest) (serverExecutionResult, error) {
+	var requests []*server.ExecutionRequest
+	executor := server.ExecutorFunc(func(_ context.Context, request *server.ExecutionRequest) (server.ExecutionResult, error) {
 		mu.Lock()
 		copyRequest := *request
-		copyRequest.messages = append([]types.Message(nil), request.messages...)
+		copyRequest.Messages = append([]types.Message(nil), request.Messages...)
 		requests = append(requests, &copyRequest)
 		mu.Unlock()
-		return serverExecutionResult{content: "from executor"}, nil
+		return server.ExecutionResult{Content: "from executor"}, nil
 	})
 	handler := newServerHandlerWithExecutor(a, map[string]bool{toolWebSearch: true}, executor)
 	body := `{"model":"","reasoning":{"effort":""},"messages":[{"role":"user","content":"hello"}]}`
@@ -83,18 +83,18 @@ func TestServerDeliveryUsesApplicationExecutorForBothModes(t *testing.T) {
 		t.Fatalf("executor calls = %d, want 2", len(requests))
 	}
 	for _, request := range requests {
-		if request.remoteBase != "https://remote.example/v1/chat/completions" || request.model != "default-model" || request.reasoning != "default-reasoning" {
+		if request.RemoteBase != "https://remote.example/v1/chat/completions" || request.Model != "default-model" || request.Reasoning != "default-reasoning" {
 			t.Fatalf("request normalization = %#v", request)
 		}
-		if len(request.messages) != 1 || request.messages[0].Role != "system" || request.question != "hello" {
-			t.Fatalf("normalized messages/question = %#v/%q", request.messages, request.question)
+		if len(request.Messages) != 1 || request.Messages[0].Role != "system" || request.Question != "hello" {
+			t.Fatalf("normalized messages/question = %#v/%q", request.Messages, request.Question)
 		}
 	}
 }
 
 func TestServerDeliveryRecoversSynchronousExecutorPanic(t *testing.T) {
 	a := &app{cfg: config{}, dataStore: newDataStore()}
-	handler := newServerHandlerWithExecutor(a, nil, serverExecutorFunc(func(context.Context, *serverExecutionRequest) (serverExecutionResult, error) {
+	handler := newServerHandlerWithExecutor(a, nil, server.ExecutorFunc(func(context.Context, *server.ExecutionRequest) (server.ExecutionResult, error) {
 		panic("delivery panic")
 	}))
 	req := httptest.NewRequest(http.MethodPost, "/?endpoint=https%3A%2F%2Fremote.example", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}]}`))
@@ -123,9 +123,9 @@ func TestServerDeliveryNeverTriggersConfiguredLocalIdleHook(t *testing.T) {
 		dataStore: newDataStore(),
 		idleHooks: hook,
 	}
-	serverApp, _ := a.newServerExecutionApp(&serverExecutionRequest{
-		remoteBase: "https://remote.example/v1/chat/completions", model: "server-model",
-		serverAllowedTools: map[string]bool{toolWebSearch: true},
+	serverApp, _ := a.newServerExecutionApp(&server.ExecutionRequest{
+		RemoteBase: "https://remote.example/v1/chat/completions", Model: "server-model",
+		AllowedTools: map[string]bool{toolWebSearch: true},
 	})
 	if serverApp.idleHooks != nil || serverApp.cfg.idleHookCommand != "" || len(serverApp.cfg.idleHookArgs) != 0 {
 		t.Fatal("server execution inherited a local idle hook")
@@ -133,22 +133,22 @@ func TestServerDeliveryNeverTriggersConfiguredLocalIdleHook(t *testing.T) {
 
 	var executionCalls atomic.Int32
 	var exposedProgram atomic.Bool
-	executor := serverExecutorFunc(func(_ context.Context, request *serverExecutionRequest) (serverExecutionResult, error) {
-		if request.serverAllowedTools[toolExecuteProgram] {
+	executor := server.ExecutorFunc(func(_ context.Context, request *server.ExecutionRequest) (server.ExecutionResult, error) {
+		if request.AllowedTools[toolExecuteProgram] {
 			exposedProgram.Store(true)
 		}
-		switch request.question {
+		switch request.Question {
 		case "hello":
 			if executionCalls.Add(1) == 1 {
-				return serverExecutionResult{content: "sync answer"}, nil
+				return server.ExecutionResult{Content: "sync answer"}, nil
 			}
-			return serverExecutionResult{}, errors.New("sync failure")
+			return server.ExecutionResult{}, errors.New("sync failure")
 		case "async-success":
-			return serverExecutionResult{content: "async answer"}, nil
+			return server.ExecutionResult{Content: "async answer"}, nil
 		case "async-timeout":
-			return serverExecutionResult{}, context.DeadlineExceeded
+			return server.ExecutionResult{}, context.DeadlineExceeded
 		default:
-			return serverExecutionResult{}, context.Canceled
+			return server.ExecutionResult{}, context.Canceled
 		}
 	})
 	handler := newServerHandlerWithExecutor(a, map[string]bool{toolWebSearch: true}, executor)
@@ -231,9 +231,9 @@ func TestServerAsyncAdmissionContractRemainsUnchangedWithIdleHook(t *testing.T) 
 
 	a := &app{cfg: config{model: "server-model", idleHookCommand: "local-hook", yolo: true}, dataStore: newDataStore(), idleHooks: hook}
 	var executorCalls atomic.Int32
-	handler := newServerHandlerWithExecutor(a, map[string]bool{toolWebSearch: true}, serverExecutorFunc(func(context.Context, *serverExecutionRequest) (serverExecutionResult, error) {
+	handler := newServerHandlerWithExecutor(a, map[string]bool{toolWebSearch: true}, server.ExecutorFunc(func(context.Context, *server.ExecutionRequest) (server.ExecutionResult, error) {
 		executorCalls.Add(1)
-		return serverExecutionResult{content: "must not run"}, nil
+		return server.ExecutionResult{Content: "must not run"}, nil
 	}))
 	oldSemaphore := asyncSem
 	limitedSemaphore := make(chan struct{}, 1)
@@ -256,4 +256,28 @@ func TestServerAsyncAdmissionContractRemainsUnchangedWithIdleHook(t *testing.T) 
 		t.Fatalf("rejected async request executed work: executor=%d hook=%d", executorCalls.Load(), hookCalls.Load())
 	}
 	<-limitedSemaphore
+}
+
+func TestServerCompositionClonesConfiguredToolPolicy(t *testing.T) {
+	a := &app{cfg: config{}, dataStore: newDataStore()}
+	allowed := map[string]bool{toolWebSearch: true}
+	var seen []bool
+	handler := newServerHandlerWithExecutor(a, allowed, server.ExecutorFunc(func(_ context.Context, request *server.ExecutionRequest) (server.ExecutionResult, error) {
+		seen = append(seen, request.AllowedTools[toolExecuteProgram])
+		request.AllowedTools[toolExecuteProgram] = true
+		return server.ExecutionResult{Content: "ok"}, nil
+	}))
+	allowed[toolExecuteProgram] = true
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/?endpoint=https://remote.example/v1", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}]}`))
+		req.Header.Set("Authorization", "Bearer token")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		if response.Code != http.StatusOK {
+			t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+		}
+	}
+	if len(seen) != 2 || seen[0] || seen[1] {
+		t.Fatalf("executor received a tool outside the configured server policy: %#v", seen)
+	}
 }

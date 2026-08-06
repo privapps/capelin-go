@@ -307,8 +307,8 @@ func TestServerSkillReferenceRemainsOrdinaryUserText(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare server request: %v", err)
 	}
-	if prepared.question != "$research keep this text" {
-		t.Fatalf("server request changed skill reference: %q", prepared.question)
+	if prepared.Question != "$research keep this text" {
+		t.Fatalf("server request changed skill reference: %q", prepared.Question)
 	}
 }
 

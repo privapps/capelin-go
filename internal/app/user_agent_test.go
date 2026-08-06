@@ -17,15 +17,12 @@ func TestRawProxyDoesNotInheritCapelinUserAgent(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	oldAllowPrivate := allowPrivateFetch
-	allowPrivateFetch = true
-	defer func() { allowPrivateFetch = oldAllowPrivate }()
-
+	handler := newComposedProxyHandler(upstream.URL, nil)
 	request := httptest.NewRequest(http.MethodGet, "/-/?endpoint="+url.QueryEscape(upstream.URL), nil)
 	request.Header.Set("User-Agent", "raw-client")
 	request.Header.Set("X-Raw-Header", "preserved")
 	response := httptest.NewRecorder()
-	proxyHandler(response, request)
+	handler.ServeHTTP(response, request)
 
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("proxy status = %d, body = %s", response.Code, response.Body.String())

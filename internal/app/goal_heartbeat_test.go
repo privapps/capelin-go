@@ -455,7 +455,7 @@ func TestInteractiveGoalHeartbeatStopsBeforePersistenceFailureStatus(t *testing.
 		if writes >= 3 {
 			return errors.New("session disk unavailable")
 		}
-		return atomicWriteFile(path, data, 0o600)
+		return os.WriteFile(path, data, 0o600)
 	}
 	recorder := captureGoalHeartbeatEvents(testApp)
 

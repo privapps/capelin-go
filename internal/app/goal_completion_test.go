@@ -283,6 +283,66 @@ func TestInteractiveGoalCancellationSurvivesControllerShutdown(t *testing.T) {
 	}
 }
 
+func TestResumedGoalNaturalLanguageContinuationUsesGoalRunner(t *testing.T) {
+	completed := goalTodosArguments("finished work", "completed")
+	testApp := newInteractiveTurnTestAppWithResponses(t,
+		chatTurnResponse("", "", []map[string]any{
+			goalToolCall("todo", toolUpdateTodos, completed),
+			goalToolCall("claim", toolCompleteGoal, `{"summary":"finished","evidence":["the final state was verified"]}`),
+		}),
+		chatTurnResponse("done", "", nil),
+	)
+	configureGoalTestApp(testApp, map[string]bool{toolUpdateTodos: true}, 1, 1)
+	session, err := testApp.app.newInteractiveSession([]contracts.Message{{Role: "system", Content: "test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.activeGoal = &goalState{Objective: "create ten workers", Generation: 1}
+	session.todos = []todoItem{{ID: "work", Content: "create ten workers", Status: todoStatusPending}}
+	syncRuntimeTodos(session)
+	if err := testApp.app.saveInteractiveSession(session); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := testApp.app.sessionStore.resolve(session.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed := testApp.app.sessionFromSnapshot(snapshot)
+
+	var controller *interactiveTurnController
+	controller = newInteractiveTurnController(nil, nil, nil, func(outcome interactiveTurnOutcome) {
+		testApp.app.finishInteractiveTurn(controller, resumed, outcome)
+	}, nil)
+	if stopped := testApp.app.handleInteractiveInputAsync(context.Background(), controller, resumed, nil, nil, "finish the goal"); stopped {
+		t.Fatal("goal continuation unexpectedly ended the interactive session")
+	}
+	controller.wait()
+
+	if prompts := testApp.userPrompts(); len(prompts) == 0 || !strings.Contains(prompts[0], "Continue working toward the objective") {
+		t.Fatalf("natural-language continuation bypassed the goal runner: prompts=%#v", prompts)
+	}
+	if resumed.activeGoal == nil || !validGoalCompletion(resumed.activeGoal, resumed.todos) {
+		t.Fatalf("resumed goal did not complete: goal=%#v todos=%#v", resumed.activeGoal, resumed.todos)
+	}
+}
+
+func TestNaturalGoalContinuationRequiresAnExplicitGoalReference(t *testing.T) {
+	tests := map[string]bool{
+		"finish the goal":           true,
+		"continue this objective":   true,
+		"resume objective":          true,
+		"finish the goal now":       true,
+		"what is the goal?":         false,
+		"continue the conversation": false,
+		"finish it":                 false,
+	}
+	for input, want := range tests {
+		if got := naturalGoalContinuation(input); got != want {
+			t.Errorf("naturalGoalContinuation(%q) = %v, want %v", input, got, want)
+		}
+	}
+}
+
 func TestInteractiveOrdinaryCancellationDoesNotCommitGoalMetadataWorker(t *testing.T) {
 	testApp := newInteractiveTurnTestApp(t)
 	session, err := testApp.app.newInteractiveSession(nil)
@@ -475,7 +535,7 @@ func TestBareGoalResumesPersistedObjectiveAndLegacyCompletedTodosNeedHandshake(t
 		if err := testApp.app.saveInteractiveSession(session); err != nil {
 			t.Fatal(err)
 		}
-		resumed := testApp.app.sessionFromSnapshot(sessionSnapshot{SessionUUID: session.id, Messages: session.messages, Todos: session.todos, ActiveGoal: session.activeGoal})
+		resumed := testApp.app.sessionFromSnapshot(sessionView{SessionUUID: session.id, Messages: session.messages, Todos: session.todos, ActiveGoal: session.activeGoal})
 		if stopped := testApp.app.runGoal(context.Background(), resumed, ""); stopped {
 			t.Fatal("persisted objective resume unexpectedly stopped the REPL")
 		}

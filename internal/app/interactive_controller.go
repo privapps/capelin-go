@@ -379,6 +379,11 @@ func (a *app) handleInteractiveInputAsync(
 		_ = a.startInteractiveTurn(ctx, controller, session, run)
 		return false
 	}
+	if session != nil && session.activeGoal != nil && naturalGoalContinuation(input) {
+		return startTurn(func(turnCtx context.Context, worker *interactiveSession) (bool, error) {
+			return a.runGoal(turnCtx, worker, ""), nil
+		})
+	}
 	switch input {
 	case "/exit", "/quit":
 		controller.withSession(func() {

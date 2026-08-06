@@ -157,7 +157,8 @@ recoverable-tool-error turns, and the outer iteration limit all produce an
 incomplete outcome. Deterministic tool errors are normally returned to the
 model so it can correct the next call; persistent provider, persistence,
 cancellation, and runtime errors stop the goal immediately. Use bare `/goal` to
-continue the saved active objective, or start a new objective with
+continue the saved active objective; clear conversational requests such as
+`finish the goal` are also recognized. Start a new objective with
 `/goal <objective>`.
 
 Set the outer limit independently with `--max-goal-iterations N` or

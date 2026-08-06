@@ -132,7 +132,8 @@ type Dispatcher struct {
 	Yolo              bool
 	Skills            map[string]skills.Skill
 	AllowPrivateFetch bool         // explicit application/test override; the zero value preserves the safety default
-	HTTPClient        *http.Client // optional policy-aware client for fetch_page
+	HTTPClient        *http.Client // optional ordinary/provider client; never used for fetch_page when FetchHTTPClient is nil
+	FetchHTTPClient   *http.Client // optional policy-aware persistent client for fetch_page
 	Hooks             Hooks
 }
 
@@ -185,8 +186,8 @@ func (d Dispatcher) Run(ctx context.Context, runtime any, call contracts.ToolCal
 		if err := decode(&args, name); err != nil {
 			return "", err
 		}
-		if d.HTTPClient != nil {
-			return runFetchPageWithClient(ctx, args.URL, d.HTTPClient)
+		if d.FetchHTTPClient != nil {
+			return runFetchPageWithClient(ctx, args.URL, d.FetchHTTPClient)
 		}
 		return runFetchPage(ctx, args.URL)
 	case ListFiles:

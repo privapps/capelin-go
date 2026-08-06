@@ -1,12 +1,14 @@
 package app
 
 import (
+	"capelin-go/internal/server"
 	"capelin-go/internal/skills"
 	"capelin-go/internal/tools"
 	"capelin-go/internal/types"
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1782,11 +1784,11 @@ func TestServerRequestNormalizationIsSharedAcrossDeliveryModes(t *testing.T) {
 	if !reflect.DeepEqual(syncExecution, asyncExecution) {
 		t.Fatalf("sync and async normalization diverged: %#v vs %#v", syncExecution, asyncExecution)
 	}
-	if got := syncExecution.messages[0].Content; !strings.Contains(got, "Only web_search and fetch_page") {
+	if got := syncExecution.Messages[0].Content; !strings.Contains(got, "Only web_search and fetch_page") {
 		t.Fatalf("expected server tool restriction in system message, got %q", got)
 	}
-	if syncExecution.model != "request-model" || syncExecution.reasoning != "low" {
-		t.Fatalf("request overrides were not preserved: model=%q reasoning=%q", syncExecution.model, syncExecution.reasoning)
+	if syncExecution.Model != "request-model" || syncExecution.Reasoning != "low" {
+		t.Fatalf("request overrides were not preserved: model=%q reasoning=%q", syncExecution.Model, syncExecution.Reasoning)
 	}
 }
 
@@ -1858,7 +1860,7 @@ func TestServerRequestBodyLimitIsEnforcedForBothDeliveryModes(t *testing.T) {
 func TestServerExecutionAppUsesOnlyServerToolPolicy(t *testing.T) {
 	allowed := map[string]bool{toolWebSearch: true, toolFetchPage: true}
 	a := &app{cfg: config{model: "default", workspaceRoot: t.TempDir(), allowedTools: map[string]bool{toolReadFile: true}}}
-	execution := &serverExecutionRequest{remoteBase: "http://remote.example", remoteToken: "token", model: "model", serverAllowedTools: allowed}
+	execution := &server.ExecutionRequest{RemoteBase: "http://remote.example", RemoteToken: "token", Model: "model", AllowedTools: allowed}
 	serverApp, runtime := a.newServerExecutionApp(execution)
 	if runtime.allowedTools[toolReadFile] {
 		t.Fatal("server runtime inherited a disallowed root tool")
@@ -1950,27 +1952,42 @@ func TestProxyHandlerForwardsRequestAndResponse(t *testing.T) {
 		if got := r.Header.Get("X-Test"); got != "forwarded" {
 			t.Errorf("X-Test = %q", got)
 		}
+		for _, header := range []string{"Authorization", "Cookie", "X-Forwarded-For", "X-Connection"} {
+			if got := r.Header.Get(header); got != "" {
+				t.Errorf("sensitive request header %s = %q", header, got)
+			}
+		}
 		body, _ := io.ReadAll(r.Body)
 		w.Header().Set("X-Upstream", "yes")
+		w.Header().Set("Authorization", "upstream-secret")
+		w.Header().Set("Set-Cookie", "session=secret")
+		w.Header().Set("X-Forwarded-Proto", "https")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.WriteHeader(http.StatusAccepted)
 		w.Write([]byte("echo:" + string(body)))
 	}))
 	defer upstream.Close()
 
-	origAllow := allowPrivateFetch
-	t.Cleanup(func() { allowPrivateFetch = origAllow })
-	allowPrivateFetch = true
-
+	handler := newComposedProxyHandler(upstream.URL, nil)
 	req := httptest.NewRequest(http.MethodPut, "/-/?endpoint="+url.QueryEscape(upstream.URL+"/target?x=1"), strings.NewReader("payload"))
 	req.Header.Set("X-Test", "forwarded")
+	req.Header.Set("Authorization", "caller-secret")
+	req.Header.Set("Cookie", "session=caller-secret")
+	req.Header.Set("X-Forwarded-For", "127.0.0.1")
+	req.Header.Set("Connection", "X-Connection")
+	req.Header.Set("X-Connection", "must-not-forward")
 	w := httptest.NewRecorder()
-	proxyHandler(w, req)
-
+	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusAccepted || w.Body.String() != "echo:payload" {
 		t.Fatalf("proxy response = %d %q", w.Code, w.Body.String())
 	}
 	if w.Header().Get("X-Upstream") != "yes" {
 		t.Fatalf("proxy headers = %#v", w.Header())
+	}
+	for _, header := range []string{"Authorization", "Set-Cookie", "X-Forwarded-Proto", "Access-Control-Allow-Origin"} {
+		if got := w.Header().Get(header); got != "" {
+			t.Errorf("sensitive response header %s = %q", header, got)
+		}
 	}
 }
 
@@ -1979,22 +1996,16 @@ type proxyRoundTripper func(*http.Request) (*http.Response, error)
 func (f proxyRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestProxyHandlerUsesCanonicalizedAuthorizedTarget(t *testing.T) {
-	oldPolicy := activeServerPolicy
-	oldClient := proxyHTTPClient
-	t.Cleanup(func() {
-		activeServerPolicy = oldPolicy
-		proxyHTTPClient = oldClient
-	})
-	activeServerPolicy = &serverSecurityPolicy{AllowedTargets: map[string]bool{"https://example.com": true}}
 	var gotScheme string
-	proxyHTTPClient = &http.Client{Transport: proxyRoundTripper(func(r *http.Request) (*http.Response, error) {
+	client := &http.Client{Transport: proxyRoundTripper(func(r *http.Request) (*http.Response, error) {
 		gotScheme = r.URL.Scheme
 		return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
 	})}
+	handler := newComposedProxyHandler("https://example.com", client)
 
 	req := httptest.NewRequest(http.MethodGet, "/-/?endpoint="+url.QueryEscape("HTTPS://EXAMPLE.COM/path"), nil)
 	w := httptest.NewRecorder()
-	proxyHandler(w, req)
+	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusNoContent || gotScheme != "https" {
 		t.Fatalf("status=%d scheme=%q, want 204 and canonical https", w.Code, gotScheme)
 	}
@@ -2006,10 +2017,7 @@ func TestProxyHandlerSupportsHexAndQueryTargets(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	origAllow := allowPrivateFetch
-	t.Cleanup(func() { allowPrivateFetch = origAllow })
-	allowPrivateFetch = true
-
+	handler := newComposedProxyHandler(upstream.URL, nil)
 	cases := []string{
 		"/-/~" + hex.EncodeToString([]byte(upstream.URL)),
 		"/-/?endpoint=" + url.QueryEscape(upstream.URL),
@@ -2017,7 +2025,7 @@ func TestProxyHandlerSupportsHexAndQueryTargets(t *testing.T) {
 	for _, path := range cases {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		w := httptest.NewRecorder()
-		proxyHandler(w, req)
+		handler.ServeHTTP(w, req)
 		if w.Code != http.StatusNoContent {
 			t.Errorf("%s: status = %d, body = %s", path, w.Code, w.Body.String())
 		}
@@ -2028,41 +2036,131 @@ func TestProxyHandlerRelaysRedirectAndRejectsInvalidTarget(t *testing.T) {
 	upstream := httptest.NewServer(http.RedirectHandler("/next", http.StatusFound))
 	defer upstream.Close()
 
-	origAllow := allowPrivateFetch
-	t.Cleanup(func() { allowPrivateFetch = origAllow })
-	allowPrivateFetch = true
-
+	handler := newComposedProxyHandler(upstream.URL, nil)
 	req := httptest.NewRequest(http.MethodGet, "/-/?endpoint="+url.QueryEscape(upstream.URL), nil)
 	w := httptest.NewRecorder()
-	proxyHandler(w, req)
+	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusFound || w.Header().Get("Location") != "/next" {
 		t.Fatalf("redirect = %d Location=%q", w.Code, w.Header().Get("Location"))
 	}
 
 	bad := httptest.NewRequest(http.MethodGet, "/-/?endpoint=ftp%3A%2F%2Fexample.com", nil)
 	w = httptest.NewRecorder()
-	proxyHandler(w, bad)
+	handler.ServeHTTP(w, bad)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("invalid target status = %d", w.Code)
 	}
 }
 
+type proxyUnreadableBody struct{}
+
+func (proxyUnreadableBody) Read([]byte) (int, error) { return 0, errors.New("body unavailable") }
+func (proxyUnreadableBody) Close() error             { return nil }
+
+func TestProxyHandlerRejectsDisallowedTargetAndOversizedBody(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	handler := newComposedProxyHandler(upstream.URL, nil)
+	rejected := httptest.NewRequest(http.MethodGet, "/-/?endpoint="+url.QueryEscape("https://not-allowlisted.example/"), nil)
+	rejectedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(rejectedResponse, rejected)
+	if rejectedResponse.Code != http.StatusForbidden {
+		t.Fatalf("disallowed target status = %d, body = %s", rejectedResponse.Code, rejectedResponse.Body.String())
+	}
+
+	missing := httptest.NewRequest(http.MethodGet, "/-/", nil)
+	missingResponse := httptest.NewRecorder()
+	handler.ServeHTTP(missingResponse, missing)
+	if missingResponse.Code != http.StatusBadRequest {
+		t.Fatalf("missing proxy endpoint status = %d, body = %s", missingResponse.Code, missingResponse.Body.String())
+	}
+
+	unreadable := httptest.NewRequest(http.MethodPost, "/-/?endpoint="+url.QueryEscape(upstream.URL), nil)
+	unreadable.Body = proxyUnreadableBody{}
+	unreadableResponse := httptest.NewRecorder()
+	handler.ServeHTTP(unreadableResponse, unreadable)
+	if unreadableResponse.Code != http.StatusBadRequest || !strings.Contains(unreadableResponse.Body.String(), "failed to read request body") {
+		t.Fatalf("unreadable proxy body = %d, body = %s", unreadableResponse.Code, unreadableResponse.Body.String())
+	}
+
+	oversized := httptest.NewRequest(http.MethodPost, "/-/?endpoint="+url.QueryEscape(upstream.URL), strings.NewReader(strings.Repeat("x", server.MaxRequestBodySize+1)))
+	oversizedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(oversizedResponse, oversized)
+	if oversizedResponse.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized proxy status = %d, body = %s", oversizedResponse.Code, oversizedResponse.Body.String())
+	}
+}
+
+func TestProxyHandlerReturnsBadGatewayForUpstreamFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	origin := upstream.URL
+	upstream.Close()
+
+	handler := newComposedProxyHandler(origin, nil)
+	req := httptest.NewRequest(http.MethodGet, "/-/?endpoint="+url.QueryEscape(origin), nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "proxy request failed") {
+		t.Fatalf("upstream failure = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+func TestProxyHandlerAppliesOriginAuthorizationAtCompositionBoundary(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	parsed, err := parseAbsoluteTarget(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &app{
+		cfg: config{
+			securityEnabled: true,
+			securityPolicy: serverSecurityPolicy{
+				AllowedOrigins:      map[string]bool{"https://allowed.example": true},
+				AllowedTargets:      map[string]bool{parsed.Origin: true},
+				AllowPrivateTargets: true,
+			},
+		},
+		dataStore: newDataStore(),
+	}
+	handler := newServerHandlerWithExecutor(a, nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/-/?endpoint="+url.QueryEscape(upstream.URL), nil)
+	req.Header.Set("Origin", "https://blocked.example")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "origin not allowed") {
+		t.Fatalf("origin rejection = %d, body = %s", response.Code, response.Body.String())
+	}
+}
 func TestProxyHandlerBlocksPrivateTargetsByDefault(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer upstream.Close()
 
-	// allowPrivateFetch left at its default (false): the proxy must refuse to
-	// dial loopback/private targets like this httptest server.
+	// The configured policy must refuse to dial loopback/private targets by
+	// default, even when the target is otherwise allowlisted.
+	parsed, err := parseAbsoluteTarget(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &app{
+		cfg:       config{securityEnabled: true, securityPolicy: serverSecurityPolicy{AllowedTargets: map[string]bool{parsed.Origin: true}}},
+		dataStore: newDataStore(),
+	}
+	handler := newServerHandlerWithExecutor(a, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/-/?endpoint="+url.QueryEscape(upstream.URL), nil)
 	w := httptest.NewRecorder()
-	proxyHandler(w, req)
+	handler.ServeHTTP(w, req)
 
-	if w.Code != http.StatusBadGateway {
-		t.Fatalf("expected proxy to reject private target, got status = %d, body = %s", w.Code, w.Body.String())
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected configured policy to reject private target, got status = %d, body = %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "private or local") {
+	if !strings.Contains(w.Body.String(), "target not allowed") {
 		t.Fatalf("expected SSRF-block error message, got body = %s", w.Body.String())
 	}
 }
@@ -3672,8 +3770,8 @@ func TestServerEndpointPrecedenceIsSharedAcrossDeliveryModes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("async normalization: %v", err)
 			}
-			if syncExecution.remoteBase != tc.want || asyncExecution.remoteBase != tc.want {
-				t.Fatalf("endpoint resolution = sync %q, async %q; want %q", syncExecution.remoteBase, asyncExecution.remoteBase, tc.want)
+			if syncExecution.RemoteBase != tc.want || asyncExecution.RemoteBase != tc.want {
+				t.Fatalf("endpoint resolution = sync %q, async %q; want %q", syncExecution.RemoteBase, asyncExecution.RemoteBase, tc.want)
 			}
 		})
 	}
@@ -3948,7 +4046,7 @@ func TestServerAsyncTimeoutAndPanicRecoveryThroughHandler(t *testing.T) {
 
 	t.Run("panic", func(t *testing.T) {
 		a := newServerParityApp(t, "http://example.com", "model", "reasoning")
-		a.asyncRunner = func(string, *serverExecutionRequest) {
+		a.asyncRunner = func(string, *server.ExecutionRequest) {
 			panic("test async panic")
 		}
 		req := httptest.NewRequest(http.MethodPost, "/async/?endpoint=http%3A%2F%2Fexample.com", strings.NewReader(serverParityBody()))

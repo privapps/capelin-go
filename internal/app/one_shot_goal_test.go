@@ -33,7 +33,7 @@ func TestOneShotGoalPersistenceFailureCannotBecomeSuccessAfterRecoverySave(t *te
 			failed = true
 			return errors.New("transient final save failure")
 		}
-		return atomicWriteFile(path, data, 0o600)
+		return os.WriteFile(path, data, 0o600)
 	}
 	testApp.app.sessionStore = store
 

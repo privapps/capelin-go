@@ -1,7 +1,6 @@
 package app
 
 import (
-	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
@@ -9,6 +8,10 @@ import (
 	"net/url"
 	"strings"
 )
+
+// Kept as a narrow compatibility seam for the application web-tool tests.
+// Raw upstream proxy delivery is owned by internal/server.
+var allowPrivateFetch = false
 
 type serverSecurityPolicy struct {
 	AllowedOrigins      map[string]bool
@@ -225,19 +228,4 @@ func (p serverSecurityPolicy) logRejectedOrigin(raw string) {
 		return
 	}
 	log.Printf("[capelin-go] rejected origin (invalid)")
-}
-
-func extractServerTarget(path, endpointPrefix string, query url.Values) (string, error) {
-	path = strings.TrimPrefix(path, endpointPrefix)
-	if strings.HasPrefix(path, "/~") {
-		decoded, err := hex.DecodeString(strings.TrimPrefix(path, "/~"))
-		if err != nil {
-			return "", fmt.Errorf("invalid hex endpoint")
-		}
-		return string(decoded), nil
-	}
-	if path != "" && path != "/" {
-		return "", fmt.Errorf("literal URL paths are not supported")
-	}
-	return strings.TrimSpace(query.Get("endpoint")), nil
 }

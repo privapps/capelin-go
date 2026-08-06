@@ -41,7 +41,9 @@ status zero only after a non-empty checklist, complete checklist items, a valid
 `complete_goal` summary/evidence handshake, and the final persistence all
 succeed; cancellation, failure, or any incomplete safeguard outcome returns a
 non-zero status. Resume an incomplete goal interactively with
-`--interactive --resume <id>` and then bare `/goal`.
+`--interactive --resume <id>` and then bare `/goal`; clear conversational
+requests such as `finish the goal` are also recognized when the resumed session
+has an active goal.
 
 
 Use `--final-only` when another program needs clean output:
@@ -107,7 +109,9 @@ Every ordinary line is sent as a new turn. Follow-up questions can refer to earl
   count, update timestamp, and checklist progress. `/session-resume [ID|PREFIX]`
   switches to an exact ID, unique prefix, or newest valid snapshot.
 - `/goal <objective>` starts a fresh checklist-driven objective, while bare
-  `/goal` continues an incomplete checklist. These commands require `--yolo`.
+  `/goal` continues an incomplete checklist. Clear conversational requests such
+  as `finish the goal` also continue a persisted active goal. These commands
+  require `--yolo`.
 
 Sessions are persisted atomically in `.capelin-go/sessions/`. Use
 `--resume [ID|PREFIX]` with `-i` to resume at startup; a bare `--resume` picks

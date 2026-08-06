@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -85,10 +86,39 @@ func (p *secureDialPolicy) resolveAndDial(ctx context.Context, network, addr str
 	return p.dialer().DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
 }
 
+// SecureTransport performs request authorization around one configured,
+// long-lived HTTP transport. The underlying transport is initialized once so
+// its idle connection pool survives across RoundTrip calls.
 type SecureTransport struct {
 	Base      http.RoundTripper
 	Policy    *secureDialPolicy
 	Authorize func(*url.URL) error
+
+	once       sync.Once
+	configured http.RoundTripper
+}
+
+func (t *SecureTransport) configure() {
+	base, ok := t.Base.(*http.Transport)
+	if !ok || base == nil {
+		if t.Base != nil {
+			t.configured = t.Base
+			return
+		}
+		base = http.DefaultTransport.(*http.Transport).Clone()
+	}
+	// Proxy and dial policy are client-level configuration. Set them before the
+	// first request instead of mutating or cloning the transport per RoundTrip.
+	base.Proxy = nil
+	if t.Policy != nil {
+		base.DialContext = t.Policy.resolveAndDial
+	}
+	t.configured = base
+}
+
+func (t *SecureTransport) transport() http.RoundTripper {
+	t.once.Do(t.configure)
+	return t.configured
 }
 
 func (t *SecureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -100,24 +130,22 @@ func (t *SecureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 	}
-	base, ok := t.Base.(*http.Transport)
-	if !ok || base == nil {
-		base = http.DefaultTransport.(*http.Transport).Clone()
-	}
-	base = base.Clone()
-	base.Proxy = nil
-	if t.Policy != nil {
-		base.DialContext = t.Policy.resolveAndDial
+	base := t.transport()
+	if base == nil {
+		return nil, fmt.Errorf("secure transport is not configured")
 	}
 	return base.RoundTrip(req)
 }
 
 func NewSecureHTTPClient(policy *secureDialPolicy, authorize func(*url.URL) error, maxRedirects int) *http.Client {
 	base := http.DefaultTransport.(*http.Transport).Clone()
-	base.Proxy = nil
+	secureTransport := &SecureTransport{Base: base, Policy: policy, Authorize: authorize}
+	// Initialize before publishing the client so all requests share the same
+	// policy-configured transport from the first RoundTrip onward.
+	secureTransport.transport()
 	return &http.Client{
 		Timeout:   requestTimeout,
-		Transport: &SecureTransport{Base: base, Policy: policy, Authorize: authorize},
+		Transport: secureTransport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if maxRedirects > 0 && len(via) >= maxRedirects {
 				return fmt.Errorf("too many redirects")

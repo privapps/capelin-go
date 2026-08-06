@@ -124,15 +124,21 @@ var toolHTTPClient = &http.Client{
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	},
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 5 {
-			return fmt.Errorf("too many redirects")
-		}
-		if req != nil {
-			req.Header.Set("User-Agent", contracts.CapelinUserAgent)
-		}
-		return nil
-	},
+	CheckRedirect: checkFetchRedirect,
+}
+
+func checkFetchRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return fmt.Errorf("too many redirects")
+	}
+	if req == nil || req.URL == nil {
+		return fmt.Errorf("fetch page: redirect has no URL")
+	}
+	if _, err := validateFetchURLWithPrivate(req.Context(), req.URL.String(), privateFetchAllowed(req.Context())); err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", contracts.CapelinUserAgent)
+	return nil
 }
 
 type userAgentTransport struct {
@@ -929,7 +935,7 @@ func validateFetchURLWithPrivate(ctx context.Context, raw string, allowPrivate b
 	if host == "" {
 		return nil, fmt.Errorf("fetch page: missing host in %q", raw)
 	}
-	if privateFetchAllowed(ctx) {
+	if allowPrivate {
 		return parsed, nil
 	}
 	if isBlockedHostname(host) {

@@ -37,6 +37,30 @@ func interactiveCommandArgument(input, command string) (string, bool) {
 	return leadingCommandArgument(input, command)
 }
 
+// naturalGoalContinuation recognizes a small set of unambiguous conversational
+// requests for continuing a persisted goal. It is intentionally narrower than
+// general language understanding: ordinary follow-up questions in a resumed
+// session must remain ordinary turns unless the user explicitly refers to the
+// goal or objective with a continuation verb.
+func naturalGoalContinuation(input string) bool {
+	words := strings.Fields(strings.ToLower(strings.TrimSpace(input)))
+	if len(words) < 2 || len(words) > 8 {
+		return false
+	}
+	switch words[0] {
+	case "finish", "complete", "continue", "resume":
+	default:
+		return false
+	}
+	for _, word := range words[1:] {
+		word = strings.Trim(word, ",.!?;:")
+		if word == "goal" || word == "objective" {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *app) writeInteractiveSystem(message string) {
 	if a != nil && a.sink != nil {
 		a.sink.WriteSystem(rootAgentID, message)
@@ -115,7 +139,7 @@ func (a *app) newInteractiveSession(messages []contracts.Message) (*interactiveS
 	return a.sessionFromSnapshot(snapshot), nil
 }
 
-func (a *app) sessionFromSnapshot(snapshot sessionSnapshot) *interactiveSession {
+func (a *app) sessionFromSnapshot(snapshot sessionView) *interactiveSession {
 	session := &interactiveSession{
 		messages:      cloneMessages(snapshot.Messages),
 		providerState: cloneProviderState(snapshot.ProviderState),
@@ -197,7 +221,7 @@ func (a *app) persistInteractiveSession(session *interactiveSession) error {
 		created = store.currentTime()
 		session.createdAt = created
 	}
-	snapshot := sessionSnapshot{
+	snapshot := sessionView{
 		SessionUUID:   session.id,
 		CreatedAt:     created,
 		UpdatedAt:     store.currentTime(),
@@ -288,7 +312,7 @@ func (a *app) listInteractiveSessions(current *interactiveSession) error {
 	return nil
 }
 
-func sessionDisplayLabel(snapshot sessionSnapshot) string {
+func sessionDisplayLabel(snapshot sessionView) string {
 	if name := strings.TrimSpace(snapshot.Name); name != "" {
 		return displaySessionText(name)
 	}

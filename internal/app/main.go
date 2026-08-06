@@ -7,6 +7,7 @@ import (
 	"capelin-go/internal/interactive"
 	"capelin-go/internal/output"
 	"capelin-go/internal/providers"
+	"capelin-go/internal/server"
 	"capelin-go/internal/skills"
 	"capelin-go/internal/tools"
 	"context"
@@ -87,6 +88,8 @@ type config struct {
 type app struct {
 	cfg                       config
 	client                    *client
+	proxyHTTP                 *http.Client
+	fetchHTTP                 *http.Client
 	skills                    map[string]skills.Skill
 	toolset                   []contracts.Tool
 	subagents                 *subagentManager
@@ -94,7 +97,7 @@ type app struct {
 	dataStore                 *dataStore
 	sessionStore              *sessionStore
 	idleHooks                 *idleHookRunner
-	asyncRunner               func(string, *serverExecutionRequest)
+	asyncRunner               func(string, *server.ExecutionRequest)
 	interactiveIdleHook       func()
 	goalHeartbeatInitialDelay time.Duration
 	goalHeartbeatCadence      time.Duration
@@ -370,7 +373,7 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "--yolo enables permissions and path access only; it does not select goal budgets. /goal still requires --yolo, and stopping/completing a goal restores ordinary limits")
 	fmt.Fprintln(w, "Iteration limit: --max-iterations N (ordinary default 40; goal-run default 256; env MAX_ITERATIONS; always wraps up gracefully on limit)")
 	fmt.Fprintln(w, "Goal loop limit: --max-goal-iterations N (ordinary baseline 20; goal-run default 64; env MAX_GOAL_ITERATIONS; accepted /goal only)")
-	fmt.Fprintln(w, "Interactive goal: /goal <objective> starts a fresh checklist; bare /goal resumes an incomplete one (requires --yolo)")
+	fmt.Fprintln(w, "Interactive goal: /goal <objective> starts a fresh checklist; bare /goal or clear requests such as 'finish the goal' resume an incomplete one (requires --yolo)")
 	fmt.Fprintln(w, "Goal completion: a completed checklist must be followed by a valid complete_goal summary and evidence claim")
 	fmt.Fprintln(w, "Interactive sessions: /compact, /session-new [prompt], /session-list, /session-resume [ID|PREFIX], /exit, /quit")
 	fmt.Fprintln(w, "Interactive /compact summarizes retained conversation history without tools; it accepts no arguments and can be cancelled.")
@@ -952,6 +955,13 @@ func (a *app) clientHTTPClient() *http.Client {
 	return a.client.http
 }
 
+func (a *app) fetchHTTPClient() *http.Client {
+	if a == nil {
+		return nil
+	}
+	return a.fetchHTTP
+}
+
 func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call contracts.ToolCall) (string, error) {
 	if runtime == nil {
 		runtime = a.rootRuntime()
@@ -962,6 +972,7 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 		Skills:            a.skills,
 		AllowPrivateFetch: a.cfg.allowPrivateFetch || (a.cfg.securityEnabled && a.cfg.securityPolicy.AllowPrivateTargets),
 		HTTPClient:        a.clientHTTPClient(),
+		FetchHTTPClient:   a.fetchHTTPClient(),
 		Hooks: tools.Hooks{
 			IsEnabled: func(value any, name string) bool {
 				r, ok := value.(*agentRuntime)

@@ -175,6 +175,17 @@ func (s *Store) SetAtomicWriter(writer func(string, []byte) error) {
 
 func (s *Store) Directory() string { return filepath.Join(s.workspaceRoot, stateDir, snapshotsDir) }
 
+// Path returns the canonical durable path for a validated session identifier.
+// It is primarily useful to composition-layer diagnostics and tests; writes
+// still go through Save and its atomic replacement seam.
+func (s *Store) Path(id string) string {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if !IsUUID(id) {
+		return ""
+	}
+	return s.pathFor(id)
+}
+
 func (s *Store) Create(messages []contracts.Message) (Snapshot, error) {
 	now := s.currentTime()
 	snapshot := Snapshot{
@@ -389,6 +400,9 @@ func ValidateTodos(todos []Todo) error {
 		}
 		if strings.TrimSpace(todo.Content) == "" {
 			return fmt.Errorf("todo %q content is required", todo.ID)
+		}
+		if todo.Source != "" && strings.TrimSpace(todo.Source) == "" {
+			return fmt.Errorf("todo %q source must not be blank", todo.ID)
 		}
 		if _, ok := seen[todo.ID]; ok {
 			return fmt.Errorf("duplicate todo ID %q", todo.ID)
