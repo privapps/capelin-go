@@ -8,11 +8,11 @@ import (
 )
 
 func TestManagerRunsChildThroughNarrowRunnerSeam(t *testing.T) {
-	manager := New(Config{MaxDepth: 1, MaxChildren: 2, MaxParallel: 1, DefaultTimeoutSec: 2, MaxTimeoutSec: 2}, func(_ context.Context, runtime *Runtime, session *Session) (string, error) {
+	manager := New(Config{MaxDepth: 1, MaxChildren: 2, MaxParallel: 1, DefaultTimeoutSec: 2, MaxTimeoutSec: 2}, func(_ context.Context, runtime *Runtime, session *Session) (string, bool, error) {
 		if runtime.Depth != 1 || session.ParentID != "root" {
 			t.Fatalf("runtime/session = %#v/%#v", runtime, session)
 		}
-		return "completed output", nil
+		return "completed output", false, nil
 	})
 	root := &Runtime{SessionID: "root", Role: "coordinator", AllowedTools: map[string]bool{"web_search": true}}
 	created, err := manager.Create(context.Background(), root, CreateArgs{Question: "inspect", ExecutionMode: "sequential"})
@@ -56,9 +56,9 @@ func TestManagerPropagatesParentProfileIntoChildAndNestedLimits(t *testing.T) {
 	}
 
 	var observed *Runtime
-	manager := New(DefaultConfig(), func(_ context.Context, runtime *Runtime, _ *Session) (string, error) {
+	manager := New(DefaultConfig(), func(_ context.Context, runtime *Runtime, _ *Session) (string, bool, error) {
 		observed = runtime
-		return "done", nil
+		return "done", false, nil
 	})
 	root := &Runtime{
 		SessionID:        "root",
@@ -122,13 +122,13 @@ func TestManagerUsesProfileParallelismInsteadOfOrdinaryManagerCapacity(t *testin
 	goalProfile := RuntimeProfile{Subagents: limits}
 	started := make(chan struct{}, 5)
 	release := make(chan struct{})
-	manager := New(DefaultConfig(), func(ctx context.Context, _ *Runtime, _ *Session) (string, error) {
+	manager := New(DefaultConfig(), func(ctx context.Context, _ *Runtime, _ *Session) (string, bool, error) {
 		started <- struct{}{}
 		select {
 		case <-release:
-			return "done", nil
+			return "done", false, nil
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", false, ctx.Err()
 		}
 	})
 	root := &Runtime{
@@ -171,8 +171,8 @@ func TestManagerUsesProfileAggregateBudget(t *testing.T) {
 	limits.MaxChildren = 8
 	limits.MaxAggregateChars = 48000
 	profile := RuntimeProfile{Subagents: limits}
-	manager := New(DefaultConfig(), func(_ context.Context, _ *Runtime, _ *Session) (string, error) {
-		return strings.Repeat("x", limits.MaxResultChars), nil
+	manager := New(DefaultConfig(), func(_ context.Context, _ *Runtime, _ *Session) (string, bool, error) {
+		return strings.Repeat("x", limits.MaxResultChars), false, nil
 	})
 	root := &Runtime{
 		SessionID:        "root",

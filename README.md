@@ -93,8 +93,8 @@ when entered at the REPL.
   time, and checklist progress. `/session-resume [ID|PREFIX]` switches to an exact,
   unique-prefix, or newest saved session.
 
-- `/goal <objective>` — start a new bounded checklist-driven objective; requires `--yolo`
-- `/goal` — continue the current incomplete checklist; requires `--yolo`
+- `/goal <objective>` — start a fresh bounded objective generation and checklist; prior completion claims and the previous checklist are not inherited; requires `--yolo`
+- `/goal` — resume the current incomplete objective with its persisted checklist and any work already recorded; requires `--yolo`
 
 For shell automation, a quoted leading `/goal <objective>` is also supported in
 one-shot mode:
@@ -330,7 +330,15 @@ queues those handles and the scheduler starts them within the configured
 pending/queued allowance is full, the tool returns a recoverable capacity error;
 run admitted handles, await or cancel them, and retry after terminal work
 releases capacity. Listing and aggregate reads expose `pending`, `queued`,
-`running`, `completed`, `failed`, `cancelled`, and `timed_out` states.
+`running`, `completed`, `failed`, `cancelled`, and `timed_out` states. A
+completed subagent whose turn engine exhausted its tool-iteration budget
+carries `iteration_limit_reached: true` in its envelope (await/read/list
+results) so the parent can tell finished work from work that was cut off at
+the turn cap; the parent is expected to verify or re-delegate truncated work.
+
+In normal terminal mode, each completed direct subagent's final response is
+printed once when the parent receives it through `await_subagent` or blocking
+`run_subagent`. `--final-only` suppresses these intermediate subagent results.
 
 Tune subagent limits (all have env var equivalents, see below):
 
@@ -377,7 +385,7 @@ Enable everything (all tools + unrestricted paths):
 - `SUBAGENT_TIMEOUT_SECONDS` — default subagent execution timeout in seconds (ordinary and goal profile default: 600; overridden by `--subagent-timeout-seconds`)
 - `SUBAGENT_MAX_RESULT_CHARS` — maximum characters returned per subagent result (default: 8000; overridden by `--subagent-max-result-chars`)
 - `SUBAGENT_MAX_AGGREGATE_CHARS` — maximum total characters across all subagent results in a single turn (ordinary default: 12000; goal profile default: 48000; overridden by `--subagent-max-aggregate-chars`)
-- `SUBAGENT_MAX_ITERATIONS` — maximum tool-call iterations per subagent (ordinary default: 20; goal profile default: 100; overridden by `--subagent-max-iterations`)
+- `SUBAGENT_MAX_ITERATIONS` — maximum tool-call iterations per subagent (ordinary default: 20; goal profile floor: 32 — an accepted goal guarantees at least 32 even when the ordinary value is lower; overridden by `--subagent-max-iterations`)
 - `SUBAGENT_MODEL` — model ID used for subagents (default: inherits `MODEL`; overridden by `--subagent-model`)
 - `SUBAGENT_REASONING_EFFORT` — reasoning effort for subagents (default: inherits `REASONING_EFFORT`; set to `none` or `nil` to omit; overridden by `--subagent-reasoning-effort`)
 - `TOOL_MAX_PARALLEL` — maximum concurrent tools (ordinary default: 8; goal profile default: 16; overridden by `--tool-max-parallel`)

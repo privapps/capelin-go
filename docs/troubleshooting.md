@@ -119,6 +119,38 @@ If saving fails, check that the current working folder is writable. The destinat
 
 Capelin uses a simpler line reader when the terminal cannot provide the full interactive interface. You can still submit ordinary prompts, use `/exit`, `/quit`, and `/save`, and press Ctrl+D to leave. Tab completion and some multiline-paste behavior may not be available.
 
+## The conversation exceeds the context window
+
+When a long interactive session or `/goal` run grows beyond the model's context
+window, the provider returns a 400 error with a message like
+`invalid_request_body` or `context window`. Capelin automatically detects this
+error, compacts the conversation history to fit within the window, and retries
+the turn once. A system line confirms the recovery:
+
+```text
+[capelin-go] context window exceeded; compacted conversation and retried
+```
+
+Automatic recovery is bounded:
+
+- At most one compaction per turn.
+- At most three automatic compactions per `/goal` run.
+- When the cap is reached, the goal ends with the resumable outcome (not a
+  final failure) and you can continue with bare `/goal`.
+
+Manual `/compact` also works on over-budget conversations: it summarizes
+within a fixed character budget, so the summarization request itself fits the
+window. Existing session identity, metadata, and checklist are preserved.
+
+Tool output entering the conversation is truncated to a fixed character limit
+(full output is still shown in the terminal), and older assistant reasoning
+content is stripped from provider requests. These measures keep history growth
+bounded during long runs.
+
+To prevent overflow proactively, set `--context-window N` (character budget) or
+`CONTEXT_WINDOW` in the environment; compaction triggers automatically when the
+conversation exceeds 75% of the budget.
+
 ## The settings file causes a startup error
 
 Check these locations and values:

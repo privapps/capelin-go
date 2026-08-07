@@ -184,6 +184,42 @@ func TestTurnEngineTimeoutRetryParity(t *testing.T) {
 	}
 }
 
+func TestTurnEngineIterationLimitDiagnosticRespectsEmitOutput(t *testing.T) {
+	workspace := t.TempDir()
+	toolCall := []map[string]any{{
+		"id": "call-1", "type": "function",
+		"function": map[string]any{"name": toolListFiles, "arguments": `{"path":"."}`},
+	}}
+	bodies := []string{
+		protocolToolResponse(false, "inspect", toolCall),
+		protocolFinalResponse(false, "fallback finished"),
+	}
+
+	// A visible run (root interactive/one-shot) still reports the exhaustion
+	// diagnostic once on its own stream.
+	visible := runProtocolScenarioWithConfigAndSinkEmit(t, workspace, false, 1, true, bodies)
+	if visible.err != nil {
+		t.Fatalf("visible capped turn failed: %v", visible.err)
+	}
+	if got := strings.Join(visible.sink.snapshot(), "\n"); !strings.Contains(got, "Maximum tool iterations (1) reached") {
+		t.Fatalf("visible run did not report the iteration-limit diagnostic: %v", visible.sink.snapshot())
+	}
+
+	// An invisible run (subagent session sharing the parent's sink) must stay
+	// silent: the diagnostic is not attributed to an agent and would appear to
+	// belong to the parent's own turn.
+	hidden := runProtocolScenarioWithConfigAndSinkEmit(t, workspace, false, 1, false, bodies)
+	if hidden.err != nil {
+		t.Fatalf("hidden capped turn failed: %v", hidden.err)
+	}
+	if got := strings.Join(hidden.sink.snapshot(), "\n"); strings.Contains(got, "Maximum tool iterations") {
+		t.Fatalf("hidden run leaked the iteration-limit diagnostic: %v", hidden.sink.snapshot())
+	}
+	if hidden.result != "fallback finished" {
+		t.Fatalf("hidden capped turn result=%q, want %q", hidden.result, "fallback finished")
+	}
+}
+
 func TestTurnEngineFinalOnlyParity(t *testing.T) {
 	chat := runProtocolFinalOnlyScenario(t, false)
 	responses := runProtocolFinalOnlyScenario(t, true)
@@ -267,6 +303,14 @@ func runProtocolScenarioWithConfig(t *testing.T, workspace string, responses boo
 }
 
 func runProtocolScenarioWithConfigAndSink(t *testing.T, workspace string, responses bool, maxIterations int, bodies []string) turnRunResult {
+	return runProtocolScenarioWithConfigAndSinkEmit(t, workspace, responses, maxIterations, true, bodies)
+}
+
+// runProtocolScenarioWithConfigAndSinkEmit is the emit-aware variant of the
+// shared protocol harness. The iteration-limit diagnostic is the only engine
+// sink write that must respect EmitOutput: invisible runs (subagent sessions
+// sharing the parent's sink) must never leak it into the parent's stream.
+func runProtocolScenarioWithConfigAndSinkEmit(t *testing.T, workspace string, responses bool, maxIterations int, emitOutput bool, bodies []string) turnRunResult {
 	t.Helper()
 	var mu sync.Mutex
 	requestIndex := 0
@@ -313,7 +357,7 @@ func runProtocolScenarioWithConfigAndSink(t *testing.T, workspace string, respon
 		sink:   sink,
 	}
 	a.toolset = buildAgentTools(a.cfg.allowedTools)
-	_, result.result, result.reasoning, result.err = a.runTurnLoop(context.Background(), nil, "inspect", a.rootRuntime(), a.toolset, true)
+	_, result.result, result.reasoning, result.err = a.runTurnLoop(context.Background(), nil, "inspect", a.rootRuntime(), a.toolset, emitOutput)
 	mu.Lock()
 	result.modelRequests = requestIndex
 	mu.Unlock()
@@ -560,7 +604,7 @@ func runProtocolSubagentScenario(t *testing.T, responses bool) struct {
 		client:    &client{endpoint: endpoint, model: "test-model", http: server.Client()},
 		subagents: newSubagentManager(defaultSubagentRuntimeConfig(), nil),
 	}
-	result, err := a.runSubagentSession(context.Background(), &agentRuntime{
+	result, _, err := a.runSubagentSession(context.Background(), &agentRuntime{
 		sessionID: "subagent-1", model: "test-model",
 	}, &subagentSession{Question: "inspect this"})
 	if err != nil {

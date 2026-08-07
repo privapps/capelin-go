@@ -65,6 +65,46 @@ func (e *retryableTransportError) Error() string { return e.err.Error() }
 func (e *retryableTransportError) Unwrap() error { return e.err }
 func (*retryableTransportError) Retryable() bool { return true }
 
+// contextOverflowError is a typed error for 400 responses whose body
+// indicates the input exceeds the model's context window. It is deliberately
+// not Retryable: recovery is an application concern, not a provider-retry
+// concern.
+type contextOverflowError struct {
+	message string
+}
+
+func (e *contextOverflowError) Error() string { return e.message }
+
+// IsContextOverflowError reports whether err is a context-overflow error
+// produced by a provider adapter.
+func IsContextOverflowError(err error) bool {
+	var target *contextOverflowError
+	return errors.As(err, &target)
+}
+
+// overflowMarkers are substrings that identify a 400 response as a
+// context-window overflow. The match is case-insensitive.
+var overflowMarkers = []string{
+	"invalid_request_body",
+	"context window",
+	"context length",
+	"maximum context",
+	"too many tokens",
+}
+
+func isOverflow400(status int, body string) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	lower := strings.ToLower(body)
+	for _, marker := range overflowMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func isRetryableStatus(status int) bool {
 	return status == 408 || status == 409 || status == 425 || status == 429 || status >= 500
 }
@@ -121,6 +161,9 @@ func doJSON(ctx context.Context, cfg Config, body []byte) ([]byte, string, error
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		message := fmt.Sprintf("model request failed: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+		if isOverflow400(resp.StatusCode, string(raw)) {
+			return nil, "", &contextOverflowError{message: message}
+		}
 		if isRetryableStatus(resp.StatusCode) {
 			return nil, "", &retryableHTTPError{status: resp.StatusCode, message: message}
 		}
@@ -171,7 +214,7 @@ func (p *ChatCompletions) ApplyResponse(state contracts.TurnState, response cont
 func (p *ChatCompletions) ApplyToolResults(state contracts.TurnState, results []contracts.ToolResult) {
 	s := state.(*chatState)
 	for _, result := range results {
-		s.messages = append(s.messages, contracts.Message{Role: "tool", ToolCallID: result.Call.ID, Content: result.Output})
+		s.messages = append(s.messages, contracts.Message{Role: "tool", ToolCallID: result.Call.ID, Content: truncateToolOutput(result.Output)})
 	}
 }
 func (*ChatCompletions) AppendUserPrompt(state contracts.TurnState, content string) {
@@ -255,18 +298,40 @@ type chatContinuationData struct {
 
 func chatMessages(messages []contracts.Message, reasoning string) []chatMessage {
 	reasoningEnabled := strings.TrimSpace(reasoning) != ""
+	// Find the last assistant message index so only its reasoning content
+	// travels in the wire payload; earlier reasoning is stripped.
+	lastAssistantIdx := -1
+	if reasoningEnabled {
+		for i := len(messages) - 1; i >= 0; i-- {
+			if messages[i].Role == "assistant" {
+				lastAssistantIdx = i
+				break
+			}
+		}
+	}
 	result := make([]chatMessage, 0, len(messages))
-	for _, message := range messages {
+	for i, message := range messages {
 		wire := chatMessage{
 			Role: message.Role, Content: message.Content, ToolCallID: message.ToolCallID,
 			Name: message.Name, ToolCalls: append([]contracts.ToolCall(nil), message.ToolCalls...),
 		}
 		if message.Role == "assistant" && reasoningEnabled {
-			value := ""
-			if message.ReasoningContent != nil {
-				value = *message.ReasoningContent
+			if i == lastAssistantIdx {
+				// The current (last) turn carries its actual reasoning
+				// content so the provider can continue reasoning.
+				value := ""
+				if message.ReasoningContent != nil {
+					value = *message.ReasoningContent
+				}
+				wire.ReasoningContent = &value
+			} else {
+				// Earlier turns carry an empty reasoning_content field.
+				// Some providers require the field to be present on every
+				// assistant message; the value is always empty so the
+				// payload does not resend old reasoning traces.
+				empty := ""
+				wire.ReasoningContent = &empty
 			}
-			wire.ReasoningContent = &value
 		}
 		result = append(result, wire)
 	}
@@ -309,8 +374,9 @@ func (p *Responses) ApplyResponse(state contracts.TurnState, response contracts.
 func (p *Responses) ApplyToolResults(state contracts.TurnState, results []contracts.ToolResult) {
 	s := state.(*responsesState)
 	for _, result := range results {
-		s.input = append(s.input, marshal(map[string]any{"type": "function_call_output", "call_id": result.Call.ID, "output": result.Output}))
-		s.messages = append(s.messages, contracts.Message{Role: "tool", ToolCallID: result.Call.ID, Content: result.Output})
+		output := truncateToolOutput(result.Output)
+		s.input = append(s.input, marshal(map[string]any{"type": "function_call_output", "call_id": result.Call.ID, "output": output}))
+		s.messages = append(s.messages, contracts.Message{Role: "tool", ToolCallID: result.Call.ID, Content: output})
 	}
 }
 func (*Responses) AppendUserPrompt(state contracts.TurnState, content string) {
@@ -391,10 +457,21 @@ func (m completionMessage) asMessage() contracts.Message {
 func (m completionMessage) asMessagePtr() completionMessage { return m }
 
 func messagesToInput(messages []contracts.Message) []json.RawMessage {
+	// Find the last assistant message index so only its reasoning content
+	// travels in the wire payload.
+	lastAssistantIdx := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "assistant" {
+			lastAssistantIdx = i
+			break
+		}
+	}
 	input := make([]json.RawMessage, 0, len(messages))
-	for _, message := range messages {
+	for i, message := range messages {
 		if message.Role == "assistant" {
-			if message.ReasoningContent != nil && strings.TrimSpace(*message.ReasoningContent) != "" {
+			// Only the most recent assistant message sends its reasoning
+			// content; earlier turns are stripped to reduce payload size.
+			if i == lastAssistantIdx && message.ReasoningContent != nil && strings.TrimSpace(*message.ReasoningContent) != "" {
 				input = append(input, marshal(map[string]any{
 					"type":    "reasoning",
 					"summary": []any{map[string]any{"type": "summary_text", "text": *message.ReasoningContent}},
@@ -406,7 +483,7 @@ func messagesToInput(messages []contracts.Message) []json.RawMessage {
 			for _, call := range message.ToolCalls {
 				input = append(input, marshal(map[string]any{"type": "function_call", "call_id": call.ID, "name": call.Function.Name, "arguments": call.Function.Arguments}))
 			}
-			if len(message.ToolCalls) > 0 || message.Content != "" || message.ReasoningContent != nil {
+			if len(message.ToolCalls) > 0 || message.Content != "" || (i == lastAssistantIdx && message.ReasoningContent != nil) {
 				continue
 			}
 		}
@@ -607,6 +684,21 @@ func cloneRawMessages(messages []json.RawMessage) []json.RawMessage {
 		result[i] = append(json.RawMessage(nil), message...)
 	}
 	return result
+}
+
+// toolOutputMaxChars is the fixed character budget for tool results stored in
+// the conversation. Larger results are truncated to fit, and the original
+// full output is still displayed on the terminal because the sink receives it
+// before the provider adapter is called.
+const toolOutputMaxChars = 16000
+
+// truncateToolOutput returns s unchanged when it fits the budget and a
+// truncated copy with an explicit marker otherwise.
+func truncateToolOutput(s string) string {
+	if len(s) <= toolOutputMaxChars {
+		return s
+	}
+	return s[:toolOutputMaxChars] + fmt.Sprintf("[truncated: %d chars]", len(s)-toolOutputMaxChars)
 }
 
 var _ contracts.Provider = (*ChatCompletions)(nil)

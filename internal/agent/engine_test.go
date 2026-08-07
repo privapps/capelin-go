@@ -153,3 +153,40 @@ func TestEngineCancellationStopsBeforeProviderCall(t *testing.T) {
 		t.Fatalf("provider was called %d times", provider.requests)
 	}
 }
+
+func TestEngineOnIterationLimitReportsExhaustionOnce(t *testing.T) {
+	call := contracts.ToolCall{ID: "call-1", Type: "function", Function: contracts.FunctionCall{Name: "lookup", Arguments: "{}"}}
+	provider := &testProvider{responses: []contracts.Completion{
+		testCompletion{calls: []contracts.ToolCall{call}},
+		testCompletion{content: "fallback answer"},
+	}}
+	var reported int
+	result, err := (&Engine{Provider: provider}).Run(context.Background(), RunOptions{
+		Question: "question", MaxToolIterations: 1, ToolRunner: &testRunner{},
+		OnIterationLimit: func() { reported++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Answer != "fallback answer" {
+		t.Fatalf("answer=%q", result.Answer)
+	}
+	if reported != 1 {
+		t.Fatalf("OnIterationLimit called %d times, want 1", reported)
+	}
+}
+
+func TestEngineOnIterationLimitNotCalledOnNormalCompletion(t *testing.T) {
+	provider := &testProvider{responses: []contracts.Completion{testCompletion{content: "done"}}}
+	reported := 0
+	_, err := (&Engine{Provider: provider}).Run(context.Background(), RunOptions{
+		Question: "question", MaxToolIterations: 4, ToolRunner: &testRunner{},
+		OnIterationLimit: func() { reported++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reported != 0 {
+		t.Fatalf("OnIterationLimit called %d times on a clean turn", reported)
+	}
+}

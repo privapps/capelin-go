@@ -103,6 +103,17 @@ func newAppToolCapability(toolset []contracts.Tool, a *app, runtime *agentRuntim
 						if commandFailed(call, output) {
 							runtime.recordRecoverableToolError(fmt.Errorf("%s reported a command failure", call.Function.Name))
 							result.IsError = true
+							return result
+						}
+						// A successful non-control tool result is the liveness
+						// signal for the current goal iteration. Checklist
+						// management and the completion handshake stay on the
+						// control plane: their meaningful state changes are
+						// evaluated through the checklist and completion checks.
+						// Recording is scoped to an enabled goal runtime so
+						// ordinary and subagent turns never carry the flag.
+						if runtime.goalIsEnabled() && !isGoalControlTool(call.Function.Name) {
+							runtime.recordSuccessfulToolActivity()
 						}
 						return result
 					},
@@ -134,6 +145,14 @@ func commandFailed(call contracts.ToolCall, output string) bool {
 		Failed bool `json:"failed"`
 	}
 	return json.Unmarshal([]byte(output), &result) == nil && result.Failed
+}
+
+// isGoalControlTool identifies checklist-management and completion-handshake
+// tools. Their meaningful state changes are validated through the
+// authoritative checklist comparison and the completion handshake checks
+// rather than through the per-iteration activity signal.
+func isGoalControlTool(name string) bool {
+	return name == toolUpdateTodos || name == toolCompleteGoal
 }
 
 func fatalToolError(err error) bool {

@@ -33,7 +33,7 @@ const (
 	goalSubagentMaxDepth       = 2
 	goalSubagentMaxParallel    = 8
 	goalSubagentTimeoutSec     = 600
-	goalSubagentToolIterations = 100
+	goalSubagentToolIterations = 32 // goal-run floor: an accepted goal guarantees at least this many subagent tool iterations
 	goalSubagentAggregateChars = 48000
 	goalToolMaxParallel        = 16
 	goalToolTimeoutSec         = 300
@@ -119,6 +119,7 @@ type Config struct {
 	ToolMaxParallel           int  // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
 	ToolTimeoutSec            int  // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
 	ToolRetryOnTimeout        bool // retry once on timeout (0 = disable; empty = default true)
+	ContextWindow             int  // optional conversation budget in characters; 0 = disabled (reactive-only recovery)
 	AsyncTimeout              time.Duration
 	Debug                     bool
 	profileSources            profileSources
@@ -281,6 +282,7 @@ func Load(args []string) (Config, error) {
 	toolMaxParallel := 0            // zero = "not set by flag"
 	toolTimeoutSec := 0             // zero = "not set by flag"
 	toolRetryOnTimeout := -1        // -1 = "not set by flag"; 0 = explicitly false; 1 = explicitly true
+	contextWindow := 0              // zero = "not set"
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -563,6 +565,24 @@ func Load(args []string) (Config, error) {
 			toolRetryOnTimeout = 1
 		case arg == "--no-tool-retry-on-timeout":
 			toolRetryOnTimeout = 0
+		case arg == "--context-window":
+			if i+1 >= len(args) {
+				return Config{}, errors.New("--context-window requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--context-window")
+			if err != nil {
+				return Config{}, err
+			}
+			contextWindow = value
+			numericFlags["CONTEXT_WINDOW"] = true
+		case strings.HasPrefix(arg, "--context-window="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--context-window="), "--context-window")
+			if err != nil {
+				return Config{}, err
+			}
+			contextWindow = value
+			numericFlags["CONTEXT_WINDOW"] = true
 		case arg == "--debug" || arg == "-debug":
 			debug = true
 		case strings.HasPrefix(arg, "-"):
@@ -674,6 +694,10 @@ func Load(args []string) (Config, error) {
 	if toolRetryOnTimeout == -1 {
 		toolRetryOnTimeout = boolToInt(readBoolCfg("TOOL_RETRY_ON_TIMEOUT", fileCfg, defaultToolRetryOnTimeout))
 	}
+	contextWindow, _, err = resolvePositiveSetting("CONTEXT_WINDOW", contextWindow, numericFlags["CONTEXT_WINDOW"], fileCfg, 0)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		Endpoint:                  endpoint,
@@ -702,6 +726,7 @@ func Load(args []string) (Config, error) {
 		ToolMaxParallel:           toolMaxParallel,
 		ToolTimeoutSec:            toolTimeoutSec,
 		ToolRetryOnTimeout:        toolRetryOnTimeout != 0,
+		ContextWindow:             contextWindow,
 		profileSources:            sources,
 		Debug:                     debug,
 	}, nil
@@ -724,7 +749,10 @@ func (c Config) OrdinaryProfile() RuntimeProfile {
 // ordinary profile. Explicit CLI and environment values always carry over;
 // customized saved values carry over too. A saved value equal to the ordinary
 // built-in default is treated as the generated baseline and receives the goal
-// fallback. This method never writes configuration or changes the receiver.
+// fallback. Subagent tool iterations are additionally floored at the goal
+// budget: an accepted goal guarantees at least that much delegated tool budget
+// even when the ordinary configuration explicitly sets less. This method
+// never writes configuration or changes the receiver.
 func (c Config) GoalProfile() RuntimeProfile {
 	ordinary := c.OrdinaryProfile()
 	goal := ordinary
@@ -738,6 +766,12 @@ func (c Config) GoalProfile() RuntimeProfile {
 	goal.Subagents.MaxResultChars = goalSetting(c.Subagents.MaxResultChars, defaultSubagentResultChars, defaultSubagentResultChars, c.profileSources.subagentMaxResultChars)
 	goal.Subagents.MaxAggregateChars = goalSetting(c.Subagents.MaxAggregateChars, defaultSubagentAggregateChars, goalSubagentAggregateChars, c.profileSources.subagentMaxAggregateChars)
 	goal.Subagents.MaxToolIterations = goalSetting(c.Subagents.MaxToolIterations, defaultSubagentToolIterations, goalSubagentToolIterations, c.profileSources.subagentMaxToolIterations)
+	// The goal floor raises explicit ordinary values below the goal budget
+	// (CLI, environment, or customized saved) so delegated work is not
+	// truncated by ordinary-turn tuning; higher explicit values stay untouched.
+	if goal.Subagents.MaxToolIterations < goalSubagentToolIterations {
+		goal.Subagents.MaxToolIterations = goalSubagentToolIterations
+	}
 	goal.ToolMaxParallel = goalSetting(c.ToolMaxParallel, defaultToolMaxParallel, goalToolMaxParallel, c.profileSources.toolMaxParallel)
 	goal.ToolTimeoutSec = goalSetting(c.ToolTimeoutSec, defaultToolTimeoutSec, goalToolTimeoutSec, c.profileSources.toolTimeoutSec)
 	return goal
@@ -949,7 +983,11 @@ TOOL_RETRY_ON_TIMEOUT = true
 IDLE_HOOK_COMMAND =
 IDLE_HOOK_ARGS = []
 
-# Server mode security (empty means no browser or dynamic outbound access).
+# Context window budget (env: CONTEXT_WINDOW; also settable via --context-window)
+# Optional character budget for proactive compaction. When set, the conversation
+# is compacted before the provider call if estimated size exceeds 75% of the
+# budget. When unset (0), recovery is reactive-only (compact after overflow).
+# CONTEXT_WINDOW =
 SERVER_ALLOWED_ORIGINS =
 SERVER_ALLOWED_TARGETS =
 SERVER_ALLOW_PRIVATE_TARGETS = false

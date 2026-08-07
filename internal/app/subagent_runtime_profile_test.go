@@ -75,7 +75,7 @@ func runApplicationSubagentWithProfile(t *testing.T, profile configpkg.RuntimePr
 		sink:   &spySink{},
 	}
 	var observed *agentRuntime
-	a.subagents = newSubagentManager(toSubagentConfig(profile.Subagents), func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+	a.subagents = newSubagentManager(toSubagentConfig(profile.Subagents), func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
 		observed = runtime
 		return a.runSubagentSession(ctx, runtime, session)
 	})
@@ -98,6 +98,9 @@ func runApplicationSubagentWithProfile(t *testing.T, profile configpkg.RuntimePr
 	}
 	if completed.Status != subagentStatusCompleted {
 		t.Fatalf("subagent status = %s, error=%q", completed.Status, completed.Error)
+	}
+	if !completed.IterationLimitReached {
+		t.Fatal("capped subagent run did not surface the iteration-limit marker on its session")
 	}
 	return int(requestCount.Load()), observed, completed
 }

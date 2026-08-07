@@ -78,6 +78,7 @@ type config struct {
 	toolMaxParallel    int  // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
 	toolTimeoutSec     int  // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
 	toolRetryOnTimeout bool // retry once on timeout (0 = disable; empty = default true)
+	contextWindow      int  // optional conversation budget in characters; 0 = disabled
 	ordinaryProfile    configpkg.RuntimeProfile
 	goalProfile        configpkg.RuntimeProfile
 	profilesResolved   bool
@@ -124,6 +125,14 @@ type interactiveSession struct {
 	goalCompleted  bool
 	successMessage string
 	skipCommit     bool
+
+	// autoCompactionCount tracks successful automatic compactions within a
+	// single goal run. The goal loop caps this at maxGoalAutoCompactions.
+	autoCompactionCount int
+	// overflowRecoverySucceeded is set by runInteractiveTurnResult when the
+	// turn succeeded after an automatic overflow compaction and retry. The
+	// goal loop uses it to reset both safeguard streaks.
+	overflowRecoverySucceeded bool
 }
 
 type client struct {
@@ -296,6 +305,7 @@ func loadConfig(args []string) (config, error) {
 		toolMaxParallel:    parsed.ToolMaxParallel,
 		toolTimeoutSec:     parsed.ToolTimeoutSec,
 		toolRetryOnTimeout: parsed.ToolRetryOnTimeout,
+		contextWindow:      parsed.ContextWindow,
 		ordinaryProfile:    parsed.OrdinaryProfile(),
 		goalProfile:        parsed.GoalProfile(),
 		profilesResolved:   true,
@@ -358,7 +368,7 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "  --resume [ID|PREFIX]       resume the newest, exact, or unique-prefix interactive session")
 	fmt.Fprintln(w, "  --final-only               one-shot mode: suppress intermediate tool output, show only the final answer")
 	fmt.Fprintln(w, "  --debug                    dump HTTP request and response to stderr")
-	fmt.Fprintln(w, "Env: ENDPOINT, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS, MAX_GOAL_ITERATIONS")
+	fmt.Fprintln(w, "Env: ENDPOINT, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS, MAX_GOAL_ITERATIONS, CONTEXT_WINDOW")
 	fmt.Fprintln(w, "     IDLE_HOOK_COMMAND, IDLE_HOOK_ARGS (JSON string array; local one-shot and interactive, requires execute_program permission)")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")
@@ -368,13 +378,14 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "Configuration precedence: CLI flags > environment > saved config > built-in defaults")
 	fmt.Fprintln(w, "Opt-in tools (repeatable): --allow-tool write_file --allow-tool edit_file --allow-tool append_file --allow-tool execute_program --allow-tool execute_skill")
 	fmt.Fprintln(w, "Ordinary limits: root iterations 40, goal-loop baseline 20, subagent depth/parallelism/iterations 1/4/20, aggregate chars 12000, tools parallel/timeout 8/60s")
-	fmt.Fprintln(w, "Goal-run limits: root iterations 256, outer iterations 64, subagent depth/parallelism/iterations 2/8/100, aggregate chars 48000, tools parallel/timeout 16/300s")
-	fmt.Fprintln(w, "Saved numeric values equal to ordinary defaults are baseline values for goal fallback; custom saved, environment, and CLI values remain explicit")
+	fmt.Fprintln(w, "Goal-run limits: root iterations 256, outer iterations 64, subagent depth/parallelism/iterations 2/8/32, aggregate chars 48000, tools parallel/timeout 16/300s")
+	fmt.Fprintln(w, "Saved numeric values equal to ordinary defaults are baseline values for goal fallback; custom saved, environment, and CLI values remain explicit (subagent iterations are raised to at least 32 for an accepted goal)")
 	fmt.Fprintln(w, "--yolo enables permissions and path access only; it does not select goal budgets. /goal still requires --yolo, and stopping/completing a goal restores ordinary limits")
 	fmt.Fprintln(w, "Iteration limit: --max-iterations N (ordinary default 40; goal-run default 256; env MAX_ITERATIONS; always wraps up gracefully on limit)")
 	fmt.Fprintln(w, "Goal loop limit: --max-goal-iterations N (ordinary baseline 20; goal-run default 64; env MAX_GOAL_ITERATIONS; accepted /goal only)")
-	fmt.Fprintln(w, "Interactive goal: /goal <objective> starts a fresh checklist; bare /goal or clear requests such as 'finish the goal' resume an incomplete one (requires --yolo)")
+	fmt.Fprintln(w, "Interactive goal: /goal <objective> starts a fresh objective generation and checklist; bare /goal or a clear request such as 'finish the goal' resumes the current incomplete objective and its persisted checklist (requires --yolo)")
 	fmt.Fprintln(w, "Goal completion: a completed checklist must be followed by a valid complete_goal summary and evidence claim")
+	fmt.Fprintln(w, "Context budget: --context-window N (env CONTEXT_WINDOW) proactively compacts when conversation exceeds 75% of the character budget; when unset, recovery is reactive-only (compact after overflow)")
 	fmt.Fprintln(w, "Interactive sessions: /compact, /session-new [prompt], /session-list, /session-resume [ID|PREFIX], /exit, /quit")
 	fmt.Fprintln(w, "Interactive /compact summarizes retained conversation history without tools; it accepts no arguments and can be cancelled.")
 	fmt.Fprintln(w, "Subagent limits (flags, env vars, or config file):")
@@ -384,7 +395,7 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "  --subagent-timeout-seconds N        (ordinary and goal-run 600; env SUBAGENT_TIMEOUT_SECONDS)")
 	fmt.Fprintln(w, "  --subagent-max-result-chars N       (default 8000;  env SUBAGENT_MAX_RESULT_CHARS)")
 	fmt.Fprintln(w, "  --subagent-max-aggregate-chars N    (ordinary 12000; goal-run 48000; env SUBAGENT_MAX_AGGREGATE_CHARS)")
-	fmt.Fprintln(w, "  --subagent-max-iterations N         (ordinary 20; goal-run 100; env SUBAGENT_MAX_ITERATIONS)")
+	fmt.Fprintln(w, "  --subagent-max-iterations N         (ordinary 20; goal-run at least 32; env SUBAGENT_MAX_ITERATIONS)")
 	fmt.Fprintln(w, "Subagent model (defaults to root MODEL if not set):")
 	fmt.Fprintln(w, "  --subagent-model MODEL              (env SUBAGENT_MODEL)")
 	fmt.Fprintln(w, "  --subagent-reasoning-effort VALUE   (env SUBAGENT_REASONING_EFFORT; set to 'none' or 'nil' to omit)")
@@ -559,11 +570,23 @@ func (a *app) runTurnLoopWithState(ctx context.Context, messages []contracts.Mes
 	}
 	profile := a.runtimeProfileFor(runtime)
 	capability := newAppToolCapability(toolset, a, runtime)
+	if runtime != nil {
+		// The truncation marker is scoped to this turn: a subagent runner
+		// consumes it after the run returns, and a shared root runtime must
+		// never carry an exhaustion signal into a later turn.
+		runtime.resetIterationLimit()
+		runtime.emitOutput = emitOutput
+	}
 	result, err := (&agent.Engine{Provider: a.client.agentProvider()}).Run(ctx, agent.RunOptions{
 		Messages: messages, Question: question, Model: model, Reasoning: reasoning,
 		MaxToolIterations: profile.MaxIterations, AgentID: agentID, EmitOutput: emitOutput,
 		FinalOnly: a.cfg.finalOnly, Sink: a.sink, ToolCapability: capability,
 		ToolSummary: extractToolSummary, ContinuationState: continuation,
+		OnIterationLimit: func() {
+			if runtime != nil {
+				runtime.recordIterationLimit()
+			}
+		},
 	})
 	return result.Messages, result.Answer, result.Reasoning, result.ContinuationState, err
 }
@@ -860,6 +883,24 @@ func (a *app) runInteractiveTurnResult(ctx context.Context, session *interactive
 		a.attachInteractiveRuntime(session)
 	}
 	session.runtime.resetToolError()
+	// Proactive context-budget compaction: when a conversation budget is
+	// configured, estimate the current conversation size and compact before
+	// the provider call if the estimate exceeds 75% of the budget. This
+	// prevents the overflow 400 entirely. When the budget is unset the
+	// recovery stays reactive-only and existing behavior is unchanged.
+	if a.cfg.contextWindow > 0 {
+		estSize := estimateConversationSize(session.messages, question)
+		threshold := a.cfg.contextWindow * 3 / 4
+		if estSize > threshold {
+			compacted, compactErr := a.compactMessagesForRecovery(ctx, session.messages)
+			if compactErr == nil {
+				session.messages = compacted
+				session.providerState = nil
+				session.loadedSkills = make(map[string]bool)
+				a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] proactive compaction: conversation estimated at %d/%d characters", estSize, a.cfg.contextWindow))
+			}
+		}
+	}
 	preTurnLen := len(session.messages)
 	prepared, newlyLoaded := prepareSkillPrompt(question, a.skills, session.loadedSkills)
 	toolset := a.toolset
@@ -871,10 +912,28 @@ func (a *app) runInteractiveTurnResult(ctx context.Context, session *interactive
 		if ctx.Err() != nil {
 			return true, err
 		}
-		if preTurnLen <= len(session.messages) {
-			session.messages = session.messages[:preTurnLen]
+		// Context-overflow recovery: compact history and retry once.
+		if providers.IsContextOverflowError(err) {
+			// Skip recovery when the per-goal-run compaction cap is exhausted.
+			if session.runtime != nil && session.runtime.goalIsEnabled() && session.autoCompactionCount >= maxGoalAutoCompactions {
+				return false, err
+			}
+			retryMessages, retryResult, _, retryState, retryErr := a.retryOverflowTurn(ctx, session, prepared, toolset, preTurnLen)
+			if retryErr != nil {
+				// Restore pre-turn state on failure.
+				session.messages = session.messages[:preTurnLen]
+				return false, retryErr
+			}
+			// Retry succeeded — use the retry results for commit.
+			messages, result, providerState, err = retryMessages, retryResult, retryState, nil
+			session.autoCompactionCount++
+			session.overflowRecoverySucceeded = true
+		} else {
+			if preTurnLen <= len(session.messages) {
+				session.messages = session.messages[:preTurnLen]
+			}
+			return false, err
 		}
-		return false, err
 	}
 	session.messages = messages
 	session.providerState = cloneProviderState(providerState)
@@ -905,6 +964,63 @@ func (a *app) runInteractiveTurnResult(ctx context.Context, session *interactive
 		return false, fatalToolFailure{err: fatal}
 	}
 	return false, nil
+}
+
+// retryOverflowTurn handles a single context-overflow recovery cycle:
+// compact the pre-turn history, emit a system line, and retry the turn once.
+// On compaction failure the session is left unchanged and the original error
+// is returned. On retry failure the session is restored to its pre-compaction
+// state.
+func (a *app) retryOverflowTurn(ctx context.Context, session *interactiveSession, prepared string, toolset []contracts.Tool, preTurnLen int) ([]contracts.Message, string, string, *contracts.ContinuationState, error) {
+	// Snapshot pre-turn state for rollback.
+	savedMessages := cloneMessages(session.messages[:preTurnLen])
+	savedProviderState := cloneProviderState(session.providerState)
+	savedSkills := make(map[string]bool, len(session.loadedSkills))
+	for k, v := range session.loadedSkills {
+		savedSkills[k] = v
+	}
+
+	// Compact the pre-turn history.
+	compacted, compactErr := a.compactMessagesForRecovery(ctx, savedMessages)
+	if compactErr != nil {
+		return nil, "", "", nil, fmt.Errorf("context overflow: compaction failed: %w", compactErr)
+	}
+	session.messages = compacted
+	session.providerState = nil
+	session.loadedSkills = make(map[string]bool)
+	a.writeInteractiveSystem("[capelin-go] context window exceeded; compacted conversation and retried")
+
+	// Retry the turn once.
+	retryMessages, retryResult, retryReasoning, retryState, retryErr := a.runTurnLoopWithState(ctx, session.messages, prepared, session.runtime, toolset, true, session.providerState)
+	if retryErr != nil {
+		// Restore pre-turn state so the session is unchanged.
+		session.messages = savedMessages
+		session.providerState = savedProviderState
+		session.loadedSkills = savedSkills
+		return nil, "", "", nil, retryErr
+	}
+	return retryMessages, retryResult, retryReasoning, retryState, nil
+}
+
+// compactMessagesForRecovery compacts a message slice using the overflow-safe
+// compaction budget and returns the compacted conversation ready for a retry.
+func (a *app) compactMessagesForRecovery(ctx context.Context, messages []contracts.Message) ([]contracts.Message, error) {
+	model, reasoning := "", ""
+	if a.client != nil {
+		model, reasoning = a.client.model, a.client.reasoning
+	}
+	summary, err := (&agent.Engine{Provider: a.client.agentProvider()}).CompactWithinBudget(ctx, agent.CompactOptions{
+		Messages: messages, Model: model, Reasoning: reasoning, Sink: a.sink, AgentID: rootAgentID,
+	}, agent.DefaultCompactionBudget())
+	if err != nil {
+		return nil, err
+	}
+	compacted := make([]contracts.Message, 0, 2)
+	if system := firstSystemMessage(messages); system != nil {
+		compacted = append(compacted, *system)
+	}
+	compacted = append(compacted, contracts.Message{Role: "assistant", Content: compactedHistoryMarker + summary})
+	return compacted, nil
 }
 
 func (a *app) interactiveResponsePath() (string, error) {
@@ -998,7 +1114,9 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 				if err != nil {
 					return nil, err
 				}
-				return a.subagents.snapshotLocked(session, true), nil
+				snapshot := a.subagents.snapshotLocked(session, true)
+				a.displayCompletedSubagent(value.(*agentRuntime), snapshot)
+				return snapshot, nil
 			},
 			AwaitSubagent: func(callCtx context.Context, value any, raw json.RawMessage) (any, error) {
 				var args awaitSubagentArgs
@@ -1009,7 +1127,9 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 				if err != nil {
 					return nil, err
 				}
-				return a.subagents.snapshotLocked(session, true), nil
+				snapshot := a.subagents.snapshotLocked(session, true)
+				a.displayCompletedSubagent(value.(*agentRuntime), snapshot)
+				return snapshot, nil
 			},
 			ListSubagents: func(value any, raw json.RawMessage) (any, error) {
 				var args listSubagentsArgs
@@ -1057,6 +1177,27 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 	return dispatcher.Run(ctx, runtime, call)
 }
 
+func (a *app) displayCompletedSubagent(runtime *agentRuntime, session subagentEnvelope) {
+	if a == nil || a.sink == nil || runtime == nil || runtime.depth != 0 {
+		return
+	}
+	if session.Status != string(subagentStatusCompleted) || strings.TrimSpace(session.Output) == "" {
+		return
+	}
+	if !runtime.claimSubagentDisplay(session.ID) {
+		return
+	}
+	label := strings.TrimSpace(session.Name)
+	if label == "" {
+		label = strings.TrimSpace(session.ID)
+	}
+	lines := strings.Split(strings.TrimSpace(session.Output), "\n")
+	for i := range lines {
+		lines[i] = fmt.Sprintf("[subagent %s] %s", label, strings.TrimSuffix(lines[i], "\r"))
+	}
+	a.sink.WriteSystem(runtime.sessionID, strings.Join(lines, "\n"))
+}
+
 func (a *app) isToolEnabled(runtime *agentRuntime, name string) bool {
 	if name == toolCompleteGoal {
 		return runtime != nil && runtime.goalIsEnabled() && runtime.allowedTools[name]
@@ -1081,16 +1222,47 @@ func (a *app) rootRuntime() *agentRuntime {
 	}
 }
 
-func (a *app) runSubagentSession(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+func (a *app) runSubagentSession(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
 	if runtime == nil {
-		return "", errors.New("runtime is required")
+		return "", false, errors.New("runtime is required")
 	}
 	toolset := tools.Build(runtime.allowedTools)
 	question := strings.TrimSpace(session.Question)
 	if question == "" {
-		return "", errors.New("subagent question is empty")
+		return "", false, errors.New("subagent question is empty")
 	}
-	return a.runConversation(ctx, question, runtime, toolset, false)
+	emit := runtime.emitOutput
+	if emit && a.sink != nil {
+		a.sink.WriteSystem(session.ID, fmt.Sprintf("[subagent %s] running: %s", session.ID, subagentStatusQuestion(question)))
+	}
+	started := time.Now()
+	answer, err := a.runConversation(ctx, question, runtime, toolset, emit)
+	if emit && a.sink != nil {
+		elapsed := time.Since(started).Round(time.Second)
+		a.sink.WriteSystem(session.ID, fmt.Sprintf("[subagent %s] %s in %s", session.ID, subagentOutcome(err), elapsed))
+	}
+	return answer, runtime.hadIterationLimit(), err
+}
+
+// subagentStatusQuestion collapses whitespace and truncates the displayed
+// question to 120 runes without splitting multi-byte characters.
+func subagentStatusQuestion(question string) string {
+	collapsed := strings.Join(strings.Fields(question), " ")
+	return output.TruncateDisplay(collapsed, 120)
+}
+
+// subagentOutcome maps a run error to a human-readable terminal status word.
+func subagentOutcome(err error) string {
+	if err == nil {
+		return "completed"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timed out"
+	}
+	return "failed"
 }
 
 func marshalToolResult(value any) (string, error) {

@@ -217,7 +217,7 @@ func TestGoalProfileUsesGoalDefaultsWithoutChangingOrdinaryConfig(t *testing.T) 
 	if goal.MaxIterations != 256 || goal.MaxGoalIterations != 64 {
 		t.Fatalf("unexpected goal iterations: root=%d outer=%d", goal.MaxIterations, goal.MaxGoalIterations)
 	}
-	if got := goal.Subagents; got.MaxDepth != 2 || got.MaxChildren != defaultSubagentMaxChildren || got.MaxParallel != 8 || got.DefaultTimeoutSec != 600 || got.MaxToolIterations != 100 || got.MaxResultChars != defaultSubagentResultChars || got.MaxAggregateCount != defaultSubagentAggregateCount || got.MaxAggregateChars != 48000 || got.MaxTimeoutSec != defaultSubagentMaxTimeoutSec {
+	if got := goal.Subagents; got.MaxDepth != 2 || got.MaxChildren != defaultSubagentMaxChildren || got.MaxParallel != 8 || got.DefaultTimeoutSec != 600 || got.MaxToolIterations != 32 || got.MaxResultChars != defaultSubagentResultChars || got.MaxAggregateCount != defaultSubagentAggregateCount || got.MaxAggregateChars != 48000 || got.MaxTimeoutSec != defaultSubagentMaxTimeoutSec {
 		t.Fatalf("unexpected goal subagent profile: %+v", got)
 	}
 	if goal.ToolMaxParallel != 16 || goal.ToolTimeoutSec != 300 || !goal.ToolRetryOnTimeout {
@@ -272,7 +272,7 @@ func TestGoalProfilePrecedenceAcrossSources(t *testing.T) {
 			name:     "saved ordinary defaults use goal fallbacks",
 			saved:    map[string]string{"MAX_ITERATIONS": "40", "MAX_GOAL_ITERATIONS": "20", "SUBAGENT_MAX_DEPTH": "1", "SUBAGENT_MAX_PARALLEL": "4", "SUBAGENT_MAX_ITERATIONS": "20", "SUBAGENT_MAX_AGGREGATE_CHARS": "12000", "TOOL_MAX_PARALLEL": "8", "TOOL_TIMEOUT_SECONDS": "60"},
 			wantOrd:  RuntimeProfile{MaxIterations: 40, MaxGoalIterations: 20, Subagents: SubagentConfig{MaxDepth: 1, MaxChildren: 8, MaxParallel: 4, DefaultTimeoutSec: 600, MaxTimeoutSec: 1800, MaxToolIterations: 20, MaxResultChars: 8000, MaxAggregateCount: 12, MaxAggregateChars: 12000}, ToolMaxParallel: 8, ToolTimeoutSec: 60, ToolRetryOnTimeout: true},
-			wantGoal: RuntimeProfile{MaxIterations: 256, MaxGoalIterations: 64, Subagents: SubagentConfig{MaxDepth: 2, MaxChildren: 8, MaxParallel: 8, DefaultTimeoutSec: 600, MaxTimeoutSec: 1800, MaxToolIterations: 100, MaxResultChars: 8000, MaxAggregateCount: 12, MaxAggregateChars: 48000}, ToolMaxParallel: 16, ToolTimeoutSec: 300, ToolRetryOnTimeout: true},
+			wantGoal: RuntimeProfile{MaxIterations: 256, MaxGoalIterations: 64, Subagents: SubagentConfig{MaxDepth: 2, MaxChildren: 8, MaxParallel: 8, DefaultTimeoutSec: 600, MaxTimeoutSec: 1800, MaxToolIterations: 32, MaxResultChars: 8000, MaxAggregateCount: 12, MaxAggregateChars: 48000}, ToolMaxParallel: 16, ToolTimeoutSec: 300, ToolRetryOnTimeout: true},
 		},
 	}
 
@@ -302,6 +302,54 @@ func TestGoalProfilePrecedenceAcrossSources(t *testing.T) {
 			}
 			if got := cfg.GoalProfile(); got != tc.wantGoal {
 				t.Fatalf("goal profile: got=%+v want=%+v", got, tc.wantGoal)
+			}
+		})
+	}
+}
+
+// TestGoalSubagentIterationFloorRaisesLowExplicitValues proves that an
+// accepted goal guarantees the 32-iteration subagent floor even when the
+// ordinary configuration explicitly sets a lower value, while values at or
+// above the floor carry over untouched.
+func TestGoalSubagentIterationFloorRaisesLowExplicitValues(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		env      map[string]string
+		saved    map[string]string
+		wantOrd  int
+		wantGoal int
+	}{
+		{name: "CLI below floor", args: []string{"--subagent-max-iterations", "20", "task"}, wantOrd: 20, wantGoal: 32},
+		{name: "CLI at floor", args: []string{"--subagent-max-iterations", "32", "task"}, wantOrd: 32, wantGoal: 32},
+		{name: "CLI above floor", args: []string{"--subagent-max-iterations", "40", "task"}, wantOrd: 40, wantGoal: 40},
+		{name: "environment below floor", env: map[string]string{"SUBAGENT_MAX_ITERATIONS": "10"}, wantOrd: 10, wantGoal: 32},
+		{name: "environment above floor", env: map[string]string{"SUBAGENT_MAX_ITERATIONS": "50"}, wantOrd: 50, wantGoal: 50},
+		{name: "custom saved below floor", saved: map[string]string{"SUBAGENT_MAX_ITERATIONS": "15"}, wantOrd: 15, wantGoal: 32},
+		{name: "custom saved above floor", saved: map[string]string{"SUBAGENT_MAX_ITERATIONS": "45"}, wantOrd: 45, wantGoal: 45},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := isolateLoad(t)
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+			if len(tc.saved) > 0 {
+				values := map[string]string{"ENDPOINT": defaultEndpoint}
+				for key, value := range tc.saved {
+					values[key] = value
+				}
+				writeConfig(t, path, values)
+			}
+			cfg, err := Load(tc.args)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := cfg.OrdinaryProfile().Subagents.MaxToolIterations; got != tc.wantOrd {
+				t.Fatalf("ordinary subagent iterations = %d, want %d", got, tc.wantOrd)
+			}
+			if got := cfg.GoalProfile().Subagents.MaxToolIterations; got != tc.wantGoal {
+				t.Fatalf("goal subagent iterations = %d, want %d", got, tc.wantGoal)
 			}
 		})
 	}

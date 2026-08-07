@@ -2,6 +2,7 @@ package app
 
 import (
 	"capelin-go/internal/contracts"
+	"capelin-go/internal/providers"
 	"context"
 	"errors"
 	"fmt"
@@ -451,8 +452,15 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 		agentSnapshot: a.subagents.ListAll,
 	})
 	defer heartbeat.stop()
-	terminalGoalStatus := func(message string) {
+	// terminalGoalStatus writes a goal outcome. Resumable bounded outcomes
+	// (cancellation, recovery limit, stall, iteration limit) append the
+	// resume-versus-fresh-start guidance; failure and preflight outcomes stay
+	// explicit without it.
+	terminalGoalStatus := func(message string, kind goalOutcomeKind) {
 		heartbeat.stop()
+		if kind == goalOutcomeResumable {
+			message = message + " " + goalResumeGuidance
+		}
 		a.writeInteractiveSystem(message)
 	}
 	session.runtime.enableGoal(session.activeGoal.Generation)
@@ -466,7 +474,7 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 	recoveryStreak := 0
 	for iteration := 1; iteration <= goalProfile.MaxGoalIterations; iteration++ {
 		if ctx.Err() != nil {
-			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: cancelled after %d iteration(s)", iteration-1))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: cancelled after %d iteration(s)", iteration-1), goalOutcomeResumable)
 			_ = a.saveGoalSession(session)
 			return true
 		}
@@ -479,83 +487,120 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 		} else if session.activeGoal != nil {
 			prompt = fmt.Sprintf("Continue working toward the objective %q. Make concrete progress on the next incomplete checklist item, then update the authoritative checklist with verified status. When every item is complete, call complete_goal with a non-empty summary and evidence list. %s", session.activeGoal.Objective, goalParallelismGuidance)
 		}
+		// Successful non-control tool work is scoped to this iteration only;
+		// the flag is never carried between iterations or persisted.
+		session.runtime.resetGoalActivity()
 		stopped, err := a.runInteractiveTurnResult(ctx, session, prompt)
 		heartbeat.endTurn()
+		overflowRecoveryOK := session.overflowRecoverySucceeded
+		session.overflowRecoverySucceeded = false
 		if err != nil {
 			if persistErr := a.saveGoalSession(session); persistErr != nil {
-				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
+				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr), goalOutcomeFinal)
 				return false
 			}
 			if stopped || ctx.Err() != nil || errors.Is(err, context.Canceled) {
-				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: cancelled after %d iteration(s)", iteration))
+				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: cancelled after %d iteration(s)", iteration), goalOutcomeResumable)
 				return true
 			}
 			if errors.Is(err, errSessionPersistence) {
-				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", err))
+				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", err), goalOutcomeFinal)
 				return false
 			}
 			var toolFailure fatalToolFailure
 			if errors.As(err, &toolFailure) {
-				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: fatal tool failure: %v", toolFailure))
+				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: fatal tool failure: %v", toolFailure), goalOutcomeFinal)
 				return false
 			}
-			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: provider or tool failure: %v", err))
+			// Context-overflow errors that failed recovery or hit the
+			// compaction cap are recoverable: advance the recovery streak
+			// instead of terminating with a final provider failure.
+			if providers.IsContextOverflowError(err) {
+				if session.autoCompactionCount >= maxGoalAutoCompactions {
+					terminalGoalStatus(fmt.Sprintf("[goal] incomplete: auto-compaction limit reached after %d iteration(s)", iteration), goalOutcomeResumable)
+					return false
+				}
+				recoveryStreak++
+				if recoveryStreak >= maxConsecutiveGoalRecoveries {
+					terminalGoalStatus(fmt.Sprintf("[goal] incomplete: recovery limit reached after %d iteration(s); %d consecutive overflow-recovery failure(s)", iteration, recoveryStreak), goalOutcomeResumable)
+					return false
+				}
+				continue
+			}
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: provider or tool failure: %v", err), goalOutcomeFinal)
 			return false
 		}
 		if stopped || ctx.Err() != nil {
 			if persistErr := a.saveGoalSession(session); persistErr != nil {
-				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
+				terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr), goalOutcomeFinal)
 				return false
 			}
-			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: cancelled after %d iteration(s)", iteration))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: cancelled after %d iteration(s)", iteration), goalOutcomeResumable)
 			return true
 		}
 		if persistErr := a.saveGoalSession(session); persistErr != nil {
-			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr), goalOutcomeFinal)
 			return false
 		}
 		current := cloneTodos(session.todos)
 		if len(current) == 0 {
-			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: checklist is empty after iteration %d", iteration))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: checklist is empty after iteration %d", iteration), goalOutcomeFinal)
 			return false
 		}
 		if cancelled, ok := firstCancelledTodo(current); ok {
-			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: checklist item %q was cancelled", cancelled.ID))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: checklist item %q was cancelled", cancelled.ID), goalOutcomeFinal)
 			return false
 		}
 		if todosComplete(current) {
 			if validGoalCompletion(session.activeGoal, current) {
 				if persistErr := a.saveGoalSession(session); persistErr != nil {
-					terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr))
+					terminalGoalStatus(fmt.Sprintf("[goal] incomplete: session persistence failure: %v", persistErr), goalOutcomeFinal)
 					return false
 				}
 				session.goalCompleted = true
-				terminalGoalStatus(fmt.Sprintf("[goal] complete after %d iteration(s): %s", iteration, session.activeGoal.Completion.Summary))
+				terminalGoalStatus(fmt.Sprintf("[goal] complete after %d iteration(s): %s", iteration, session.activeGoal.Completion.Summary), goalOutcomeFinal)
 				return false
 			}
 			a.writeInteractiveSystem(fmt.Sprintf("[goal] incomplete: checklist is complete after iteration %d, but the complete_goal handshake is missing or stale; continuing", iteration))
 		}
-		if session.runtime.hadRecoverableToolError() {
+		// Evaluate progress before incrementing the safeguard counters.
+		// A changed authoritative checklist, successful non-control tool
+		// activity, or a successful overflow recovery means the iteration
+		// made real progress, so it resets both the recoverable-error
+		// streak and the unchanged-checklist streak. Error-only
+		// turns advance only the recovery streak; genuine no-op turns advance
+		// only the stall streak. Both paths remain bounded by their existing
+		// thresholds and terminal messages.
+		checklistChanged := !equalTodos(previous, current)
+		hadActivity := session.runtime.hadGoalActivity()
+		switch {
+		case checklistChanged || hadActivity || overflowRecoveryOK:
+			// Authoritative progress or successful overflow recovery
+			// resets both safeguard counters before their guards are
+			// evaluated.
+			recoveryStreak = 0
+			unchanged = 0
+		case session.runtime.hadRecoverableToolError():
+			// Error-only turns advance only the recovery streak; the stall
+			// streak is preserved so mixed error/no-op sequences remain
+			// bounded by the stall guard as well.
 			recoveryStreak++
-		} else {
+		default:
+			// Genuine no-op turns advance only the stall streak.
+			unchanged++
 			recoveryStreak = 0
 		}
 		if recoveryStreak >= maxConsecutiveGoalRecoveries {
-			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: recovery limit reached after %d iteration(s); %d consecutive recoverable tool-error turn(s)", iteration, recoveryStreak))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: recovery limit reached after %d iteration(s); %d consecutive recoverable tool-error turn(s)", iteration, recoveryStreak), goalOutcomeResumable)
 			return false
 		}
-		if equalTodos(previous, current) {
-			unchanged++
-		} else {
-			unchanged = 0
-		}
 		if unchanged >= 2 {
-			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: stalled after %d iteration(s); checklist did not change", iteration))
+			terminalGoalStatus(fmt.Sprintf("[goal] incomplete: stalled after %d iteration(s); checklist did not change", iteration), goalOutcomeResumable)
 			return false
 		}
 		previous = current
 	}
-	terminalGoalStatus(fmt.Sprintf("[goal] incomplete: iteration limit reached (%d)", goalProfile.MaxGoalIterations))
+	terminalGoalStatus(fmt.Sprintf("[goal] incomplete: iteration limit reached (%d)", goalProfile.MaxGoalIterations), goalOutcomeResumable)
 	return false
 }
 
@@ -571,6 +616,26 @@ const goalParallelismGuidance = "When subagent tools are available and the work 
 const goalContinuationPrompt = "Continue working toward the objective. Make concrete progress on the next incomplete checklist item, then update the authoritative checklist with verified status. When every item is complete, call complete_goal with a non-empty summary and evidence list. Do not claim success while any checklist item remains incomplete. " + goalParallelismGuidance
 
 const maxConsecutiveGoalRecoveries = 3
+
+// maxGoalAutoCompactions is the upper bound on automatic compactions within a
+// single goal run. Exhausting the cap ends with the resumable outcome.
+const maxGoalAutoCompactions = 3
+
+// goalResumeGuidance makes the recovery distinction explicit at every
+// incomplete terminal outcome: bare /goal resumes the current incomplete
+// objective, while /goal <objective> starts a fresh generation and checklist.
+const goalResumeGuidance = "Resume the current objective with bare /goal; /goal <objective> starts a fresh generation and checklist."
+
+// goalOutcomeKind classifies a terminal goal outcome. Bounded, resumable
+// outcomes (cancellation, recovery limit, stall, iteration limit) append the
+// resume-versus-fresh-start guidance; final failure and completion outcomes
+// stay explicit without it.
+type goalOutcomeKind bool
+
+const (
+	goalOutcomeResumable goalOutcomeKind = true
+	goalOutcomeFinal     goalOutcomeKind = false
+)
 
 var errSessionPersistence = errors.New("session persistence failure")
 

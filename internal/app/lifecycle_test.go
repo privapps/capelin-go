@@ -565,7 +565,7 @@ func TestGoalStopsAfterTwoUnchangedIncompleteSnapshots(t *testing.T) {
 		t.Fatal("stalled goal unexpectedly stopped the REPL")
 	}
 	if got := len(testApp.userPrompts()); got != 6 {
-		t.Fatalf("stalled goal made %d turns, want 5", got)
+		t.Fatalf("stalled goal made %d turns, want 6", got)
 	}
 }
 func mustJSONQuote(raw []byte) []byte {

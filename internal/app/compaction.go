@@ -44,9 +44,9 @@ func (a *app) compactInteractiveSession(ctx context.Context, session *interactiv
 	if session.runtime != nil && session.runtime.model != "" {
 		model, reasoning = session.runtime.model, session.runtime.reasoning
 	}
-	summary, err := (&agent.Engine{Provider: a.client.agentProvider()}).Compact(ctx, agent.CompactOptions{
+	summary, err := (&agent.Engine{Provider: a.client.agentProvider()}).CompactWithinBudget(ctx, agent.CompactOptions{
 		Messages: messages, Model: model, Reasoning: reasoning, Sink: a.sink, AgentID: rootAgentID,
-	})
+	}, agent.DefaultCompactionBudget())
 	if err != nil {
 		return err
 	}
@@ -62,6 +62,20 @@ func (a *app) compactInteractiveSession(ctx context.Context, session *interactiv
 }
 
 var errNothingToCompact = errors.New("nothing to compact")
+
+// estimateConversationSize returns an approximate character count of the
+// messages slice plus the pending user question. The estimate is intentionally
+// conservative: it sums the byte length of every message's Content field and
+// adds the question length. Tool calls, roles, and wire-envelope overhead are
+// excluded so the estimate is a lower bound. The proactive context-budget
+// compaction uses this to decide whether to compact before the provider call.
+func estimateConversationSize(messages []contracts.Message, question string) int {
+	size := len(question)
+	for _, msg := range messages {
+		size += len(msg.Content)
+	}
+	return size
+}
 
 func firstSystemMessage(messages []contracts.Message) *contracts.Message {
 	for _, message := range messages {

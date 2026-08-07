@@ -1,6 +1,7 @@
 package app
 
 import (
+	"capelin-go/internal/output"
 	"capelin-go/internal/server"
 	"capelin-go/internal/skills"
 	"capelin-go/internal/tools"
@@ -622,8 +623,8 @@ func TestSubagentLifecycleAndAggregation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newApp: %v", err)
 	}
-	a.subagents.runner = func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
-		return "done: " + session.Question, nil
+	a.subagents.runner = func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
+		return "done: " + session.Question, false, nil
 	}
 
 	createCall := types.ToolCall{
@@ -690,6 +691,337 @@ func TestSubagentLifecycleAndAggregation(t *testing.T) {
 	}
 }
 
+func TestAwaitSubagentDisplaysCompletedResult(t *testing.T) {
+	var events []string
+	a := &app{
+		cfg: config{
+			workspaceRoot: t.TempDir(),
+			allowedTools: map[string]bool{
+				toolCreateSubagent: true,
+				toolRunSubagent:    true,
+				toolAwaitSubagent:  true,
+			},
+		},
+		sink: &spySink{onSystem: func(message string) { events = append(events, message) }},
+	}
+	a.subagents = newSubagentManager(defaultSubagentRuntimeConfig(), func(context.Context, *agentRuntime, *subagentSession) (string, bool, error) {
+		return "child result", false, nil
+	})
+	root := a.rootRuntime()
+
+	createdRaw, err := a.runToolForRuntime(context.Background(), root, types.ToolCall{
+		Function: types.FunctionCall{
+			Name:      toolCreateSubagent,
+			Arguments: `{"name":"worker-a","question":"inspect repo"}`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create_subagent: %v", err)
+	}
+	var created subagentEnvelope
+	if err := json.Unmarshal([]byte(createdRaw), &created); err != nil {
+		t.Fatalf("decode created subagent: %v", err)
+	}
+
+	if _, err := a.runToolForRuntime(context.Background(), root, types.ToolCall{
+		Function: types.FunctionCall{
+			Name:      toolRunSubagent,
+			Arguments: fmt.Sprintf(`{"id":%q}`, created.ID),
+		},
+	}); err != nil {
+		t.Fatalf("run_subagent: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("running subagent emitted output before completion: %v", events)
+	}
+
+	if _, err := a.runToolForRuntime(context.Background(), root, types.ToolCall{
+		Function: types.FunctionCall{
+			Name:      toolAwaitSubagent,
+			Arguments: fmt.Sprintf(`{"id":%q}`, created.ID),
+		},
+	}); err != nil {
+		t.Fatalf("await_subagent: %v", err)
+	}
+
+	if got, want := events, []string{"[subagent worker-a] child result"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("displayed subagent output = %v, want %v", got, want)
+	}
+}
+
+func TestCompletedSubagentResultIsDisplayedOnce(t *testing.T) {
+	var events []string
+	a := &app{
+		cfg: config{
+			workspaceRoot: t.TempDir(),
+			allowedTools: map[string]bool{
+				toolCreateSubagent: true,
+				toolRunSubagent:    true,
+				toolAwaitSubagent:  true,
+			},
+		},
+		sink: &spySink{onSystem: func(message string) { events = append(events, message) }},
+	}
+	a.subagents = newSubagentManager(defaultSubagentRuntimeConfig(), func(context.Context, *agentRuntime, *subagentSession) (string, bool, error) {
+		return "child result", false, nil
+	})
+	root := a.rootRuntime()
+	createdRaw, err := a.runToolForRuntime(context.Background(), root, types.ToolCall{
+		Function: types.FunctionCall{
+			Name:      toolCreateSubagent,
+			Arguments: `{"name":"worker-a","question":"inspect repo"}`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create_subagent: %v", err)
+	}
+	var created subagentEnvelope
+	if err := json.Unmarshal([]byte(createdRaw), &created); err != nil {
+		t.Fatalf("decode created subagent: %v", err)
+	}
+
+	if _, err := a.runToolForRuntime(context.Background(), root, types.ToolCall{
+		Function: types.FunctionCall{
+			Name:      toolRunSubagent,
+			Arguments: fmt.Sprintf(`{"id":%q,"wait":true}`, created.ID),
+		},
+	}); err != nil {
+		t.Fatalf("run_subagent: %v", err)
+	}
+	if _, err := a.runToolForRuntime(context.Background(), root, types.ToolCall{
+		Function: types.FunctionCall{
+			Name:      toolAwaitSubagent,
+			Arguments: fmt.Sprintf(`{"id":%q}`, created.ID),
+		},
+	}); err != nil {
+		t.Fatalf("await_subagent: %v", err)
+	}
+
+	if got, want := events, []string{"[subagent worker-a] child result"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("displayed subagent output = %v, want exactly one event %v", got, want)
+	}
+}
+
+func TestFinalOnlySuppressesCompletedSubagentResult(t *testing.T) {
+	var events []string
+	base := &spySink{onSystem: func(message string) { events = append(events, message) }}
+	a := &app{
+		cfg: config{
+			workspaceRoot: t.TempDir(),
+			allowedTools: map[string]bool{
+				toolCreateSubagent: true,
+				toolRunSubagent:    true,
+				toolAwaitSubagent:  true,
+			},
+		},
+		sink: output.NewFinalOnlySink(base, rootAgentID),
+	}
+	a.subagents = newSubagentManager(defaultSubagentRuntimeConfig(), func(context.Context, *agentRuntime, *subagentSession) (string, bool, error) {
+		return "child result", false, nil
+	})
+	root := a.rootRuntime()
+	createdRaw, err := a.runToolForRuntime(context.Background(), root, types.ToolCall{
+		Function: types.FunctionCall{
+			Name:      toolCreateSubagent,
+			Arguments: `{"name":"worker-a","question":"inspect repo"}`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create_subagent: %v", err)
+	}
+	var created subagentEnvelope
+	if err := json.Unmarshal([]byte(createdRaw), &created); err != nil {
+		t.Fatalf("decode created subagent: %v", err)
+	}
+	if _, err := a.runToolForRuntime(context.Background(), root, types.ToolCall{
+		Function: types.FunctionCall{
+			Name:      toolRunSubagent,
+			Arguments: fmt.Sprintf(`{"id":%q,"wait":true}`, created.ID),
+		},
+	}); err != nil {
+		t.Fatalf("run_subagent: %v", err)
+	}
+
+	if len(events) != 0 {
+		t.Fatalf("final-only sink exposed subagent output: %v", events)
+	}
+}
+
+func TestNestedSubagentResultDoesNotLeakToRootSink(t *testing.T) {
+	var events []string
+	a := &app{
+		cfg: config{
+			workspaceRoot: t.TempDir(),
+			allowedTools: map[string]bool{
+				toolCreateSubagent: true,
+				toolRunSubagent:    true,
+				toolAwaitSubagent:  true,
+			},
+		},
+		sink: &spySink{onSystem: func(message string) { events = append(events, message) }},
+	}
+	a.subagents = newSubagentManager(defaultSubagentRuntimeConfig(), func(context.Context, *agentRuntime, *subagentSession) (string, bool, error) {
+		return "nested result", false, nil
+	})
+	root := a.rootRuntime()
+	createdRaw, err := a.runToolForRuntime(context.Background(), root, types.ToolCall{
+		Function: types.FunctionCall{
+			Name:      toolCreateSubagent,
+			Arguments: `{"name":"worker-a","question":"inspect repo"}`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create_subagent: %v", err)
+	}
+	var created subagentEnvelope
+	if err := json.Unmarshal([]byte(createdRaw), &created); err != nil {
+		t.Fatalf("decode created subagent: %v", err)
+	}
+	if _, err := a.runToolForRuntime(context.Background(), root, types.ToolCall{
+		Function: types.FunctionCall{
+			Name:      toolRunSubagent,
+			Arguments: fmt.Sprintf(`{"id":%q}`, created.ID),
+		},
+	}); err != nil {
+		t.Fatalf("run_subagent: %v", err)
+	}
+
+	nested := &agentRuntime{sessionID: rootAgentID, depth: 1, allowedTools: root.allowedTools}
+	if _, err := a.runToolForRuntime(context.Background(), nested, types.ToolCall{
+		Function: types.FunctionCall{
+			Name:      toolAwaitSubagent,
+			Arguments: fmt.Sprintf(`{"id":%q}`, created.ID),
+		},
+	}); err != nil {
+		t.Fatalf("nested await_subagent: %v", err)
+	}
+
+	if len(events) != 0 {
+		t.Fatalf("nested subagent output leaked to root sink: %v", events)
+	}
+}
+
+func TestUnsuccessfulSubagentResultsAreNotDisplayed(t *testing.T) {
+	tests := []struct {
+		name   string
+		result string
+		err    error
+	}{
+		{name: "empty completed result"},
+		{name: "failed result", result: "failed output", err: errors.New("worker failed")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var events []string
+			a := &app{
+				cfg: config{
+					workspaceRoot: t.TempDir(),
+					allowedTools: map[string]bool{
+						toolCreateSubagent: true,
+						toolRunSubagent:    true,
+						toolAwaitSubagent:  true,
+					},
+				},
+				sink: &spySink{onSystem: func(message string) { events = append(events, message) }},
+			}
+			a.subagents = newSubagentManager(defaultSubagentRuntimeConfig(), func(context.Context, *agentRuntime, *subagentSession) (string, bool, error) {
+				return tt.result, false, tt.err
+			})
+			root := a.rootRuntime()
+			createdRaw, err := a.runToolForRuntime(context.Background(), root, types.ToolCall{
+				Function: types.FunctionCall{
+					Name:      toolCreateSubagent,
+					Arguments: `{"name":"worker-a","question":"inspect repo"}`,
+				},
+			})
+			if err != nil {
+				t.Fatalf("create_subagent: %v", err)
+			}
+			var created subagentEnvelope
+			if err := json.Unmarshal([]byte(createdRaw), &created); err != nil {
+				t.Fatalf("decode created subagent: %v", err)
+			}
+			if _, err := a.runToolForRuntime(context.Background(), root, types.ToolCall{
+				Function: types.FunctionCall{
+					Name:      toolRunSubagent,
+					Arguments: fmt.Sprintf(`{"id":%q,"wait":true}`, created.ID),
+				},
+			}); err != nil {
+				t.Fatalf("run_subagent: %v", err)
+			}
+
+			if len(events) != 0 {
+				t.Fatalf("unsuccessful subagent emitted output: %v", events)
+			}
+		})
+	}
+}
+
+// TestSubagentIterationLimitSurfacesInEnvelope proves that the runner's
+// truncation signal reaches the parent through the awaited session and its
+// JSON envelope, while a clean run keeps the field absent (omitempty).
+func TestSubagentIterationLimitSurfacesInEnvelope(t *testing.T) {
+	m := newSubagentManager(defaultSubagentRuntimeConfig(), func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
+		return "worker output", true, nil
+	})
+	root := &agentRuntime{
+		sessionID:         rootAgentID,
+		depth:             0,
+		allowedTools:      map[string]bool{toolCreateSubagent: true, toolRunSubagent: true, toolAwaitSubagent: true},
+		maxToolIterations: 5,
+	}
+	created, err := m.create(context.Background(), root, createSubagentArgs{Question: "work", ExecutionMode: "parallel"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := m.run(context.Background(), root, runSubagentArgs{ID: created.ID, Wait: false}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	done, err := m.await(context.Background(), root, awaitSubagentArgs{ID: created.ID, TimeoutSeconds: 5})
+	if err != nil {
+		t.Fatalf("await: %v", err)
+	}
+	if done.Status != subagentStatusCompleted {
+		t.Fatalf("status = %q, want completed", done.Status)
+	}
+	if !done.IterationLimitReached {
+		t.Fatal("expected iteration_limit_reached on the awaited session")
+	}
+	raw, err := json.Marshal(m.snapshotLocked(done, true))
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	if !strings.Contains(string(raw), "iteration_limit_reached") || !strings.Contains(string(raw), `"status":"completed"`) {
+		t.Fatalf("envelope does not expose the truncation marker: %s", raw)
+	}
+
+	// A clean run leaves the marker false and omitted from the envelope JSON.
+	clean := newSubagentManager(defaultSubagentRuntimeConfig(), func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
+		return "clean output", false, nil
+	})
+	createdClean, err := clean.create(context.Background(), root, createSubagentArgs{Question: "clean", ExecutionMode: "parallel"})
+	if err != nil {
+		t.Fatalf("clean create: %v", err)
+	}
+	if _, err := clean.run(context.Background(), root, runSubagentArgs{ID: createdClean.ID, Wait: false}); err != nil {
+		t.Fatalf("clean run: %v", err)
+	}
+	doneClean, err := clean.await(context.Background(), root, awaitSubagentArgs{ID: createdClean.ID, TimeoutSeconds: 5})
+	if err != nil {
+		t.Fatalf("clean await: %v", err)
+	}
+	if doneClean.IterationLimitReached {
+		t.Fatal("clean run unexpectedly reported the iteration-limit marker")
+	}
+	rawClean, err := json.Marshal(clean.snapshotLocked(doneClean, true))
+	if err != nil {
+		t.Fatalf("marshal clean envelope: %v", err)
+	}
+	if strings.Contains(string(rawClean), "iteration_limit_reached") {
+		t.Fatalf("clean envelope should omit the truncation marker: %s", rawClean)
+	}
+}
+
 func TestSubagentPolicyInheritancePreventsEscalation(t *testing.T) {
 	parentAllowed := map[string]bool{
 		toolListFiles: true,
@@ -705,8 +1037,8 @@ func TestSubagentMaxDepthAndChildren(t *testing.T) {
 	cfg := defaultSubagentRuntimeConfig()
 	cfg.MaxDepth = 1
 	cfg.MaxChildren = 1
-	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
-		return "ok", nil
+	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
+		return "ok", false, nil
 	})
 	root := &agentRuntime{
 		sessionID:         rootAgentID,
@@ -740,14 +1072,14 @@ func TestSubagentCreateDoesNotWaitForChildSlot(t *testing.T) {
 	cfg.MaxDepth = 1
 	cfg.MaxChildren = 1
 	cfg.DefaultTimeoutSec = 2
-	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
 		timer := time.NewTimer(120 * time.Millisecond)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
-			return "ok", nil
+			return "ok", false, nil
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", false, ctx.Err()
 		}
 	})
 	root := &agentRuntime{
@@ -784,9 +1116,9 @@ func TestSubagentCreateOverflowReturnsBoundedCapacityPromptly(t *testing.T) {
 	cfg.MaxChildren = 1
 	cfg.MaxParallel = 4
 	cfg.DefaultTimeoutSec = 120
-	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
 		<-ctx.Done()
-		return "", ctx.Err()
+		return "", false, ctx.Err()
 	})
 	root := &agentRuntime{
 		sessionID:         rootAgentID,
@@ -818,8 +1150,8 @@ func TestSubagentCreateOverflowDoesNotWaitForCancelledContext(t *testing.T) {
 	cfg.MaxDepth = 1
 	cfg.MaxChildren = 1
 	cfg.MaxParallel = 1
-	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
-		return "ok", nil
+	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
+		return "ok", false, nil
 	})
 	root := &agentRuntime{
 		sessionID:         rootAgentID,
@@ -852,8 +1184,8 @@ func TestSubagentCreateFailFastOverflowMode(t *testing.T) {
 	cfg := defaultSubagentRuntimeConfig()
 	cfg.MaxDepth = 1
 	cfg.MaxChildren = 1
-	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
-		return "ok", nil
+	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
+		return "ok", false, nil
 	})
 	root := &agentRuntime{
 		sessionID:         rootAgentID,
@@ -882,7 +1214,7 @@ func TestSubagentParallelBoundedWorkerPool(t *testing.T) {
 
 	var concurrent atomic.Int64
 	var peak atomic.Int64
-	m.runner = func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+	m.runner = func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
 		now := concurrent.Add(1)
 		for {
 			currentPeak := peak.Load()
@@ -892,7 +1224,7 @@ func TestSubagentParallelBoundedWorkerPool(t *testing.T) {
 		}
 		time.Sleep(80 * time.Millisecond)
 		concurrent.Add(-1)
-		return "ok", nil
+		return "ok", false, nil
 	}
 
 	root := &agentRuntime{
@@ -925,8 +1257,8 @@ func TestSubagentParallelBoundedWorkerPool(t *testing.T) {
 func TestRunSubagentPreservesCreatedExecutionMode(t *testing.T) {
 	cfg := defaultSubagentRuntimeConfig()
 	cfg.MaxDepth = 1
-	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
-		return "mode=" + session.ExecutionMode, nil
+	m := newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
+		return "mode=" + session.ExecutionMode, false, nil
 	})
 	root := &agentRuntime{
 		sessionID: rootAgentID,
@@ -1577,10 +1909,10 @@ func TestSubagentExecutionUsesConfiguredModelAndReasoning(t *testing.T) {
 	}
 
 	var capturedModel, capturedReasoning string
-	a.subagents.runner = func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+	a.subagents.runner = func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
 		capturedModel = runtime.model
 		capturedReasoning = runtime.reasoning
-		return "ok", nil
+		return "ok", false, nil
 	}
 
 	root := a.rootRuntime()
@@ -1622,9 +1954,9 @@ func TestSubagentExecutionInheritsRootModelWhenNotConfigured(t *testing.T) {
 	}
 
 	var capturedModel string
-	a.subagents.runner = func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+	a.subagents.runner = func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
 		capturedModel = runtime.model
-		return "ok", nil
+		return "ok", false, nil
 	}
 
 	root := a.rootRuntime()
@@ -2458,6 +2790,58 @@ func TestFormatToolCallDisplayUsesBoundedSemanticArguments(t *testing.T) {
 func TestFormatToolCallDisplayUsesReadableKeyValueArguments(t *testing.T) {
 	if got, want := formatToolCallDisplay("list_files", `{"path":".","recursive":true}`), "[tool] list_files path=. recursive=true\n"; got != want {
 		t.Fatalf("unexpected tool display: got %q, want %q", got, want)
+	}
+}
+
+func TestFormatToolResultDisplaySuccessWithDetail(t *testing.T) {
+	if got, want := formatToolResultDisplay("read_file", false, "123 lines"), "[tool] read_file ok: 123 lines\n"; got != want {
+		t.Fatalf("unexpected tool result display: got %q, want %q", got, want)
+	}
+}
+
+func TestFormatToolResultDisplaySuccessWithoutDetail(t *testing.T) {
+	if got, want := formatToolResultDisplay("read_file", false, ""), "[tool] read_file ok\n"; got != want {
+		t.Fatalf("unexpected tool result display: got %q, want %q", got, want)
+	}
+}
+
+func TestFormatToolResultDisplayFailureWithDetail(t *testing.T) {
+	if got, want := formatToolResultDisplay("read_file", true, "permission denied"), "[tool] read_file failed: permission denied\n"; got != want {
+		t.Fatalf("unexpected tool result display: got %q, want %q", got, want)
+	}
+}
+
+func TestFormatToolResultDisplayFailureWithoutDetail(t *testing.T) {
+	if got, want := formatToolResultDisplay("read_file", true, ""), "[tool] read_file failed\n"; got != want {
+		t.Fatalf("unexpected tool result display: got %q, want %q", got, want)
+	}
+}
+
+func TestFormatToolResultDisplayIsBoundedAndUtf8Safe(t *testing.T) {
+	got := formatToolResultDisplay("read_file", false, strings.Repeat("é", 200))
+
+	if !strings.HasPrefix(got, "[tool] read_file ok: ") || !strings.HasSuffix(got, "...\n") {
+		t.Fatalf("unexpected bounded tool result display: %q", got)
+	}
+	if len([]rune(strings.TrimSuffix(got, "\n"))) != toolDisplayMaxChars {
+		t.Fatalf("expected %d displayed runes, got %d", toolDisplayMaxChars, len([]rune(strings.TrimSuffix(got, "\n"))))
+	}
+}
+
+func TestFormatToolResultDisplayIsBoundedOnFailurePath(t *testing.T) {
+	got := formatToolResultDisplay("read_file", true, strings.Repeat("é", 200))
+
+	if !strings.HasPrefix(got, "[tool] read_file failed: ") || !strings.HasSuffix(got, "...\n") {
+		t.Fatalf("unexpected bounded failure display: %q", got)
+	}
+	if len([]rune(strings.TrimSuffix(got, "\n"))) != toolDisplayMaxChars {
+		t.Fatalf("expected %d displayed runes, got %d", toolDisplayMaxChars, len([]rune(strings.TrimSuffix(got, "\n"))))
+	}
+}
+
+func TestFormatToolResultDisplaySanitizesControlCharacters(t *testing.T) {
+	if got, want := formatToolResultDisplay("read_file", false, "a\nb\x00c"), "[tool] read_file ok: a b c\n"; got != want {
+		t.Fatalf("unexpected sanitized tool result display: got %q, want %q", got, want)
 	}
 }
 

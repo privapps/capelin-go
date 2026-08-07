@@ -231,12 +231,17 @@ func TestGoalPersistenceFailureIsFatalIncomplete(t *testing.T) {
 }
 
 func TestGoalStopsAfterThreeConsecutiveRecoverableTurns(t *testing.T) {
+	// Each iteration is error-only: a recoverable tool error plus an unchanged
+	// checklist-management replacement. The identical update_todos call is a
+	// control-plane operation, so it must not count as successful activity, and
+	// the unchanged checklist must not count as progress. Three such turns
+	// still exhaust the bounded recovery budget.
 	responses := make([]string, 0, maxConsecutiveGoalRecoveries*2)
 	for i := 1; i <= maxConsecutiveGoalRecoveries; i++ {
 		responses = append(responses,
 			chatTurnResponse("", "", []map[string]any{
 				goalToolCall("bad", "unknown_tool", `{}`),
-				goalToolCall("todo", toolUpdateTodos, goalTodosArguments("work "+string(rune('0'+i)), "pending")),
+				goalToolCall("todo", toolUpdateTodos, goalTodosArguments("work", "pending")),
 			}),
 			chatTurnResponse("still working", "", nil),
 		)

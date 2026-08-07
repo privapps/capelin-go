@@ -111,6 +111,7 @@ type agentRuntime struct {
 	executionProfile  RuntimeProfile
 	model             string
 	reasoning         string
+	emitOutput        bool
 }
 
 // RuntimeProfile carries the selected application budget into a child-agent
@@ -157,8 +158,13 @@ type subagentSession struct {
 	Error           string
 	Output          string
 	OutputTruncated bool
-	profile         RuntimeProfile
-	limits          subagentRuntimeConfig
+	// IterationLimitReached records that the child's turn engine exhausted its
+	// tool-iteration budget and had to force a final answer. The child still
+	// completes normally; the flag lets the parent distinguish a finished task
+	// from one that was cut off at the turn limit.
+	IterationLimitReached bool
+	profile               RuntimeProfile
+	limits                subagentRuntimeConfig
 
 	started   bool
 	parentCtx context.Context // inherited from the parent agent's run() call
@@ -169,9 +175,13 @@ type subagentSession struct {
 	// execution. It is set when run_subagent starts the child so the existing
 	// create-then-run timeout behavior remains intact.
 	queueDeadline time.Time
+	// emitOutput carries the inherited emit policy for this session. It is
+	// set from the parent at creation time and refreshed at queue time so a
+	// session created in one turn reflects the turn that actually executes it.
+	emitOutput bool
 }
 
-type subagentRunner func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error)
+type subagentRunner func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error)
 
 type subagentManager struct {
 	cfg    subagentRuntimeConfig
@@ -220,6 +230,9 @@ type Runtime struct {
 	ExecutionProfile  RuntimeProfile
 	Model             string
 	Reasoning         string
+	// EmitOutput mirrors the parent turn's emit policy so the engine gates
+	// child content, tool, and status events through the shared output sink.
+	EmitOutput bool
 }
 
 func internalRuntime(runtime *Runtime) *agentRuntime {
@@ -235,6 +248,7 @@ func internalRuntime(runtime *Runtime) *agentRuntime {
 		executionProfile:  runtime.ExecutionProfile,
 		model:             runtime.Model,
 		reasoning:         runtime.Reasoning,
+		emitOutput:        runtime.EmitOutput,
 	}
 }
 
@@ -251,6 +265,7 @@ func publicRuntime(runtime *agentRuntime) *Runtime {
 		ExecutionProfile:  runtime.executionProfile,
 		Model:             runtime.model,
 		Reasoning:         runtime.reasoning,
+		EmitOutput:        runtime.emitOutput,
 	}
 }
 
@@ -268,7 +283,7 @@ type CancelArgs = cancelSubagentArgs
 type Envelope = subagentEnvelope
 type AggregateEnvelope = subagentAggregateEnvelope
 
-type Runner func(context.Context, *Runtime, *Session) (string, error)
+type Runner func(context.Context, *Runtime, *Session) (string, bool, error)
 
 // Manager owns child-agent lifecycle, visibility, limits, scheduling, and
 // result aggregation. Application code supplies only the runner adapter.
@@ -277,9 +292,9 @@ type Manager struct{ core *subagentManager }
 // New constructs a subagent manager behind the capability seam.
 func New(cfg Config, runner Runner) *Manager {
 	manager := &Manager{}
-	manager.core = newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, error) {
+	manager.core = newSubagentManager(cfg, func(ctx context.Context, runtime *agentRuntime, session *subagentSession) (string, bool, error) {
 		if runner == nil {
-			return "", errors.New("subagent runner is nil")
+			return "", false, errors.New("subagent runner is nil")
 		}
 		return runner(ctx, publicRuntime(runtime), session)
 	})
@@ -474,6 +489,7 @@ func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args
 		CreatedAt:     now,
 		Status:        subagentStatusPending,
 		done:          make(chan struct{}),
+		emitOutput:    parent.emitOutput,
 	}
 	if session.ExecutionMode == "" {
 		if limits.MaxParallel > 1 {
@@ -538,6 +554,7 @@ func (m *subagentManager) run(ctx context.Context, parent *agentRuntime, args ru
 	session.started = true
 	session.ExecutionMode = mode
 	session.Status = subagentStatusQueued
+	session.emitOutput = parent.emitOutput
 	session.queueDeadline = time.Now().Add(session.Timeout)
 	if args.Wait {
 		session.parentCtx = ctx
@@ -739,8 +756,9 @@ func (m *subagentManager) execute(session *subagentSession) {
 		executionProfile:  session.profile,
 		model:             session.limits.Model,
 		reasoning:         session.limits.ReasoningEffort,
+		emitOutput:        session.emitOutput,
 	}
-	output, runErr := m.runner(execCtx, runtime, cloneSession(session))
+	output, iterationLimitReached, runErr := m.runner(execCtx, runtime, cloneSession(session))
 
 	// Capture context error BEFORE cancel() since cancel() sets execCtx.Err() to context.Canceled
 	execCtxErr := execCtx.Err()
@@ -751,6 +769,7 @@ func (m *subagentManager) execute(session *subagentSession) {
 	session.cancel = nil
 	session.FinishedAt = time.Now().UTC()
 	session.Output, session.OutputTruncated = truncateText(output, session.limits.MaxResultChars)
+	session.IterationLimitReached = iterationLimitReached && runErr == nil
 
 	switch {
 	case errors.Is(execCtxErr, context.DeadlineExceeded):
@@ -948,18 +967,19 @@ func (m *subagentManager) snapshotLocked(session *subagentSession, includeOutput
 	slices.Sort(allowedTools)
 
 	snap := subagentEnvelope{
-		ID:              session.ID,
-		Name:            session.Name,
-		ParentID:        session.ParentID,
-		Role:            string(session.Role),
-		Depth:           session.Depth,
-		Status:          string(session.Status),
-		ExecutionMode:   session.ExecutionMode,
-		TimeoutSeconds:  int(session.Timeout.Seconds()),
-		AllowedTools:    allowedTools,
-		CreatedAt:       session.CreatedAt.Format(time.RFC3339Nano),
-		OutputTruncated: session.OutputTruncated,
-		Error:           session.Error,
+		ID:                    session.ID,
+		Name:                  session.Name,
+		ParentID:              session.ParentID,
+		Role:                  string(session.Role),
+		Depth:                 session.Depth,
+		Status:                string(session.Status),
+		ExecutionMode:         session.ExecutionMode,
+		TimeoutSeconds:        int(session.Timeout.Seconds()),
+		AllowedTools:          allowedTools,
+		CreatedAt:             session.CreatedAt.Format(time.RFC3339Nano),
+		OutputTruncated:       session.OutputTruncated,
+		IterationLimitReached: session.IterationLimitReached,
+		Error:                 session.Error,
 	}
 	if !session.StartedAt.IsZero() {
 		snap.StartedAt = session.StartedAt.Format(time.RFC3339Nano)
@@ -1068,7 +1088,11 @@ type subagentEnvelope struct {
 	FinishedAt      string   `json:"finished_at,omitempty"`
 	Output          string   `json:"output,omitempty"`
 	OutputTruncated bool     `json:"output_truncated"`
-	Error           string   `json:"error,omitempty"`
+	// IterationLimitReached tells the parent that the child's turn engine ran
+	// out of tool iterations and produced a forced final answer. Omitted when
+	// false so existing envelope consumers are unaffected.
+	IterationLimitReached bool   `json:"iteration_limit_reached,omitempty"`
+	Error                 string `json:"error,omitempty"`
 }
 
 type subagentAggregateEnvelope struct {
@@ -1156,12 +1180,17 @@ func cloneSession(in *subagentSession) *subagentSession {
 		Error:           in.Error,
 		Output:          in.Output,
 		OutputTruncated: in.OutputTruncated,
-		profile:         in.profile,
-		limits:          in.limits,
-		started:         in.started,
-		parentCtx:       in.parentCtx,
-		done:            in.done,
-		cancel:          in.cancel,
+		// The truncation marker is a completed-run property: clones created
+		// before execution starts carry the zero value, and the executing
+		// goroutine publishes the final value on the real session.
+		IterationLimitReached: in.IterationLimitReached,
+		profile:               in.profile,
+		limits:                in.limits,
+		started:               in.started,
+		parentCtx:             in.parentCtx,
+		done:                  in.done,
+		cancel:                in.cancel,
+		emitOutput:            in.emitOutput,
 	}
 }
 

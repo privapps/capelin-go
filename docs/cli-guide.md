@@ -53,6 +53,9 @@ Use `--final-only` when another program needs clean output:
 ```
 
 Intermediate tool messages are hidden, but the assistant still uses the tools it is allowed to use.
+In normal terminal mode, completed direct subagent final responses are printed
+once when the parent awaits them; `--final-only` suppresses those intermediate
+results as well.
 
 ### See request details
 
@@ -108,10 +111,12 @@ Every ordinary line is sent as a new turn. Follow-up questions can refer to earl
   session. It also shows a deterministic label, recent direct input, message
   count, update timestamp, and checklist progress. `/session-resume [ID|PREFIX]`
   switches to an exact ID, unique prefix, or newest valid snapshot.
-- `/goal <objective>` starts a fresh checklist-driven objective, while bare
-  `/goal` continues an incomplete checklist. Clear conversational requests such
-  as `finish the goal` also continue a persisted active goal. These commands
-  require `--yolo`.
+- `/goal <objective>` starts a fresh objective generation and checklist:
+  prior completion claims and the previous checklist are not inherited as the
+  new objective's authoritative plan. Bare `/goal` resumes the current
+  incomplete objective with its persisted checklist and any work already
+  recorded. Clear conversational requests such as `finish the goal` also
+  continue a persisted active goal. These commands require `--yolo`.
 
 Sessions are persisted atomically in `.capelin-go/sessions/`. Use
 `--resume [ID|PREFIX]` with `-i` to resume at startup; a bare `--resume` picks
@@ -130,7 +135,11 @@ requests another continuation and eventually reports an explicit incomplete
 safeguard outcome. Later checklist changes and new objectives invalidate prior
 claims. Deterministic tool errors—such as a missing path, invalid arguments, a
 disabled tool, or a failed command—are returned to the model as recoverable
-results. Provider failures, parent cancellation, persistence failures, and
+results. A goal iteration that changes the checklist or produces successful
+tool work (inspections, edits, or verification commands) resets the recovery
+and stall streaks; only error-only turns and no-op turns advance the bounded
+recovery and stall safeguards. Provider failures, parent cancellation,
+persistence failures, and
 unrecoverable runtime errors stop with an explicit incomplete outcome while
 retaining the active objective for bare `/goal` resume. Tool-scoped timeouts
 retain one bounded retry. While an accepted goal turn is active, Capelin emits

@@ -34,4 +34,8 @@ func formatToolCallDisplay(toolName, args string) string {
 	return output.FormatToolCallDisplay(toolName, args)
 }
 
+func formatToolResultDisplay(toolName string, isError bool, detail string) string {
+	return output.FormatToolResultDisplay(toolName, isError, detail)
+}
+
 var _ contracts.OutputSink = (*finalOnlySink)(nil)

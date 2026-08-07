@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const rootAgentID = "root"
@@ -110,6 +111,7 @@ type agentRuntime struct {
 	executionProfile  configpkg.RuntimeProfile
 	model             string
 	reasoning         string
+	emitOutput        bool
 
 	todosMu        sync.RWMutex
 	todos          []todoItem
@@ -121,6 +123,20 @@ type agentRuntime struct {
 	goalEnabled    bool
 	goalGeneration uint64
 	goalClaim      *goalCompletion
+	// goalToolActivity is the transient per-goal-iteration liveness signal,
+	// set only by successful non-control tool results, reset at the start of
+	// each goal iteration, and never persisted.
+	goalToolActivity atomic.Bool
+	// displayedSubagents is transient terminal-rendering state. It prevents a
+	// result observed through run_subagent(wait=true) from being rendered again
+	// when the caller subsequently awaits the same child.
+	displayedSubagentsMu sync.Mutex
+	displayedSubagents   map[string]struct{}
+	// iterationLimitReached records that the most recent turn engine run on
+	// this runtime exhausted its tool-iteration budget. It is transient,
+	// scoped to one turn, and consumed by the subagent runner to publish the
+	// truncation marker on the child session.
+	iterationLimitReached atomic.Bool
 }
 
 // selectExecutionProfile changes only this runtime's value profile and
@@ -215,6 +231,74 @@ func (r *agentRuntime) hadRecoverableToolError() bool {
 	r.toolErrorMu.Lock()
 	defer r.toolErrorMu.Unlock()
 	return r.recoveryErr != nil
+}
+
+// resetGoalActivity clears the transient per-iteration liveness flag. The goal
+// runner calls it before each iteration so activity is scoped to one turn.
+func (r *agentRuntime) resetGoalActivity() {
+	if r == nil {
+		return
+	}
+	r.goalToolActivity.Store(false)
+}
+
+// recordSuccessfulToolActivity marks the current goal iteration as containing
+// real work. Only successful non-control tool results may call it; failed
+// commands, tool errors, and control-plane calls never do.
+func (r *agentRuntime) recordSuccessfulToolActivity() {
+	if r == nil {
+		return
+	}
+	r.goalToolActivity.Store(true)
+}
+
+func (r *agentRuntime) hadGoalActivity() bool {
+	if r == nil {
+		return false
+	}
+	return r.goalToolActivity.Load()
+}
+
+func (r *agentRuntime) claimSubagentDisplay(id string) bool {
+	if r == nil || strings.TrimSpace(id) == "" {
+		return false
+	}
+	r.displayedSubagentsMu.Lock()
+	defer r.displayedSubagentsMu.Unlock()
+	if r.displayedSubagents == nil {
+		r.displayedSubagents = make(map[string]struct{})
+	}
+	if _, ok := r.displayedSubagents[id]; ok {
+		return false
+	}
+	r.displayedSubagents[id] = struct{}{}
+	return true
+}
+
+// resetIterationLimit clears the per-turn truncation marker before a turn
+// engine run. The marker is consumed by the subagent runner after the run
+// returns, so a fresh turn must never inherit a stale exhaustion signal.
+func (r *agentRuntime) resetIterationLimit() {
+	if r == nil {
+		return
+	}
+	r.iterationLimitReached.Store(false)
+}
+
+// recordIterationLimit marks the current turn as truncated by the engine's
+// tool-iteration budget. Only the engine's OnIterationLimit hook may call it.
+func (r *agentRuntime) recordIterationLimit() {
+	if r == nil {
+		return
+	}
+	r.iterationLimitReached.Store(true)
+}
+
+func (r *agentRuntime) hadIterationLimit() bool {
+	if r == nil {
+		return false
+	}
+	return r.iterationLimitReached.Load()
 }
 
 func (r *agentRuntime) enableGoal(generation uint64) {
@@ -315,7 +399,7 @@ const (
 
 type subagentSession = subagents.Session
 
-type subagentRunner func(context.Context, *agentRuntime, *subagentSession) (string, error)
+type subagentRunner func(context.Context, *agentRuntime, *subagentSession) (string, bool, error)
 
 type subagentManager struct {
 	cfg    subagentRuntimeConfig
@@ -325,9 +409,9 @@ type subagentManager struct {
 
 func newSubagentManager(cfg subagentRuntimeConfig, runner subagentRunner) *subagentManager {
 	m := &subagentManager{cfg: cfg, runner: runner}
-	m.core = subagents.New(cfg, func(ctx context.Context, runtime *subagents.Runtime, session *subagents.Session) (string, error) {
+	m.core = subagents.New(cfg, func(ctx context.Context, runtime *subagents.Runtime, session *subagents.Session) (string, bool, error) {
 		if m.runner == nil {
-			return "", errors.New("subagent runner is nil")
+			return "", false, errors.New("subagent runner is nil")
 		}
 		return m.runner(ctx, appRuntime(runtime), appSession(session))
 	})
@@ -348,6 +432,7 @@ func appRuntime(runtime *subagents.Runtime) *agentRuntime {
 		executionProfile:  profile,
 		model:             runtime.Model,
 		reasoning:         runtime.Reasoning,
+		emitOutput:        runtime.EmitOutput,
 	}
 }
 
@@ -364,6 +449,7 @@ func subagentRuntime(runtime *agentRuntime) *subagents.Runtime {
 		ExecutionProfile:  toSubagentProfile(runtime.executionProfile),
 		Model:             runtime.model,
 		Reasoning:         runtime.reasoning,
+		EmitOutput:        runtime.emitOutput,
 	}
 }
 

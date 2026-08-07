@@ -243,6 +243,7 @@ func cloneInteractiveRuntime(runtime *agentRuntime) *agentRuntime {
 		executionProfile:  runtime.executionProfile,
 		model:             runtime.model,
 		reasoning:         runtime.reasoning,
+		emitOutput:        runtime.emitOutput,
 		todos:             runtime.snapshotTodos(),
 	}
 	return clone

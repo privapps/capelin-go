@@ -52,7 +52,7 @@ func TestApplicationToolBatchAdmitsAndRunsTenSubagentsWithinBounds(t *testing.T)
 			profilesResolved: true,
 		},
 	}
-	a.subagents = newSubagentManager(toSubagentConfig(profile.Subagents), func(ctx context.Context, _ *agentRuntime, session *subagentSession) (string, error) {
+	a.subagents = newSubagentManager(toSubagentConfig(profile.Subagents), func(ctx context.Context, _ *agentRuntime, session *subagentSession) (string, bool, error) {
 		started.Add(1)
 		current := running.Add(1)
 		updatePeak(current)
@@ -61,9 +61,9 @@ func TestApplicationToolBatchAdmitsAndRunsTenSubagentsWithinBounds(t *testing.T)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
-			return "completed:" + session.ID, nil
+			return "completed:" + session.ID, false, nil
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", false, ctx.Err()
 		}
 	})
 	root := &agentRuntime{
@@ -280,22 +280,22 @@ func TestApplicationBatchTerminalOutcomesReleaseCapacityForRetry(t *testing.T) {
 			profile.Subagents.MaxTimeoutSec = 2
 			release := make(chan struct{})
 			started := make(chan string, 1)
-			a, _, capability := newBatchSchedulingApp(t, profile, func(ctx context.Context, _ *agentRuntime, session *subagentSession) (string, error) {
+			a, _, capability := newBatchSchedulingApp(t, profile, func(ctx context.Context, _ *agentRuntime, session *subagentSession) (string, bool, error) {
 				if session.Question == "first" {
 					started <- session.ID
 					switch test.name {
 					case "completed":
 						<-release
-						return "first complete", nil
+						return "first complete", false, nil
 					case "failed":
 						<-release
-						return "", errors.New("controlled child failure")
+						return "", false, errors.New("controlled child failure")
 					default:
 						<-ctx.Done()
-						return "", ctx.Err()
+						return "", false, ctx.Err()
 					}
 				}
-				return "retryable child complete", nil
+				return "retryable child complete", false, nil
 			})
 			ctx := context.Background()
 			first := batchEnvelope(t, capability.Run(ctx, []contracts.ToolCall{
@@ -339,16 +339,16 @@ func TestApplicationBatchCancellationFinalizesQueuedWorkAndReleasesCapacity(t *t
 	profile := batchSchedulingProfile()
 	firstStarted := make(chan struct{})
 	secondStarted := atomic.Int64{}
-	a, _, capability := newBatchSchedulingApp(t, profile, func(ctx context.Context, _ *agentRuntime, session *subagentSession) (string, error) {
+	a, _, capability := newBatchSchedulingApp(t, profile, func(ctx context.Context, _ *agentRuntime, session *subagentSession) (string, bool, error) {
 		if session.Question == "first" {
 			close(firstStarted)
 			<-ctx.Done()
-			return "", ctx.Err()
+			return "", false, ctx.Err()
 		}
 		if session.Question == "second" {
 			secondStarted.Add(1)
 		}
-		return "unexpected execution", nil
+		return "unexpected execution", false, nil
 	})
 	parentCtx, cancelParent := context.WithCancel(context.Background())
 	first := batchEnvelope(t, capability.Run(parentCtx, []contracts.ToolCall{
@@ -382,8 +382,8 @@ func TestApplicationBatchCancellationFinalizesQueuedWorkAndReleasesCapacity(t *t
 }
 
 func TestApplicationCancelledCreateDoesNotAdmitAnOrphan(t *testing.T) {
-	a, _, capability := newBatchSchedulingApp(t, batchSchedulingProfile(), func(context.Context, *agentRuntime, *subagentSession) (string, error) {
-		return "unexpected execution", nil
+	a, _, capability := newBatchSchedulingApp(t, batchSchedulingProfile(), func(context.Context, *agentRuntime, *subagentSession) (string, bool, error) {
+		return "unexpected execution", false, nil
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -404,20 +404,20 @@ func TestApplicationQueuedChildDeadlineFinalizesBeforeExecution(t *testing.T) {
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	secondStarted := atomic.Int64{}
-	a, _, capability := newBatchSchedulingApp(t, profile, func(ctx context.Context, _ *agentRuntime, session *subagentSession) (string, error) {
+	a, _, capability := newBatchSchedulingApp(t, profile, func(ctx context.Context, _ *agentRuntime, session *subagentSession) (string, bool, error) {
 		if session.Question == "first" {
 			close(firstStarted)
 			select {
 			case <-releaseFirst:
-				return "first complete", nil
+				return "first complete", false, nil
 			case <-ctx.Done():
-				return "", ctx.Err()
+				return "", false, ctx.Err()
 			}
 		}
 		if session.Question == "second" {
 			secondStarted.Add(1)
 		}
-		return "unexpected execution", nil
+		return "unexpected execution", false, nil
 	})
 
 	first := batchEnvelope(t, capability.Run(context.Background(), []contracts.ToolCall{
@@ -455,12 +455,12 @@ func TestApplicationBatchListingAndAggregateExposeSchedulerStates(t *testing.T) 
 	profile.Subagents.MaxParallel = 1
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
-	a, _, capability := newBatchSchedulingApp(t, profile, func(_ context.Context, _ *agentRuntime, session *subagentSession) (string, error) {
+	a, _, capability := newBatchSchedulingApp(t, profile, func(_ context.Context, _ *agentRuntime, session *subagentSession) (string, bool, error) {
 		if session.Question == "running" {
 			close(firstStarted)
 			<-releaseFirst
 		}
-		return "done", nil
+		return "done", false, nil
 	})
 	create := func(id, question string) subagentEnvelope {
 		return batchEnvelope(t, capability.Run(context.Background(), []contracts.ToolCall{

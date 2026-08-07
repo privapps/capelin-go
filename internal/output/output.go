@@ -84,16 +84,16 @@ func FormatToolCallDisplay(toolName, args string) string {
 	return TruncateDisplay(line, toolDisplayMaxChars) + "\n"
 }
 
-// FormatToolResultDisplay formats a bounded completion or error diagnostic.
+// FormatToolResultDisplay formats a bounded completion or failure diagnostic.
 func FormatToolResultDisplay(toolName string, isError bool, detail string) string {
 	line := "[tool] " + sanitizeDisplay(toolName)
 	if isError {
-		line += " error"
-		if detail = sanitizeDisplay(detail); detail != "" {
-			line += ": " + detail
-		}
+		line += " failed"
 	} else {
-		line += " done"
+		line += " ok"
+	}
+	if detail = sanitizeDisplay(detail); detail != "" {
+		line += ": " + detail
 	}
 	return TruncateDisplay(line, toolDisplayMaxChars) + "\n"
 }

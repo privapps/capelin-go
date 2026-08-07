@@ -61,6 +61,11 @@ type RunOptions struct {
 	// ContinuationState is opaque to the engine. Stateful providers validate it
 	// and either restore their native wire state or rebuild from Messages.
 	ContinuationState *contracts.ContinuationState
+	// OnIterationLimit is invoked once when the tool-iteration budget is
+	// exhausted, before the forced final-answer call. It lets the embedding
+	// application record truncation for runs whose output is not visible
+	// (subagent sessions), where the diagnostic message itself is suppressed.
+	OnIterationLimit func()
 }
 
 // Result contains the conversation and observable answer produced by a turn.
@@ -166,10 +171,16 @@ func (e *Engine) Run(ctx context.Context, options RunOptions) (Result, error) {
 		reasoning.AddToolCalls(iter+1, results, options.ToolSummary)
 	}
 
-	if !options.FinalOnly {
+	if !options.FinalOnly && options.EmitOutput {
 		// Keep this diagnostic on stderr in the application sink rather than
-		// making the protocol adapters aware of turn limits.
+		// making the protocol adapters aware of turn limits. Runs that do not
+		// emit output (subagent sessions sharing the parent's sink) stay
+		// silent: their truncation belongs in their tool results, not the
+		// parent's event stream.
 		sink.WriteSystem(agentID, "[capelin-go] Maximum tool iterations ("+itoa(maxIterations)+") reached; requesting final answer.")
+	}
+	if options.OnIterationLimit != nil {
+		options.OnIterationLimit()
 	}
 	e.Provider.AppendFinalPrompt(state)
 	response, err := e.completeWithRetry(ctx, state, RunOptions{
@@ -181,7 +192,7 @@ func (e *Engine) Run(ctx context.Context, options RunOptions) (Result, error) {
 		if lastContent != "" {
 			return Result{Messages: state.Messages(), Answer: lastContent, Reasoning: reasoning.String(), ContinuationState: exportContinuationState(e.Provider, state)}, nil
 		}
-		return Result{Messages: state.Messages(), ContinuationState: exportContinuationState(e.Provider, state)}, errorf("exceeded maximum tool iterations (%d) and final-answer call failed: %v", maxIterations, err)
+		return Result{Messages: state.Messages(), ContinuationState: exportContinuationState(e.Provider, state)}, errorf("exceeded maximum tool iterations (%d) and final-answer call failed: %w", maxIterations, err)
 	}
 	if content := trim(response.Content()); content != "" {
 		if options.EmitOutput {
