@@ -93,6 +93,21 @@ when entered at the REPL.
   time, and checklist progress. `/session-resume [ID|PREFIX]` switches to an exact,
   unique-prefix, or newest saved session.
 
+Local status commands use the reserved `::` namespace. They are answered
+locally from current state: they never reach the model, never append
+conversation history, never change the checklist, and never persist output, so
+they also work while a turn or `/goal` is running.
+
+- `::session` prints the current session's full persisted UUID (never
+  shortened, so it can be pasted into `--resume` or `/session-resume`). It
+  accepts no arguments and reports a clear local message when no session is
+  available.
+- `::todos` shows the committed checklist, or the live worker checklist while a
+  turn is active.
+- `::agents` shows the coordinator/subagent tree with aggregate status counts
+  (`-f`/`--full` disables question truncation). `::agent` is a deprecated alias.
+- `::stats` shows portable process and runtime diagnostics.
+
 - `/goal <objective>` — start a fresh bounded objective generation and checklist; prior completion claims and the previous checklist are not inherited; requires `--yolo`
 - `/goal` — resume the current incomplete objective with its persisted checklist and any work already recorded; requires `--yolo`
 
@@ -132,7 +147,7 @@ cancellation, persistence failures, stalled checklist progress, and
 unrecoverable runtime errors are reported as incomplete and remain resumable
 with bare `/goal`. During an accepted goal, Capelin emits an immediate
 iteration status and a generic working heartbeat while a turn is active (about
-five seconds initially, then every ten seconds), including total and
+five seconds initially, then every thirty seconds), including total and
 current-turn elapsed time. Configure the outer limit independently with
 `--max-goal-iterations N` or `MAX_GOAL_ITERATIONS` (ordinary default 20); this
 does not change ordinary `--max-iterations` (default 40). Accepted goals use a
@@ -464,7 +479,11 @@ Endpoints that do not end with `/responses` continue to use Chat Completions. Pr
 Local users can configure `IDLE_HOOK_COMMAND` and `IDLE_HOOK_ARGS` in the
 saved configuration or environment. `IDLE_HOOK_ARGS` is a JSON string array;
 values follow CLI > environment > saved config > built-in defaults precedence.
-A non-empty hook requires `--allow-tool execute_program` or `--yolo`, runs the
+A non-empty hook is granted a dedicated `idle_hook` permission implicitly when
+the hook command is configured (`--yolo` also grants it); it does not require
+`--allow-tool execute_program` and does not grant general program-execution
+permission. Use `--idle-hook COMMAND` to set it for one run and
+`--no-idle-hook` to disable it. The hook runs the
 executable directly without a shell, and retains the normal program safety,
 workspace, timeout, output, and cancellation safeguards. It runs once after a
 local one-shot terminal outcome or finalized interactive turn; interactive
@@ -475,3 +494,9 @@ The hook is strictly local. Server-mode synchronous and asynchronous HTTP
 requests never invoke it, even when the server is started with YOLO or
 program-execution permission. Server tool restrictions and HTTP delivery
 contracts are unchanged.
+
+`IDLE_HOOK_TIMEOUT` bounds one hook run in seconds (default `5`); invalid or
+non-positive values keep the default. Separately, `AGENT_QUESTION_PREVIEW_MAX`
+(default `160`) sets the rune budget for bounded previews such as agent
+questions and the goal heartbeat `current todo` field; it is parsed by
+`internal/config` and wired into the output layer at startup.

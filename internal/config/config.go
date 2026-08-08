@@ -116,10 +116,13 @@ type Config struct {
 	ServerSecurityEnabled     bool
 	IdleHookCommand           string
 	IdleHookArgs              []string
-	ToolMaxParallel           int  // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
-	ToolTimeoutSec            int  // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
-	ToolRetryOnTimeout        bool // retry once on timeout (0 = disable; empty = default true)
-	ContextWindow             int  // optional conversation budget in characters; 0 = disabled (reactive-only recovery)
+	IdleHookTimeout           int
+	NoIdleHook                bool
+	IdleHookSource            string // "" or "cli"/"env"/"saved"
+	ToolMaxParallel           int    // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
+	ToolTimeoutSec            int    // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
+	ToolRetryOnTimeout        bool   // retry once on timeout (0 = disable; empty = default true)
+	ContextWindow             int    // optional conversation budget in characters; 0 = disabled (reactive-only recovery)
 	AsyncTimeout              time.Duration
 	Debug                     bool
 	profileSources            profileSources
@@ -145,6 +148,11 @@ const (
 	defaultSubagentAggregateCount    = 12
 	defaultSubagentAggregateChars    = 12000
 )
+
+// defaultAgentQuestionPreviewMax mirrors internal/output's built-in preview
+// budget. It is the fallback when AGENT_QUESTION_PREVIEW_MAX is unset or not a
+// positive integer.
+const defaultAgentQuestionPreviewMax = 160
 
 type agentRole string
 
@@ -283,6 +291,10 @@ func Load(args []string) (Config, error) {
 	toolTimeoutSec := 0             // zero = "not set by flag"
 	toolRetryOnTimeout := -1        // -1 = "not set by flag"; 0 = explicitly false; 1 = explicitly true
 	contextWindow := 0              // zero = "not set"
+	idleHookFlag := ""
+	idleHookFlagSet := false
+	noIdleHook := false
+	idleHookTimeout := 5
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -585,6 +597,18 @@ func Load(args []string) (Config, error) {
 			numericFlags["CONTEXT_WINDOW"] = true
 		case arg == "--debug" || arg == "-debug":
 			debug = true
+		case arg == "--no-idle-hook":
+			noIdleHook = true
+		case arg == "--idle-hook":
+			if i+1 >= len(args) {
+				return Config{}, errors.New("--idle-hook requires a value")
+			}
+			i++
+			idleHookFlag = strings.TrimSpace(args[i])
+			idleHookFlagSet = true
+		case strings.HasPrefix(arg, "--idle-hook="):
+			idleHookFlag = strings.TrimSpace(strings.TrimPrefix(arg, "--idle-hook="))
+			idleHookFlagSet = true
 		case strings.HasPrefix(arg, "-"):
 			return Config{}, fmt.Errorf("unknown flag %q", arg)
 		default:
@@ -600,16 +624,39 @@ func Load(args []string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	idleHookEnv, idleHookEnvPresent := os.LookupEnv("IDLE_HOOK_COMMAND")
+	if strings.TrimSpace(idleHookEnv) == "" {
+		idleHookEnvPresent = false
+	}
 	idleHookCommand := ""
+	idleHookSource := ""
 	var idleHookArgs []string
 	if !serverMode {
-		idleHookCommand = readCfg("IDLE_HOOK_COMMAND", fileCfg, "")
+		savedHook := readCfg("IDLE_HOOK_COMMAND", fileCfg, "")
+		switch {
+		case idleHookFlagSet:
+			idleHookCommand = idleHookFlag
+			idleHookSource = "cli"
+		case idleHookEnvPresent:
+			idleHookCommand = idleHookEnv
+			idleHookSource = "env"
+		case strings.TrimSpace(savedHook) != "":
+			idleHookCommand = savedHook
+			idleHookSource = "saved"
+		}
 		idleHookArgs, err = readIdleHookArgs(idleHookCommand, fileCfg)
 		if err != nil {
 			return Config{}, err
 		}
-		if strings.TrimSpace(idleHookCommand) != "" && !yolo && !allowedTools[policy.ExecuteProgram] {
-			return Config{}, errors.New("IDLE_HOOK_COMMAND requires execute_program permission; start with --allow-tool execute_program or --yolo")
+		if noIdleHook {
+			idleHookCommand = ""
+			idleHookArgs = nil
+			idleHookSource = ""
+		}
+	}
+	if v, ok := os.LookupEnv("IDLE_HOOK_TIMEOUT"); ok {
+		if n, e := parsePositiveInt(v, "IDLE_HOOK_TIMEOUT"); e == nil && n > 0 {
+			idleHookTimeout = n
 		}
 	}
 	workspaceRoot, err := os.Getwd()
@@ -723,6 +770,9 @@ func Load(args []string) (Config, error) {
 		ServerSecurityEnabled:     serverMode,
 		IdleHookCommand:           idleHookCommand,
 		IdleHookArgs:              idleHookArgs,
+		IdleHookTimeout:           idleHookTimeout,
+		NoIdleHook:                noIdleHook,
+		IdleHookSource:            idleHookSource,
 		ToolMaxParallel:           toolMaxParallel,
 		ToolTimeoutSec:            toolTimeoutSec,
 		ToolRetryOnTimeout:        toolRetryOnTimeout != 0,
@@ -894,6 +944,18 @@ func readReasoningEffort(fileCfg map[string]string) (string, error) {
 		return "", nil
 	}
 	return value, nil
+}
+
+// NormalizeIdleHookSource collapses the idle-hook configuration origin to the
+// only values the rest of the system may observe. An empty source means the
+// hook is unset or disabled; any unrecognized value becomes "unknown".
+func NormalizeIdleHookSource(source string) string {
+	switch source {
+	case "cli", "env", "saved", "":
+		return source
+	default:
+		return "unknown"
+	}
 }
 
 func readIdleHookArgs(command string, fileCfg map[string]string) ([]string, error) {

@@ -118,6 +118,37 @@ Every ordinary line is sent as a new turn. Follow-up questions can refer to earl
   recorded. Clear conversational requests such as `finish the goal` also
   continue a persisted active goal. These commands require `--yolo`.
 
+### Local status commands
+
+The reserved `::` namespace is handled entirely inside Capelin. These commands
+are dispatched before the busy-turn rejection, so they answer immediately even
+while a turn or `/goal` is running. They never send anything to the model,
+never append conversation messages, never change the checklist, never write
+`last-response.md`, and never alter the persisted session snapshot. Tab
+completion offers `::agents`, `::session`, `::stats`, and `::todos`.
+
+- `::session` prints the current session's full persisted UUID, for example
+  `[::session] 3f2b7c1d-9e4a-4a6b-8c2d-5f7e1a2b3c4d`. The value is never
+  shortened, so it can be pasted directly into `--resume <id>` or
+  `/session-resume <id>`. It works during an active turn or goal and reports
+  the same identifier as startup, resume, and exit output. It accepts no
+  arguments: `::session anything` replies
+  `[capelin-go] ::session accepts no arguments`. When no session is available
+  it replies `[::session] no active session is available` instead of failing.
+- `::todos` shows the committed checklist, or the active worker's live
+  checklist (marked `(live)`) while a turn owns the session. It accepts no
+  arguments.
+- `::agents` shows the synthetic root coordinator, the nested subagent tree,
+  previewed questions, descendant counts, and aggregate status counts. `-f` or
+  `--full` shows complete question text. `::agent` still works as a deprecated
+  alias and prints a one-line deprecation note first.
+- `::stats` shows portable process and runtime diagnostics (working folder,
+  model, reasoning effort, OS/arch, Go version, CPUs, goroutines, and memory in
+  grouped kilobytes). It accepts no arguments.
+
+An unrecognized `::` command is also consumed locally and answers with the list
+of available status commands.
+
 Sessions are persisted atomically in `.capelin-go/sessions/`. Use
 `--resume [ID|PREFIX]` with `-i` to resume at startup; a bare `--resume` picks
 the newest valid snapshot. On exit, Capelin prints only the current UUID and a
@@ -144,7 +175,7 @@ unrecoverable runtime errors stop with an explicit incomplete outcome while
 retaining the active objective for bare `/goal` resume. Tool-scoped timeouts
 retain one bounded retry. While an accepted goal turn is active, Capelin emits
 an immediate iteration status and generic working heartbeat (about five
-seconds initially, then every ten seconds) with total and current-turn elapsed
+seconds initially, then every thirty seconds) with total and current-turn elapsed
 time.
 
 The four built-in provider defaults are `ENDPOINT=https://opencode.ai/zen/v1/chat/completions`,
@@ -272,6 +303,10 @@ Common settings:
 | `TOOL_MAX_PARALLEL` | Maximum tools used at the same time | `8` ordinary (`16` goal profile) |
 | `TOOL_TIMEOUT_SECONDS` | Default time allowed for one tool | `60` ordinary (`300` goal profile) |
 | `TOOL_RETRY_ON_TIMEOUT` | Retry a tool once after a timeout | `true` |
+| `IDLE_HOOK_COMMAND` | Local program run when a task or turn goes idle | empty (disabled) |
+| `IDLE_HOOK_ARGS` | Fixed argument vector for the hook, as a JSON string array | empty |
+| `IDLE_HOOK_TIMEOUT` | Seconds allowed for one hook run | `5` |
+| `AGENT_QUESTION_PREVIEW_MAX` | Rune budget for bounded status/question previews (positive integer; invalid values fall back to the default) | `160` |
 
 Set reasoning to `none` or `nil` to leave it out of the request.
 
@@ -348,3 +383,15 @@ These values can be changed with matching `--subagent-*` flags, environment sett
 ## Graceful limits and retries
 
 The assistant retries temporary model failures such as rate limits and server errors. If a task reaches its tool-use limit, Capelin asks for the best final answer using the information collected so far. If the final request also fails, see the [Troubleshooting FAQ](troubleshooting.md).
+
+### Preview budget
+
+`AGENT_QUESTION_PREVIEW_MAX` sets the total display budget, in runes, for the
+bounded previews used by agent questions and the goal heartbeat `current todo`
+field (the budget includes the trailing `… (+N more chars)` suffix). It is parsed
+by `internal/config` and wired into the rendering layer once at startup; the
+rendering package never reads the environment itself. Unset, non-numeric, or
+non-positive values keep the default of `160`.
+
+`IDLE_HOOK_TIMEOUT` bounds a single idle-hook run in seconds (default `5`);
+non-positive or non-numeric values keep the default.

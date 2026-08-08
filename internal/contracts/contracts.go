@@ -142,6 +142,7 @@ type SubagentNode struct {
 	Question string
 	ParentID string
 	Status   string
+	Role     string
 	Depth    int
 }
 

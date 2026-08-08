@@ -487,12 +487,15 @@ func TestIdleHookConfigurationPrecedenceAndValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("permission is required in local mode", func(t *testing.T) {
+	t.Run("saved hook does not require execute_program permission", func(t *testing.T) {
 		path := isolateLoad(t)
 		writeConfig(t, path, map[string]string{"IDLE_HOOK_COMMAND": "hook"})
-		_, err := Load([]string{"task"})
-		if err == nil || !strings.Contains(err.Error(), "execute_program") || !strings.Contains(err.Error(), "--allow-tool") {
-			t.Fatalf("missing actionable hook permission error: %v", err)
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("configured hook must not require execute_program: %v", err)
+		}
+		if cfg.IdleHookCommand != "hook" || cfg.IdleHookSource != "saved" {
+			t.Fatalf("unexpected saved hook resolution: command=%q source=%q", cfg.IdleHookCommand, cfg.IdleHookSource)
 		}
 	})
 }
@@ -537,5 +540,135 @@ func TestServerModeIgnoresLocalIdleHookConfiguration(t *testing.T) {
 	}
 	if cfg.ServerPort != 8899 || !cfg.ServerSecurityEnabled {
 		t.Fatalf("server mode contract changed: port=%d security=%v", cfg.ServerPort, cfg.ServerSecurityEnabled)
+	}
+}
+
+// TestIdleHookImplicitGrantWithoutExecuteProgram proves a configured idle hook
+// no longer requires execute_program or --yolo: the hook is a dedicated
+// idle_hook permission, not a general program-execution grant.
+func TestIdleHookImplicitGrantWithoutExecuteProgram(t *testing.T) {
+	isolateLoad(t)
+	t.Setenv("IDLE_HOOK_COMMAND", "my-hook")
+	cfg, err := Load([]string{"task"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.IdleHookCommand != "my-hook" {
+		t.Fatalf("IdleHookCommand = %q, want %q", cfg.IdleHookCommand, "my-hook")
+	}
+}
+
+// TestIdleHookConfiguresImplicitIdleHookPermission proves the dedicated
+// idle_hook opt-in permission is consumed: it is granted exactly when a local
+// hook command is configured, and never otherwise.
+func TestIdleHookConfiguresImplicitIdleHookPermission(t *testing.T) {
+	t.Run("configured hook grants idle_hook without yolo", func(t *testing.T) {
+		isolateLoad(t)
+		t.Setenv("IDLE_HOOK_COMMAND", "my-hook")
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.AllowedTools[policy.IdleHook] {
+			t.Fatalf("configured hook did not grant %q: %#v", policy.IdleHook, cfg.AllowedTools)
+		}
+		if cfg.Yolo || cfg.AllowedTools[policy.ExecuteProgram] {
+			t.Fatalf("idle hook must not imply execute_program/yolo: yolo=%v allowed=%#v", cfg.Yolo, cfg.AllowedTools)
+		}
+	})
+
+	t.Run("no hook command leaves idle_hook unset", func(t *testing.T) {
+		isolateLoad(t)
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.AllowedTools[policy.IdleHook] {
+			t.Fatalf("%q granted without a configured hook: %#v", policy.IdleHook, cfg.AllowedTools)
+		}
+	})
+
+	t.Run("--no-idle-hook leaves idle_hook unset", func(t *testing.T) {
+		isolateLoad(t)
+		t.Setenv("IDLE_HOOK_COMMAND", "env-hook")
+		cfg, err := Load([]string{"--no-idle-hook", "task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.AllowedTools[policy.IdleHook] {
+			t.Fatalf("--no-idle-hook still granted %q: %#v", policy.IdleHook, cfg.AllowedTools)
+		}
+	})
+
+	t.Run("server mode never grants idle_hook", func(t *testing.T) {
+		path := isolateLoad(t)
+		writeConfig(t, path, map[string]string{"ENDPOINT": defaultEndpoint, "IDLE_HOOK_COMMAND": "server-must-ignore"})
+		t.Setenv("IDLE_HOOK_COMMAND", "environment-hook")
+		cfg, err := Load([]string{"--server-port", "8899"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.AllowedTools[policy.IdleHook] {
+			t.Fatalf("server mode granted %q: %#v", policy.IdleHook, cfg.AllowedTools)
+		}
+	})
+}
+
+func TestNormalizeIdleHookSource(t *testing.T) {
+	for input, want := range map[string]string{
+		"cli": "cli", "env": "env", "saved": "saved", "": "", "bogus": "unknown",
+	} {
+		if got := NormalizeIdleHookSource(input); got != want {
+			t.Fatalf("NormalizeIdleHookSource(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestIdleHookCLIFlagOverridesEnvSource(t *testing.T) {
+	isolateLoad(t)
+	t.Setenv("IDLE_HOOK_COMMAND", "env-hook")
+	cfg, err := Load([]string{"--idle-hook", "cli-hook", "task"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.IdleHookCommand != "cli-hook" {
+		t.Fatalf("IdleHookCommand = %q, want %q", cfg.IdleHookCommand, "cli-hook")
+	}
+	if cfg.IdleHookSource != "cli" {
+		t.Fatalf("IdleHookSource = %q, want %q", cfg.IdleHookSource, "cli")
+	}
+}
+
+func TestNoIdleHookDisablesCommand(t *testing.T) {
+	isolateLoad(t)
+	t.Setenv("IDLE_HOOK_COMMAND", "env-hook")
+	cfg, err := Load([]string{"--no-idle-hook", "task"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.IdleHookCommand != "" {
+		t.Fatalf("IdleHookCommand = %q, want empty", cfg.IdleHookCommand)
+	}
+	if cfg.IdleHookSource != "" {
+		t.Fatalf("IdleHookSource = %q, want empty", cfg.IdleHookSource)
+	}
+}
+
+func TestIdleHookTimeoutDefaultAndEnv(t *testing.T) {
+	isolateLoad(t)
+	cfg, err := Load([]string{"task"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.IdleHookTimeout != 5 {
+		t.Fatalf("default IdleHookTimeout = %d, want 5", cfg.IdleHookTimeout)
+	}
+	t.Setenv("IDLE_HOOK_TIMEOUT", "10")
+	cfg2, err := Load([]string{"task"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg2.IdleHookTimeout != 10 {
+		t.Fatalf("IDLE_HOOK_TIMEOUT=10 gave IdleHookTimeout = %d, want 10", cfg2.IdleHookTimeout)
 	}
 }

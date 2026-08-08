@@ -65,6 +65,25 @@ func (r *interactiveDraftRestorer) wait() {
 	}
 }
 
+// activeWorkerView is a race-safe, read-only handle on the worker session that
+// owns the current interactive turn. Status commands observe the worker
+// through it instead of reading mutable worker session fields directly: the
+// runtime pointer is captured once at publication time and the checklist is
+// read through the runtime's own synchronized snapshot.
+type activeWorkerView struct {
+	runtime *agentRuntime
+}
+
+// todos returns the active worker's live checklist. The second result reports
+// whether a live view was available at all, so callers can fall back to the
+// committed session snapshot rather than rendering a misleading empty list.
+func (v *activeWorkerView) todos() ([]todoItem, bool) {
+	if v == nil || v.runtime == nil {
+		return nil, false
+	}
+	return v.runtime.snapshotTodos(), true
+}
+
 // interactiveTurnController is the single ownership point for an interactive
 // turn. It reserves the session before starting a worker, never queues input,
 // and closes its completion channel only after the worker's state has either
@@ -76,11 +95,51 @@ type interactiveTurnController struct {
 	cancel       context.CancelFunc
 	done         chan struct{}
 	sessionMu    sync.Mutex
+	workerMu     sync.RWMutex
+	worker       *activeWorkerView
 	onBusy       func()
 	onCancelling func()
 	onIdle       func()
 	onComplete   func(interactiveTurnOutcome)
 	onIdleReady  func()
+}
+
+// publishActiveWorker exposes the worker that owns the running turn so local
+// status commands can inspect live state. It is cleared again once the turn
+// has been committed or discarded.
+func (c *interactiveTurnController) publishActiveWorker(worker *interactiveSession) {
+	if c == nil {
+		return
+	}
+	var view *activeWorkerView
+	if worker != nil && worker.runtime != nil {
+		view = &activeWorkerView{runtime: worker.runtime}
+	}
+	c.workerMu.Lock()
+	c.worker = view
+	c.workerMu.Unlock()
+}
+
+// clearActiveWorker drops the published worker view. Status commands then fall
+// back to the committed session snapshot.
+func (c *interactiveTurnController) clearActiveWorker() {
+	if c == nil {
+		return
+	}
+	c.workerMu.Lock()
+	c.worker = nil
+	c.workerMu.Unlock()
+}
+
+// activeWorker returns the published worker view, or nil when no turn owns the
+// session.
+func (c *interactiveTurnController) activeWorker() *activeWorkerView {
+	if c == nil {
+		return nil
+	}
+	c.workerMu.RLock()
+	defer c.workerMu.RUnlock()
+	return c.worker
 }
 
 func newInteractiveTurnController(
@@ -286,12 +345,19 @@ func (a *app) startInteractiveTurn(
 	controller.sessionMu.Lock()
 	workerSession := controller.cloneSession(a, session)
 	controller.sessionMu.Unlock()
+	// Publish the worker before the goroutine starts so a status command
+	// issued immediately after the turn is reserved already observes live
+	// state instead of the committed snapshot.
+	controller.publishActiveWorker(workerSession)
 	go func() {
 		stopped, err := run(workerCtx, workerSession)
 		outcome := interactiveTurnOutcome{session: workerSession, stopped: stopped, err: err}
 		if controller.onComplete != nil {
 			controller.onComplete(outcome)
 		}
+		// The worker's state has now been committed or discarded, so live
+		// inspection must stop and the committed snapshot becomes current.
+		controller.clearActiveWorker()
 		if controller.onIdle != nil {
 			controller.onIdle()
 		}
@@ -365,14 +431,20 @@ func (a *app) handleInteractiveInputAsync(
 	if controller == nil {
 		return a.handleInteractiveInput(ctx, session, rawInput)
 	}
+	input := normalizeInteractiveInput(rawInput)
+	if input == "" {
+		return false
+	}
+	// Local :: status commands are dispatched before the busy-turn rejection so
+	// they can inspect an active turn. Ordinary prompts and existing slash
+	// commands keep their current rejection behavior.
+	if a.handleStatusCommand(session, input, controller.busy(), controller.activeWorker()) {
+		return false
+	}
 	if controller.busy() {
 		if rl != nil {
 			draftRestorer.restore(rl, rawInput)
 		}
-		return false
-	}
-	input := normalizeInteractiveInput(rawInput)
-	if input == "" {
 		return false
 	}
 

@@ -20,6 +20,7 @@ const (
 	AppendFile     = "append_file"
 	ExecuteProgram = "execute_program"
 	ExecuteSkill   = "execute_skill"
+	IdleHook       = "idle_hook"
 	ListSkills     = "list_skills"
 	ReadSkill      = "read_skill"
 	CreateSubagent = "create_subagent"
@@ -39,6 +40,7 @@ var alwaysEnabled = []string{
 
 var optIn = map[string]struct{}{
 	WriteFile: {}, EditFile: {}, AppendFile: {}, ExecuteProgram: {}, ExecuteSkill: {},
+	IdleHook: {},
 }
 
 // AlwaysEnabledTools returns a fresh copy of the baseline safe catalog.

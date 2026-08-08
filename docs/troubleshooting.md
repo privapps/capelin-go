@@ -198,7 +198,7 @@ Set the outer limit independently with `--max-goal-iterations N` or
 `--max-iterations` setting. Accepted goals use a default outer fallback of 64
 iterations (ordinary baseline 20, per-turn goal limit 256). While a goal turn
 is active, the interactive sink reports an immediate iteration status and a
-generic working heartbeat after about five seconds and every ten seconds,
+generic working heartbeat after about five seconds and every thirty seconds,
 including total and current-turn elapsed time. The reporter is informational,
 stops before terminal goal output, and is not persisted in session snapshots.
 

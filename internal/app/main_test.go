@@ -35,6 +35,7 @@ func isolateConfigFile(t *testing.T) {
 
 func TestLoadConfigDefaults(t *testing.T) {
 	isolateConfigFile(t)
+	t.Setenv("ENDPOINT", "")
 	t.Setenv("BASE_URL", "")
 	t.Setenv("MODEL", "")
 	t.Setenv("TOKEN", "")
@@ -1569,6 +1570,10 @@ func TestReasoningEffortNoneOmitted(t *testing.T) {
 }
 
 func TestReasoningEffortNoneCaseInsensitive(t *testing.T) {
+	// Test-isolation repair (recorded): the compatibility readReasoningEffort
+	// reads the environment before the supplied file map, so a developer's
+	// REASONING_EFFORT would override the value under test. Clear it.
+	t.Setenv("REASONING_EFFORT", "")
 	for _, val := range []string{"none", "None", "NONE", "nOnE", "nil", "NIL"} {
 		v, err := readReasoningEffort(map[string]string{"REASONING_EFFORT": val})
 		if err != nil {

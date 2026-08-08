@@ -249,14 +249,14 @@ func TestSubagentStatusQuestionCollapsesWhitespaceAndTruncates(t *testing.T) {
 		{
 			name:    "truncates long question",
 			input:   strings.Repeat("a", 200),
-			wantSub: "...",
-			maxLen:  120,
+			wantSub: "… (+",
+			maxLen:  200,
 		},
 		{
 			name:    "unicode not split",
 			input:   strings.Repeat("é", 200),
-			wantSub: "...",
-			maxLen:  120,
+			wantSub: "… (+",
+			maxLen:  200,
 		},
 	}
 	for _, tc := range tests {

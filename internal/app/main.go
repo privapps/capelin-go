@@ -75,15 +75,21 @@ type config struct {
 	securityEnabled    bool
 	idleHookCommand    string
 	idleHookArgs       []string
+	idleHookTimeoutSec int
+	idleHookSource     string
+	noIdleHook         bool
 	toolMaxParallel    int  // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
 	toolTimeoutSec     int  // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
 	toolRetryOnTimeout bool // retry once on timeout (0 = disable; empty = default true)
 	contextWindow      int  // optional conversation budget in characters; 0 = disabled
-	ordinaryProfile    configpkg.RuntimeProfile
-	goalProfile        configpkg.RuntimeProfile
-	profilesResolved   bool
-	asyncTimeout       time.Duration
-	debug              bool
+	// agentQuestionPreviewMax is the rune budget wired into internal/output at
+	// startup (env AGENT_QUESTION_PREVIEW_MAX; 0 = built-in default 160).
+	agentQuestionPreviewMax int
+	ordinaryProfile         configpkg.RuntimeProfile
+	goalProfile             configpkg.RuntimeProfile
+	profilesResolved        bool
+	asyncTimeout            time.Duration
+	debug                   bool
 }
 
 type app struct {
@@ -209,6 +215,10 @@ func newApp(cfg config) (*app, error) {
 	if cfg.finalOnly {
 		sink = output.NewFinalOnlySink(output.NewStdioSink(), rootAgentID)
 	}
+	// internal/config owns env parsing; wire the resolved preview budget into
+	// the rendering package once, here at the composition root. A non-positive
+	// value restores the built-in default.
+	output.SetPreviewMax(cfg.agentQuestionPreviewMax)
 	instance := &app{
 		cfg: cfg,
 		client: &client{
@@ -234,7 +244,7 @@ func newApp(cfg config) (*app, error) {
 		sink:         sink,
 		sessionStore: sessionStore,
 	}
-	if strings.TrimSpace(cfg.idleHookCommand) != "" {
+	if strings.TrimSpace(cfg.idleHookCommand) != "" && !cfg.noIdleHook {
 		instance.idleHooks = newIdleHookRunner(
 			cfg.idleHookCommand,
 			cfg.idleHookArgs,
@@ -242,7 +252,10 @@ func newApp(cfg config) (*app, error) {
 			cfg.yolo,
 			defaultIdleHookExecutor,
 			os.Stderr,
+			cfg.idleHookTimeoutSec,
 		)
+		fmt.Fprintf(os.Stderr, "[capelin-go] idle hook enabled (command=%q source=%s timeout=%ds)\n",
+			cfg.idleHookCommand, idleHookSourceLabel(cfg.idleHookSource), cfg.idleHookTimeoutSec)
 	}
 	subagentCfg := cfg.subagents
 	instance.subagents = newSubagentManager(subagentCfg, instance.runSubagentSession)
@@ -302,6 +315,9 @@ func loadConfig(args []string) (config, error) {
 		securityEnabled:    parsed.ServerSecurityEnabled,
 		idleHookCommand:    parsed.IdleHookCommand,
 		idleHookArgs:       append([]string(nil), parsed.IdleHookArgs...),
+		idleHookTimeoutSec: parsed.IdleHookTimeout,
+		idleHookSource:     parsed.IdleHookSource,
+		noIdleHook:         parsed.NoIdleHook,
 		toolMaxParallel:    parsed.ToolMaxParallel,
 		toolTimeoutSec:     parsed.ToolTimeoutSec,
 		toolRetryOnTimeout: parsed.ToolRetryOnTimeout,
@@ -793,6 +809,9 @@ func (a *app) handleInteractiveInput(ctx context.Context, session *interactiveSe
 	if input == "" {
 		return false
 	}
+	if a.handleStatusCommand(session, input, false, nil) {
+		return false
+	}
 
 	switch input {
 	case "/exit", "/quit":
@@ -1244,11 +1263,12 @@ func (a *app) runSubagentSession(ctx context.Context, runtime *agentRuntime, ses
 	return answer, runtime.hadIterationLimit(), err
 }
 
-// subagentStatusQuestion collapses whitespace and truncates the displayed
-// question to 120 runes without splitting multi-byte characters.
+// subagentStatusQuestion renders the echoed "running" question through the
+// shared preview helper so the interactive ::agents list view and this line
+// agree on whitespace collapsing and truncation. Preview already collapses
+// internal whitespace and cuts on a grapheme boundary.
 func subagentStatusQuestion(question string) string {
-	collapsed := strings.Join(strings.Fields(question), " ")
-	return output.TruncateDisplay(collapsed, 120)
+	return output.Preview(question, false)
 }
 
 // subagentOutcome maps a run error to a human-readable terminal status word.
@@ -1346,6 +1366,15 @@ func truncateStr(s string, max int) string {
 		return s
 	}
 	return s[:max] + "..."
+}
+
+// idleHookSourceLabel normalizes the configuration-origin value for the startup
+// banner. An empty source means the hook is disabled or unset.
+func idleHookSourceLabel(source string) string {
+	if label := configpkg.NormalizeIdleHookSource(source); label != "" {
+		return label
+	}
+	return "unknown"
 }
 
 // truncateDisplay limits the complete displayed value, including its ellipsis.

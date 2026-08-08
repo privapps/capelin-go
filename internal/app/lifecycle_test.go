@@ -91,6 +91,14 @@ func TestUpdateTodosRejectsInvalidReplacementAndPreservesPrevious(t *testing.T) 
 }
 
 func TestGoalConfigIsIndependentAndRejectsInvalidLimits(t *testing.T) {
+	// Test-isolation repair (recorded): this test loads the real config file
+	// and the environment, so a developer's saved IDLE_HOOK_COMMAND (which
+	// requires execute_program permission) or REASONING_EFFORT would make the
+	// assertion environment-dependent. Isolate both sources deterministically.
+	isolateConfigFile(t)
+	t.Setenv("IDLE_HOOK_COMMAND", "")
+	t.Setenv("IDLE_HOOK_ARGS", "")
+	t.Setenv("REASONING_EFFORT", "")
 	t.Setenv("MAX_GOAL_ITERATIONS", "7")
 	t.Setenv("MAX_ITERATIONS", "3")
 	cfg, err := loadConfig([]string{"-i"})

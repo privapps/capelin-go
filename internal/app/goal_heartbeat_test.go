@@ -2,6 +2,7 @@ package app
 
 import (
 	"capelin-go/internal/contracts"
+	"capelin-go/internal/output"
 	"context"
 	"errors"
 	"io"
@@ -71,6 +72,38 @@ func assertGoalHeartbeatLifecycle(t *testing.T, recorder *goalHeartbeatEventReco
 	time.Sleep(30 * time.Millisecond)
 	if after := recorder.snapshot(); len(after) != eventCount {
 		t.Fatalf("heartbeat emitted after runGoal returned: %v", after[eventCount:])
+	}
+}
+
+// assertGoalHeartbeatSummaryContract asserts the stable recurring heartbeat
+// contract introduced by the compact summary: the "[goal] " prefix and the
+// " working;" lifecycle marker are preserved, total elapsed time is present,
+// and the fields appear in the order todo count -> explicitly named current
+// todo -> agent summary. It also rejects the previous ambiguous bare
+// "current:" label and the verbose per-state subagent breakdown, which now
+// lives only in the ::agents view.
+func assertGoalHeartbeatSummaryContract(t *testing.T, message string) {
+	t.Helper()
+	if !strings.HasPrefix(message, "[goal] iteration ") || !strings.Contains(message, " working;") {
+		t.Fatalf("heartbeat lost its prefix or lifecycle marker: %q", message)
+	}
+	if !strings.Contains(message, "; total elapsed ") {
+		t.Fatalf("heartbeat omitted total elapsed time: %q", message)
+	}
+	todosIndex := strings.Index(message, "; todos ")
+	currentIndex := strings.Index(message, "; current todo")
+	agentsIndex := strings.Index(message, "; subagents ")
+	if todosIndex < 0 || currentIndex < 0 || agentsIndex < 0 {
+		t.Fatalf("heartbeat missing todo/current-todo/agent fields (todos=%d current=%d agents=%d): %q", todosIndex, currentIndex, agentsIndex, message)
+	}
+	if todosIndex >= currentIndex || currentIndex >= agentsIndex {
+		t.Fatalf("heartbeat fields out of order (todos=%d current=%d agents=%d): %q", todosIndex, currentIndex, agentsIndex, message)
+	}
+	if strings.Contains(message, "; current: ") {
+		t.Fatalf("heartbeat still exposes an unlabeled current field: %q", message)
+	}
+	if strings.Contains(message, "states pending=") {
+		t.Fatalf("heartbeat still repeats the ::agents state breakdown: %q", message)
 	}
 }
 
@@ -149,13 +182,15 @@ func TestInteractiveGoalHeartbeatReportsBlockedTurnAndStopsBeforeTerminalStatus(
 	}
 
 	initial := waitForGoalHeartbeatEvent(t, events, "iteration 1/1 working")
+	assertGoalHeartbeatSummaryContract(t, initial)
 	if !strings.Contains(initial, "total elapsed") || !strings.Contains(initial, "current turn elapsed") ||
-		!strings.Contains(initial, "subagents 0 active; states pending=0 queued=0 running=0 completed=0 failed=0 cancelled=0 timed_out=0; todos 0/0 completed; current: none") {
+		!strings.Contains(initial, "todos 0/0 completed; current todo: none; subagents 0 active") {
 		t.Fatalf("immediate goal status omitted elapsed-time fields: %q", initial)
 	}
 	subsequent := waitForGoalHeartbeatEvent(t, events, "iteration 1/1 working")
+	assertGoalHeartbeatSummaryContract(t, subsequent)
 	if !strings.Contains(subsequent, "current turn elapsed") ||
-		!strings.Contains(subsequent, "subagents 0 active; states pending=0 queued=0 running=0 completed=0 failed=0 cancelled=0 timed_out=0; todos 0/0 completed; current: none") {
+		!strings.Contains(subsequent, "todos 0/0 completed; current todo: none; subagents 0 active") {
 		t.Fatalf("subsequent heartbeat omitted current-turn elapsed time: %q", subsequent)
 	}
 
@@ -294,9 +329,13 @@ func TestInteractiveGoalHeartbeatReportsOrderedCurrentChecklistAndActiveSubagent
 	}
 
 	heartbeat := waitForGoalHeartbeatEvent(t, events, "iteration 1/1 working")
-	wantProgress := "subagents 1 active; states pending=1 queued=0 running=0 completed=0 failed=0 cancelled=0 timed_out=0; todos 1/3 completed; current: first item, third item"
+	assertGoalHeartbeatSummaryContract(t, heartbeat)
+	wantProgress := "todos 1/3 completed; current todos: first item (+1 more); subagents 1 active"
 	if !strings.Contains(heartbeat, wantProgress) {
 		t.Fatalf("heartbeat omitted ordered runtime progress: got %q, want substring %q", heartbeat, wantProgress)
+	}
+	if strings.Contains(heartbeat, "third item") {
+		t.Fatalf("heartbeat joined every in-progress todo instead of previewing the first: %q", heartbeat)
 	}
 
 	close(release)
@@ -519,9 +558,10 @@ func TestGoalHeartbeatFormattingHandlesElapsedTimeAndStopIdempotently(t *testing
 	heartbeat.stop()
 	heartbeat.beginIteration(3)
 
-	if len(messages) != 1 || messages[0] != "[goal] iteration 2/64 working; total elapsed 03s; current turn elapsed 00s; subagents 0 active; states pending=0 queued=0 running=0 completed=0 failed=0 cancelled=0 timed_out=0; todos 0/0 completed; current: none" {
+	if len(messages) != 1 || messages[0] != "[goal] iteration 2/64 working; total elapsed 03s; current turn elapsed 00s; todos 0/0 completed; current todo: none; subagents 0 active" {
 		t.Fatalf("unexpected deterministic heartbeat message: %#v", messages)
 	}
+	assertGoalHeartbeatSummaryContract(t, messages[0])
 	if heartbeat.started {
 		t.Fatal("heartbeat unexpectedly restarted after stop")
 	}
@@ -538,6 +578,19 @@ func TestGoalHeartbeatUsesCapturedGoalStartTime(t *testing.T) {
 
 	if len(messages) != 1 || !strings.Contains(messages[0], "total elapsed 03s") {
 		t.Fatalf("heartbeat did not use captured goal start time: %#v", messages)
+	}
+}
+
+func TestGoalHeartbeatDefaultsToThirtySecondRecurringCadence(t *testing.T) {
+	heartbeat := newGoalHeartbeat(func(string) {}, 8, 0, 0)
+	if heartbeat.initialDelay != goalHeartbeatInitialDelay {
+		t.Fatalf("zero initial delay did not fall back to %s: got %s", goalHeartbeatInitialDelay, heartbeat.initialDelay)
+	}
+	if heartbeat.cadence != goalHeartbeatCadence {
+		t.Fatalf("zero cadence did not fall back to the %s default: got %s", goalHeartbeatCadence, heartbeat.cadence)
+	}
+	if goalHeartbeatCadence != 30*time.Second {
+		t.Fatalf("goalHeartbeatCadence constant = %s, want 30s", goalHeartbeatCadence)
 	}
 }
 
@@ -577,10 +630,11 @@ func TestGoalHeartbeatProgressCountsUseOneSnapshotPerHeartbeat(t *testing.T) {
 	if len(messages) != 1 {
 		t.Fatalf("expected one heartbeat, got %d: %#v", len(messages), messages)
 	}
-	want := "[goal] iteration 2/8 working; total elapsed 1m02s; current turn elapsed 00s; subagents 3 active; states pending=1 queued=1 running=1 completed=1 failed=1 cancelled=1 timed_out=1; todos 1/5 completed; current: three item, five"
+	want := "[goal] iteration 2/8 working; total elapsed 1m02s; current turn elapsed 00s; todos 1/5 completed; current todos: three item (+1 more); subagents 3 active"
 	if messages[0] != want {
 		t.Fatalf("unexpected progress heartbeat: %q", messages[0])
 	}
+	assertGoalHeartbeatSummaryContract(t, messages[0])
 	if todoSnapshots != len(messages) || agentSnapshots != len(messages) {
 		t.Fatalf("expected one snapshot per heartbeat, got todos=%d agents=%d heartbeats=%d", todoSnapshots, agentSnapshots, len(messages))
 	}
@@ -607,9 +661,204 @@ func TestGoalHeartbeatFormatsSingleCurrentTodo(t *testing.T) {
 	heartbeat.beginIteration(1)
 	heartbeat.stop()
 
-	want := "[goal] iteration 1/1 working; total elapsed 03s; current turn elapsed 00s; subagents 0 active; states pending=0 queued=0 running=0 completed=0 failed=0 cancelled=0 timed_out=0; todos 0/1 completed; current: verify output"
+	want := "[goal] iteration 1/1 working; total elapsed 03s; current turn elapsed 00s; todos 0/1 completed; current todo: verify output; subagents 0 active"
 	if len(messages) != 1 || messages[0] != want {
 		t.Fatalf("unexpected single-current heartbeat: got %#v, want %q", messages, want)
+	}
+	assertGoalHeartbeatSummaryContract(t, messages[0])
+}
+
+func newDeterministicGoalHeartbeat(t *testing.T, messages *[]string, todos []todoItem, agents []contracts.SubagentNode) *goalHeartbeat {
+	t.Helper()
+	heartbeat := newGoalHeartbeatAt(
+		time.Unix(100, 0),
+		func(message string) { *messages = append(*messages, message) },
+		4,
+		time.Hour,
+		time.Hour,
+		goalHeartbeatProgress{
+			todosSnapshot: func() []todoItem { return todos },
+			agentSnapshot: func() []contracts.SubagentNode { return agents },
+		},
+	)
+	heartbeat.now = func() time.Time { return time.Unix(103, 0) }
+	return heartbeat
+}
+
+// TestGoalHeartbeatOrdersTodoCountBeforeCurrentTodoBeforeAgents pins acceptance
+// criterion 1: todo count, then the named current todo, then the agents field.
+func TestGoalHeartbeatOrdersTodoCountBeforeCurrentTodoBeforeAgents(t *testing.T) {
+	var messages []string
+	heartbeat := newDeterministicGoalHeartbeat(t, &messages, []todoItem{
+		{ID: "done", Content: "done work", Status: todoStatusCompleted},
+		{ID: "active", Content: "active work", Status: todoStatusInProgress},
+	}, []contracts.SubagentNode{{Status: string(subagentStatusRunning)}})
+	heartbeat.beginIteration(1)
+	heartbeat.stop()
+
+	if len(messages) != 1 {
+		t.Fatalf("expected one heartbeat, got %#v", messages)
+	}
+	assertGoalHeartbeatSummaryContract(t, messages[0])
+	want := "todos 1/2 completed; current todo: active work; subagents 1 active"
+	if !strings.Contains(messages[0], want) {
+		t.Fatalf("heartbeat ordering changed: got %q, want substring %q", messages[0], want)
+	}
+}
+
+// TestGoalHeartbeatBoundsLongCurrentTodoPreview pins acceptance criterion 3:
+// the current-todo value is whitespace-normalized and truncated through the
+// shared output.Preview helper instead of being emitted verbatim.
+func TestGoalHeartbeatBoundsLongCurrentTodoPreview(t *testing.T) {
+	t.Cleanup(func() { output.SetPreviewMax(0) })
+	output.SetPreviewMax(40)
+	long := "alpha " + strings.Repeat("beta\tgamma\n", 40)
+	var messages []string
+	heartbeat := newDeterministicGoalHeartbeat(t, &messages, []todoItem{
+		{ID: "long", Content: long, Status: todoStatusInProgress},
+	}, nil)
+	heartbeat.beginIteration(1)
+	heartbeat.stop()
+
+	if len(messages) != 1 {
+		t.Fatalf("expected one heartbeat, got %#v", messages)
+	}
+	message := messages[0]
+	assertGoalHeartbeatSummaryContract(t, message)
+	if strings.Contains(message, "\n") || strings.Contains(message, "\t") {
+		t.Fatalf("heartbeat did not normalize todo whitespace: %q", message)
+	}
+	if !strings.Contains(message, "more chars)") {
+		t.Fatalf("heartbeat did not bound the long todo preview: %q", message)
+	}
+	if strings.Contains(message, long) {
+		t.Fatalf("heartbeat emitted the unbounded todo text: %q", message)
+	}
+	preview := message[strings.Index(message, "; current todo: ")+len("; current todo: ") : strings.Index(message, "; subagents ")]
+	if len([]rune(preview)) > 40 {
+		t.Fatalf("current todo preview exceeded the preview budget (%d runes): %q", len([]rune(preview)), preview)
+	}
+}
+
+// TestGoalHeartbeatSummarizesMultipleInProgressTodos pins acceptance criterion
+// 3 for the multi-item case: the first preview plus an additional-item count,
+// never a full join of every in-progress item.
+func TestGoalHeartbeatSummarizesMultipleInProgressTodos(t *testing.T) {
+	var messages []string
+	heartbeat := newDeterministicGoalHeartbeat(t, &messages, []todoItem{
+		{ID: "one", Content: " first   item ", Status: todoStatusInProgress},
+		{ID: "two", Content: "second item", Status: todoStatusInProgress},
+		{ID: "three", Content: "third item", Status: todoStatusInProgress},
+	}, nil)
+	heartbeat.beginIteration(2)
+	heartbeat.stop()
+
+	if len(messages) != 1 {
+		t.Fatalf("expected one heartbeat, got %#v", messages)
+	}
+	message := messages[0]
+	assertGoalHeartbeatSummaryContract(t, message)
+	if !strings.Contains(message, "current todos: first item (+2 more); subagents 0 active") {
+		t.Fatalf("heartbeat did not summarize multiple in-progress todos: %q", message)
+	}
+	for _, hidden := range []string{"second item", "third item"} {
+		if strings.Contains(message, hidden) {
+			t.Fatalf("heartbeat exposed additional in-progress todo %q: %q", hidden, message)
+		}
+	}
+}
+
+// TestGoalHeartbeatReportsExplicitEmptyCurrentTodo pins acceptance criterion 4:
+// no in-progress todo renders an explicit, singular, todo-scoped empty value
+// that is distinguishable from the agent summary.
+func TestGoalHeartbeatReportsExplicitEmptyCurrentTodo(t *testing.T) {
+	var messages []string
+	heartbeat := newDeterministicGoalHeartbeat(t, &messages, []todoItem{
+		{ID: "one", Content: "done work", Status: todoStatusCompleted},
+		{ID: "two", Content: "waiting work", Status: todoStatusPending},
+	}, []contracts.SubagentNode{{Status: string(subagentStatusRunning)}, {Status: string(subagentStatusCompleted)}})
+	heartbeat.beginIteration(1)
+	heartbeat.stop()
+
+	if len(messages) != 1 {
+		t.Fatalf("expected one heartbeat, got %#v", messages)
+	}
+	message := messages[0]
+	assertGoalHeartbeatSummaryContract(t, message)
+	if !strings.Contains(message, "todos 1/2 completed; current todo: none; subagents 1 active") {
+		t.Fatalf("heartbeat did not report an explicit empty current todo: %q", message)
+	}
+	if strings.Contains(message, "current todos:") {
+		t.Fatalf("empty current todo used the plural label: %q", message)
+	}
+}
+
+// TestGoalHeartbeatRetainsIterationAndElapsedFields pins acceptance criterion
+// 5: iteration, total elapsed, and current-turn elapsed survive the compaction,
+// and the current-turn field disappears only once the turn ends.
+func TestGoalHeartbeatRetainsIterationAndElapsedFields(t *testing.T) {
+	var messages []string
+	heartbeat := newDeterministicGoalHeartbeat(t, &messages, nil, nil)
+	heartbeat.beginIteration(3)
+	heartbeat.emit()
+	heartbeat.endTurn()
+	heartbeat.emit()
+	heartbeat.stop()
+
+	if len(messages) != 3 {
+		t.Fatalf("expected three heartbeats, got %#v", messages)
+	}
+	for _, message := range messages {
+		assertGoalHeartbeatSummaryContract(t, message)
+		if !strings.HasPrefix(message, "[goal] iteration 3/4 working; total elapsed 03s") {
+			t.Fatalf("heartbeat lost iteration or total elapsed time: %q", message)
+		}
+	}
+	for _, message := range messages[:2] {
+		if !strings.Contains(message, "; current turn elapsed 00s;") {
+			t.Fatalf("active-turn heartbeat lost current-turn elapsed time: %q", message)
+		}
+	}
+	if strings.Contains(messages[2], "current turn elapsed") {
+		t.Fatalf("heartbeat reported current-turn elapsed time after the turn ended: %q", messages[2])
+	}
+}
+
+// TestGoalHeartbeatBlankCurrentTodoDoesNotRenderNone pins the blank-todo
+// collision fix: a real in-progress todo whose content is blank or
+// whitespace-only renders the explicit "(blank)" placeholder and must never
+// collapse into "none", which is reserved for having no in-progress todo.
+func TestGoalHeartbeatBlankCurrentTodoDoesNotRenderNone(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		content string
+	}{
+		{name: "empty", content: ""},
+		{name: "whitespace", content: " \t\n  "},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var messages []string
+			heartbeat := newDeterministicGoalHeartbeat(t, &messages, []todoItem{
+				{ID: "blank", Content: testCase.content, Status: todoStatusInProgress},
+			}, nil)
+			heartbeat.beginIteration(1)
+			heartbeat.stop()
+
+			if len(messages) != 1 {
+				t.Fatalf("expected one heartbeat, got %#v", messages)
+			}
+			message := messages[0]
+			assertGoalHeartbeatSummaryContract(t, message)
+			if !strings.Contains(message, "current todo: (blank)") {
+				t.Fatalf("blank in-progress todo did not render the blank placeholder: %q", message)
+			}
+			if strings.Contains(message, "current todo: none") {
+				t.Fatalf("blank in-progress todo collided with the no-current-todo state: %q", message)
+			}
+			if strings.Contains(message, "current todos:") {
+				t.Fatalf("single blank current todo used the plural label: %q", message)
+			}
+		})
 	}
 }
 

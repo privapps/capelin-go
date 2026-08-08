@@ -378,6 +378,7 @@ func (m *subagentManager) ListAll() []contracts.SubagentNode {
 			Question: s.Question,
 			ParentID: s.ParentID,
 			Status:   string(s.Status),
+			Role:     string(s.Role),
 			Depth:    s.Depth,
 		})
 	}

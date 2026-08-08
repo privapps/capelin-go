@@ -254,26 +254,48 @@ func (c *interactiveCompleter) Do(line []rune, pos int) ([][]rune, int) {
 	if tokenStart, prefix, ok := currentSlashToken(line, pos); ok {
 		return completionCandidates(prefix, skillNameCommands, tokenStart, line, pos)
 	}
+	if tokenStart, prefix, ok := currentStatusToken(line, pos); ok {
+		return completionCandidates(prefix, statusCommandNames, tokenStart, line, pos)
+	}
 	if tokenStart, prefix, ok := currentSkillToken(line, pos); ok {
 		return completionCandidates(prefix, c.skillNames, tokenStart, line, pos)
 	}
 	return nil, 0
 }
 
-func currentSlashToken(line []rune, pos int) (start int, prefix string, ok bool) {
+// currentPrefixedToken finds the leading sentinel-prefixed token at the cursor.
+// The slash namespace uses a single sentinel ('/'), while the status namespace
+// uses a double sentinel ('::'). All remaining runes must be sentinel
+// characters or skill-name runes. Both currentSlashToken and
+// currentStatusToken share this scanner so the two namespace rules cannot
+// drift apart.
+func currentPrefixedToken(line []rune, pos int, sentinel rune, double bool) (start int, prefix string, ok bool) {
 	start = pos
 	for start > 0 && !isInteractiveTokenBoundary(line[start-1]) {
 		start--
 	}
-	if start >= pos || line[start] != '/' {
+	if start >= pos || line[start] != sentinel {
 		return 0, "", false
 	}
+	if double {
+		if start+1 >= pos || line[start+1] != sentinel {
+			return 0, "", false
+		}
+	}
 	for _, r := range line[start:pos] {
-		if r != '/' && !isSkillNameRune(r) {
+		if r != sentinel && !isSkillNameRune(r) {
 			return 0, "", false
 		}
 	}
 	return start, string(line[start:pos]), true
+}
+
+func currentSlashToken(line []rune, pos int) (start int, prefix string, ok bool) {
+	return currentPrefixedToken(line, pos, '/', false)
+}
+
+func currentStatusToken(line []rune, pos int) (start int, prefix string, ok bool) {
+	return currentPrefixedToken(line, pos, ':', true)
 }
 
 func currentSkillToken(line []rune, pos int) (start int, prefix string, ok bool) {
@@ -303,6 +325,16 @@ func isEscapedDollar(line []rune, dollar int) bool {
 	return backslashes%2 == 1
 }
 
+// commandCandidateName renders a completion candidate for the non-"$" token
+// prefixes. A "/" prefix normalizes the name to exactly one leading slash; a
+// ":" prefix uses the name verbatim.
+func commandCandidateName(prefix, name string) string {
+	if prefix[0] == '/' {
+		return "/" + strings.TrimPrefix(name, "/")
+	}
+	return name
+}
+
 func completionCandidates(prefix string, names []string, tokenStart int, line []rune, pos int) ([][]rune, int) {
 	if prefix == "" {
 		return nil, 0
@@ -310,8 +342,8 @@ func completionCandidates(prefix string, names []string, tokenStart int, line []
 	result := make([][]rune, 0, len(names))
 	for _, name := range names {
 		candidate := name
-		if prefix[0] == '/' {
-			fullName := "/" + strings.TrimPrefix(name, "/")
+		if prefix[0] == '/' || prefix[0] == ':' {
+			fullName := commandCandidateName(prefix, name)
 			if !strings.HasPrefix(fullName, prefix) {
 				continue
 			}

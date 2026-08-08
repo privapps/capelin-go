@@ -170,7 +170,7 @@ resuming it recomputes the current goal profile, while completing or stopping
 the goal restores ordinary limits for later turns.
 
 During long accepted-goal turns, the existing output sink emits a generic
-working heartbeat after about five seconds and every ten seconds, including
+working heartbeat after about five seconds and every thirty seconds, including
 total and current-turn elapsed time. It stops before terminal goal status
 output and is not persisted.
 
@@ -198,9 +198,12 @@ IDLE_HOOK_ARGS = ["completed", "local"]
 
 Environment values override non-empty saved configuration values, following the
 normal precedence order: CLI flags, environment, saved config, then built-in
-defaults. A blank command disables the hook. A configured hook requires
-`--allow-tool execute_program` or `--yolo`; configuration alone does not grant
-program-execution permission. The executable and arguments are passed directly
+defaults. A blank command disables the hook, as does `--no-idle-hook`. A
+configured local hook is granted a dedicated `idle_hook` permission implicitly
+whenever the hook command is set (`--yolo` also grants it). It does **not**
+require `--allow-tool execute_program`, and the grant does not confer general
+program-execution permission: only the configured hook command and its fixed
+argument vector may run. The executable and arguments are passed directly
 without a shell, and the existing workspace, dangerous-command, output-limit,
 timeout, and process-cancellation safeguards remain in force.
 
