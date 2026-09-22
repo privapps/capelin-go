@@ -19,15 +19,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chzyer/readline"
 )
 
 const (
-	interactiveResponseFile = "last-response.md"
-	requestTimeout          = 10 * time.Minute
-	usageMessageTemplate    = "Usage: %s [--allow-tool TOOL] \"your task\"\n"
+	interactiveResponseFile     = "last-response.md"
+	requestTimeout              = 10 * time.Minute
+	defaultModelRequestTimeout  = 5 * time.Minute
+	oneShotProgressInitialDelay = 10 * time.Second
+	oneShotProgressInterval     = 30 * time.Second
+	usageMessageTemplate        = "Usage: %s [--allow-tool TOOL] \"your task\"\n"
 )
 
 const (
@@ -52,36 +56,37 @@ const (
 )
 
 type config struct {
-	endpoint           string
-	model              string
-	token              string
-	reasoning          string
-	systemPrompt       string
-	showVersion        bool
-	interactive        bool
-	finalOnly          bool
-	initialQuestion    string
-	resumeID           string
-	resumeRequested    bool
-	workspaceRoot      string
-	allowedTools       map[string]bool
-	yolo               bool // enables all tools and unrestricted paths
-	allowPrivateFetch  bool // controlled application/test seam; defaults to the hardened fetch policy
-	maxIterations      int
-	maxGoalIterations  int
-	subagents          subagentRuntimeConfig
-	serverPort         int
-	securityPolicy     serverSecurityPolicy
-	securityEnabled    bool
-	idleHookCommand    string
-	idleHookArgs       []string
-	idleHookTimeoutSec int
-	idleHookSource     string
-	noIdleHook         bool
-	toolMaxParallel    int  // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
-	toolTimeoutSec     int  // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
-	toolRetryOnTimeout bool // retry once on timeout (0 = disable; empty = default true)
-	contextWindow      int  // optional conversation budget in characters; 0 = disabled
+	endpoint            string
+	model               string
+	token               string
+	reasoning           string
+	systemPrompt        string
+	showVersion         bool
+	interactive         bool
+	finalOnly           bool
+	initialQuestion     string
+	resumeID            string
+	resumeRequested     bool
+	workspaceRoot       string
+	allowedTools        map[string]bool
+	yolo                bool // enables all tools and unrestricted paths
+	allowPrivateFetch   bool // controlled application/test seam; defaults to the hardened fetch policy
+	maxIterations       int
+	maxGoalIterations   int
+	modelRequestTimeout time.Duration
+	subagents           subagentRuntimeConfig
+	serverPort          int
+	securityPolicy      serverSecurityPolicy
+	securityEnabled     bool
+	idleHookCommand     string
+	idleHookArgs        []string
+	idleHookTimeoutSec  int
+	idleHookSource      string
+	noIdleHook          bool
+	toolMaxParallel     int  // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
+	toolTimeoutSec      int  // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
+	toolRetryOnTimeout  bool // retry once on timeout (0 = disable; empty = default true)
+	contextWindow       int  // optional conversation budget in characters; 0 = disabled
 	// agentQuestionPreviewMax is the rune budget wired into internal/output at
 	// startup (env AGENT_QUESTION_PREVIEW_MAX; 0 = built-in default 160).
 	agentQuestionPreviewMax int
@@ -228,7 +233,7 @@ func newApp(cfg config) (*app, error) {
 			reasoning: cfg.reasoning,
 			debug:     cfg.debug,
 			http: &http.Client{
-				Timeout: requestTimeout,
+				Timeout: modelRequestTimeout(cfg),
 				Transport: &http.Transport{
 					ForceAttemptHTTP2:     true,
 					MaxIdleConns:          100,
@@ -262,6 +267,13 @@ func newApp(cfg config) (*app, error) {
 	return instance, nil
 }
 
+func modelRequestTimeout(cfg config) time.Duration {
+	if cfg.modelRequestTimeout > 0 {
+		return cfg.modelRequestTimeout
+	}
+	return defaultModelRequestTimeout
+}
+
 var errHelpRequested = errors.New("help requested")
 
 // ErrHelpRequested identifies the non-error control flow used by LoadConfig
@@ -281,22 +293,23 @@ func loadConfig(args []string) (config, error) {
 		return config{}, err
 	}
 	return config{
-		endpoint:          parsed.Endpoint,
-		model:             parsed.Model,
-		token:             parsed.Token,
-		reasoning:         parsed.Reasoning,
-		systemPrompt:      parsed.SystemPrompt,
-		showVersion:       parsed.ShowVersion,
-		interactive:       parsed.Interactive,
-		finalOnly:         parsed.FinalOnly,
-		initialQuestion:   parsed.InitialQuestion,
-		resumeID:          parsed.ResumeID,
-		resumeRequested:   parsed.ResumeRequested,
-		workspaceRoot:     parsed.WorkspaceRoot,
-		allowedTools:      parsed.AllowedTools,
-		yolo:              parsed.Yolo,
-		maxIterations:     parsed.MaxIterations,
-		maxGoalIterations: parsed.MaxGoalIterations,
+		endpoint:            parsed.Endpoint,
+		model:               parsed.Model,
+		token:               parsed.Token,
+		reasoning:           parsed.Reasoning,
+		systemPrompt:        parsed.SystemPrompt,
+		showVersion:         parsed.ShowVersion,
+		interactive:         parsed.Interactive,
+		finalOnly:           parsed.FinalOnly,
+		initialQuestion:     parsed.InitialQuestion,
+		resumeID:            parsed.ResumeID,
+		resumeRequested:     parsed.ResumeRequested,
+		workspaceRoot:       parsed.WorkspaceRoot,
+		allowedTools:        parsed.AllowedTools,
+		yolo:                parsed.Yolo,
+		maxIterations:       parsed.MaxIterations,
+		maxGoalIterations:   parsed.MaxGoalIterations,
+		modelRequestTimeout: time.Duration(parsed.ModelRequestTimeoutSec) * time.Second,
 		subagents: subagentRuntimeConfig{
 			MaxDepth:          parsed.Subagents.MaxDepth,
 			MaxChildren:       parsed.Subagents.MaxChildren,
@@ -384,7 +397,7 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "  --resume [ID|PREFIX]       resume the newest, exact, or unique-prefix interactive session")
 	fmt.Fprintln(w, "  --final-only               one-shot mode: suppress intermediate tool output, show only the final answer")
 	fmt.Fprintln(w, "  --debug                    dump HTTP request and response to stderr")
-	fmt.Fprintln(w, "Env: ENDPOINT, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS, MAX_GOAL_ITERATIONS, CONTEXT_WINDOW")
+	fmt.Fprintln(w, "Env: ENDPOINT, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS, MAX_GOAL_ITERATIONS, MODEL_REQUEST_TIMEOUT_SECONDS, CONTEXT_WINDOW")
 	fmt.Fprintln(w, "     IDLE_HOOK_COMMAND, IDLE_HOOK_ARGS (JSON string array; local one-shot and interactive, requires execute_program permission)")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")
@@ -397,6 +410,7 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "Goal-run limits: root iterations 256, outer iterations 64, subagent depth/parallelism/iterations 2/8/32, aggregate chars 48000, tools parallel/timeout 16/300s")
 	fmt.Fprintln(w, "Saved numeric values equal to ordinary defaults are baseline values for goal fallback; custom saved, environment, and CLI values remain explicit (subagent iterations are raised to at least 32 for an accepted goal)")
 	fmt.Fprintln(w, "--yolo enables permissions and path access only; it does not select goal budgets. /goal still requires --yolo, and stopping/completing a goal restores ordinary limits")
+	fmt.Fprintln(w, "Request timeout: --model-request-timeout-seconds N (env MODEL_REQUEST_TIMEOUT_SECONDS; default 300; bounds one-shot model work and each HTTP request)")
 	fmt.Fprintln(w, "Iteration limit: --max-iterations N (ordinary default 40; goal-run default 256; env MAX_ITERATIONS; always wraps up gracefully on limit)")
 	fmt.Fprintln(w, "Goal loop limit: --max-goal-iterations N (ordinary baseline 20; goal-run default 64; env MAX_GOAL_ITERATIONS; accepted /goal only)")
 	fmt.Fprintln(w, "Interactive goal: /goal <objective> starts a fresh objective generation and checklist; bare /goal or a clear request such as 'finish the goal' resumes the current incomplete objective and its persisted checklist (requires --yolo)")
@@ -428,6 +442,9 @@ func (a *app) runQuestion(ctx context.Context, question string) error {
 	if objective, ok := leadingCommandArgument(question, "/goal"); ok {
 		return a.runOneShotGoal(ctx, objective)
 	}
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithTimeout(ctx, modelRequestTimeout(a.cfg))
+	defer cancel()
 	if !a.cfg.finalOnly {
 		fmt.Fprintf(os.Stderr, "[capelin-go] Task: %s\n\n", question)
 	}
@@ -468,7 +485,8 @@ func (a *app) runQuestion(ctx context.Context, question string) error {
 		// answer while suppressing all intermediate events.
 		finalOnly.RootAgentID = session.id
 	}
-	resultMessages, answer, _, providerState, executionErr := a.runTurnLoopWithState(ctx, initialMessages, question, runtime, a.toolset, true, session.providerState)
+	resultMessages, answer, _, providerState, executionErr := a.runOneShotTurn(ctx, initialMessages, question, runtime, session.providerState)
+	executionErr = annotateOneShotError(ctx, executionErr, modelRequestTimeout(a.cfg))
 	if len(resultMessages) > 0 {
 		session.messages = cloneMessages(resultMessages)
 	}
@@ -497,6 +515,53 @@ func (a *app) runQuestion(ctx context.Context, question string) error {
 		persistenceErr = errors.Join(persistenceErrors...)
 	}
 	return joinOneShotErrors(executionErr, persistenceErr)
+}
+
+func (a *app) runOneShotTurn(ctx context.Context, messages []contracts.Message, question string, runtime *agentRuntime, continuation *contracts.ContinuationState) ([]contracts.Message, string, string, *contracts.ContinuationState, error) {
+	if !a.cfg.finalOnly {
+		return a.runTurnLoopWithState(ctx, messages, question, runtime, a.toolset, true, continuation)
+	}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		started := time.Now()
+		timer := time.NewTimer(oneShotProgressInitialDelay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			fmt.Fprintln(os.Stderr, "[capelin-go] working; intermediate output is hidden by --final-only")
+		case <-done:
+			return
+		}
+		ticker := time.NewTicker(oneShotProgressInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				fmt.Fprintf(os.Stderr, "[capelin-go] still working; elapsed=%s\n", time.Since(started).Round(time.Second))
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	resultMessages, answer, toolOutput, providerState, executionErr := a.runTurnLoopWithState(ctx, messages, question, runtime, a.toolset, true, continuation)
+	close(done)
+	wg.Wait()
+	return resultMessages, answer, toolOutput, providerState, executionErr
+}
+
+func annotateOneShotError(ctx context.Context, err error, timeout time.Duration) error {
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	if ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return err
+	}
+	return fmt.Errorf("model request timed out after %s: %w", timeout.Round(time.Second), err)
 }
 
 func joinOneShotErrors(executionErr, persistenceErr error) error {

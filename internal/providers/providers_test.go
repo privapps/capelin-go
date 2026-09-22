@@ -3,13 +3,35 @@ package providers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"testing"
+	"time"
 
 	"capelin-go/internal/contracts"
 )
+
+func TestChatCompletionsHonorsHTTPClientTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(time.Second):
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"late"}}]}`))
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+
+	provider := NewChatCompletions(Config{
+		Endpoint: server.URL,
+		HTTP:     &http.Client{Timeout: 20 * time.Millisecond},
+	})
+	_, err := provider.Complete(context.Background(), provider.Initialize(nil, "inspect"), nil, "model", "")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout error = %v, want context deadline exceeded", err)
+	}
+}
 
 func TestChatCompletionsReplaysNativeReasoningForToolContinuation(t *testing.T) {
 	call := contracts.ToolCall{

@@ -34,6 +34,23 @@ Check the full message after the error. Rate-limit responses and server failures
 
 Run once with `--debug` to inspect the request and response details. Treat the debug output as private.
 
+## A one-shot request appears stuck
+
+Capelin bounds the overall one-shot model work and each model HTTP request with
+`MODEL_REQUEST_TIMEOUT_SECONDS` (five minutes by default). This prevents a
+multi-iteration tool loop from multiplying the timeout. With
+`--final-only`, intermediate tool output is intentionally hidden from standard
+output, but long-running one-shot requests emit progress diagnostics on
+standard error. Set a shorter timeout for scripts that must fail fast:
+
+```bash
+MODEL_REQUEST_TIMEOUT_SECONDS=180 ./capelin-go --final-only "your task"
+```
+
+If the timeout is reached, Capelin returns a non-zero status and prints the
+session resume hint so the saved session can be continued instead of silently
+waiting indefinitely.
+
 ## A tool says it is disabled
 
 File changes, program execution, and skill execution are disabled by default. Enable only the required tool:

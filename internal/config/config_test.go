@@ -13,6 +13,7 @@ import (
 var numericConfigKeys = []string{
 	"MAX_ITERATIONS",
 	"MAX_GOAL_ITERATIONS",
+	"MODEL_REQUEST_TIMEOUT_SECONDS",
 	"SUBAGENT_MAX_DEPTH",
 	"SUBAGENT_MAX_CHILDREN",
 	"SUBAGENT_MAX_PARALLEL",
@@ -79,6 +80,7 @@ func TestLoadFirstRunUsesProviderDefaultsAndGeneratesOrdinaryConfig(t *testing.T
 		"REASONING_EFFORT = " + defaultReasoning,
 		"MAX_ITERATIONS = 40",
 		"MAX_GOAL_ITERATIONS = 20",
+		"MODEL_REQUEST_TIMEOUT_SECONDS = 300",
 		"SUBAGENT_MAX_DEPTH = 1",
 		"SUBAGENT_MAX_PARALLEL = 4",
 		"SUBAGENT_MAX_ITERATIONS = 20",
@@ -164,6 +166,40 @@ func TestLoadExistingConfigMissingEndpointAddsDefaultAndPreservesValues(t *testi
 		if saved[key] != want {
 			t.Fatalf("migration changed existing %s: got %q want %q", key, saved[key], want)
 		}
+	}
+
+}
+
+func TestLoadModelRequestTimeoutUsesPrecedence(t *testing.T) {
+	path := isolateLoad(t)
+	t.Setenv("MODEL_REQUEST_TIMEOUT_SECONDS", "240")
+
+	cfg, err := Load([]string{"task"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ModelRequestTimeoutSec != 240 {
+		t.Fatalf("environment timeout = %d, want 240", cfg.ModelRequestTimeoutSec)
+	}
+
+	cfg, err = Load([]string{"--model-request-timeout-seconds", "90", "task"})
+	if err != nil {
+		t.Fatalf("Load with CLI timeout: %v", err)
+	}
+	if cfg.ModelRequestTimeoutSec != 90 {
+		t.Fatalf("CLI timeout = %d, want 90", cfg.ModelRequestTimeoutSec)
+	}
+
+	if err := os.WriteFile(path, []byte("MODEL_REQUEST_TIMEOUT_SECONDS = 30\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("MODEL_REQUEST_TIMEOUT_SECONDS", "")
+	cfg, err = Load([]string{"task"})
+	if err != nil {
+		t.Fatalf("Load with saved timeout: %v", err)
+	}
+	if cfg.ModelRequestTimeoutSec != 30 {
+		t.Fatalf("saved timeout = %d, want 30", cfg.ModelRequestTimeoutSec)
 	}
 }
 
@@ -384,17 +420,18 @@ func TestExplicitDefaultCLIAndEnvironmentValuesRemainExplicitForGoals(t *testing
 
 func TestLoadRejectsInvalidNonPositiveNumericValuesFromEverySource(t *testing.T) {
 	flags := map[string]string{
-		"MAX_ITERATIONS":               "--max-iterations",
-		"MAX_GOAL_ITERATIONS":          "--max-goal-iterations",
-		"SUBAGENT_MAX_DEPTH":           "--subagent-max-depth",
-		"SUBAGENT_MAX_CHILDREN":        "--subagent-max-children",
-		"SUBAGENT_MAX_PARALLEL":        "--subagent-max-parallel",
-		"SUBAGENT_TIMEOUT_SECONDS":     "--subagent-timeout-seconds",
-		"SUBAGENT_MAX_RESULT_CHARS":    "--subagent-max-result-chars",
-		"SUBAGENT_MAX_AGGREGATE_CHARS": "--subagent-max-aggregate-chars",
-		"SUBAGENT_MAX_ITERATIONS":      "--subagent-max-iterations",
-		"TOOL_MAX_PARALLEL":            "--tool-max-parallel",
-		"TOOL_TIMEOUT_SECONDS":         "--tool-timeout-seconds",
+		"MAX_ITERATIONS":                "--max-iterations",
+		"MAX_GOAL_ITERATIONS":           "--max-goal-iterations",
+		"MODEL_REQUEST_TIMEOUT_SECONDS": "--model-request-timeout-seconds",
+		"SUBAGENT_MAX_DEPTH":            "--subagent-max-depth",
+		"SUBAGENT_MAX_CHILDREN":         "--subagent-max-children",
+		"SUBAGENT_MAX_PARALLEL":         "--subagent-max-parallel",
+		"SUBAGENT_TIMEOUT_SECONDS":      "--subagent-timeout-seconds",
+		"SUBAGENT_MAX_RESULT_CHARS":     "--subagent-max-result-chars",
+		"SUBAGENT_MAX_AGGREGATE_CHARS":  "--subagent-max-aggregate-chars",
+		"SUBAGENT_MAX_ITERATIONS":       "--subagent-max-iterations",
+		"TOOL_MAX_PARALLEL":             "--tool-max-parallel",
+		"TOOL_TIMEOUT_SECONDS":          "--tool-timeout-seconds",
 	}
 	for key, flag := range flags {
 		t.Run("CLI/"+key, func(t *testing.T) {
