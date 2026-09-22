@@ -42,6 +42,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	t.Setenv("REASONING_EFFORT", "")
 	t.Setenv("SYSTEM_PROMPT", "")
 	t.Setenv("systemPrompt", "")
+	t.Setenv("MODEL_REQUEST_TIMEOUT_SECONDS", "")
 
 	cfg, err := loadConfig([]string{"hello"})
 	if err != nil {
@@ -52,6 +53,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if cfg.model != defaultModel {
 		t.Fatalf("unexpected model: %q", cfg.model)
+	}
+	if cfg.modelRequestTimeout != defaultModelRequestTimeout {
+		t.Fatalf("unexpected model request timeout: %s", cfg.modelRequestTimeout)
 	}
 	if !cfg.allowedTools[toolListFiles] || !cfg.allowedTools[toolReadFile] {
 		t.Fatal("expected safe default tools to be enabled")
@@ -73,6 +77,8 @@ func TestPrintUsageDescribesProviderAndRuntimeProfileContract(t *testing.T) {
 		"MODEL=deepseek-v4-flash-free",
 		"TOKEN=public",
 		"REASONING_EFFORT=high",
+		"MODEL_REQUEST_TIMEOUT_SECONDS",
+		"--model-request-timeout-seconds",
 		"CLI flags > environment > saved config > built-in defaults",
 		"Ordinary limits:",
 		"Goal-run limits:",
@@ -97,6 +103,20 @@ func TestLoadConfigReasoningPassThrough(t *testing.T) {
 	}
 	if cfg.reasoning != "trace-heavy-v2" {
 		t.Fatalf("unexpected reasoning: %q", cfg.reasoning)
+	}
+}
+
+func TestAnnotateOneShotTimeout(t *testing.T) {
+	err := annotateOneShotError(context.Background(), context.DeadlineExceeded, 90*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "model request timed out after 1m30s") {
+		t.Fatalf("timeout diagnostic = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = annotateOneShotError(ctx, context.DeadlineExceeded, time.Minute)
+	if !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "model request timed out") {
+		t.Fatalf("cancellation diagnostic = %v", err)
 	}
 }
 

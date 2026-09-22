@@ -55,7 +55,20 @@ Use `--final-only` when another program needs clean output:
 Intermediate tool messages are hidden, but the assistant still uses the tools it is allowed to use.
 In normal terminal mode, completed direct subagent final responses are printed
 once when the parent awaits them; `--final-only` suppresses those intermediate
-results as well.
+results as well. Long-running one-shot requests still emit bounded progress
+diagnostics on standard error, while the final answer remains the only standard
+output.
+
+One-shot model work and each model HTTP request have a five-minute default
+timeout. Override it when a provider needs a different bound:
+
+```bash
+./capelin-go --model-request-timeout-seconds 180 --final-only "answer a short test question"
+```
+
+The same `MODEL_REQUEST_TIMEOUT_SECONDS` key works in the environment or the
+saved configuration file. A timed-out request returns a non-zero status and
+retains the session resume hint on standard error.
 
 ### See request details
 

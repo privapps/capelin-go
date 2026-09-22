@@ -16,15 +16,16 @@ import (
 )
 
 const (
-	defaultEndpoint           = "https://opencode.ai/zen/v1/chat/completions"
-	defaultModel              = "deepseek-v4-flash-free"
-	defaultToken              = "public"
-	defaultReasoning          = "high"
-	defaultMaxIterations      = 40
-	defaultMaxGoalIterations  = 20
-	defaultToolMaxParallel    = 8
-	defaultToolTimeoutSec     = 60
-	defaultToolRetryOnTimeout = true
+	defaultEndpoint               = "https://opencode.ai/zen/v1/chat/completions"
+	defaultModel                  = "deepseek-v4-flash-free"
+	defaultToken                  = "public"
+	defaultReasoning              = "high"
+	defaultMaxIterations          = 40
+	defaultMaxGoalIterations      = 20
+	defaultModelRequestTimeoutSec = 300
+	defaultToolMaxParallel        = 8
+	defaultToolTimeoutSec         = 60
+	defaultToolRetryOnTimeout     = true
 )
 
 const (
@@ -108,6 +109,7 @@ type Config struct {
 	Yolo                      bool // enables all tools and unrestricted paths
 	MaxIterations             int
 	MaxGoalIterations         int
+	ModelRequestTimeoutSec    int
 	Subagents                 SubagentConfig
 	ServerPort                int
 	ServerAllowedOrigins      string
@@ -285,6 +287,7 @@ func Load(args []string) (Config, error) {
 	finalOnly := false
 	maxIter := 0
 	maxGoalIter := 0
+	modelRequestTimeoutSec := 0
 	numericFlags := map[string]bool{}
 	resumeID := ""
 	resumeRequested := false
@@ -527,6 +530,24 @@ func Load(args []string) (Config, error) {
 			}
 			maxGoalIter = value
 			numericFlags["MAX_GOAL_ITERATIONS"] = true
+		case arg == "--model-request-timeout-seconds":
+			if i+1 >= len(args) {
+				return Config{}, errors.New("--model-request-timeout-seconds requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--model-request-timeout-seconds")
+			if err != nil {
+				return Config{}, err
+			}
+			modelRequestTimeoutSec = value
+			numericFlags["MODEL_REQUEST_TIMEOUT_SECONDS"] = true
+		case strings.HasPrefix(arg, "--model-request-timeout-seconds="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--model-request-timeout-seconds="), "--model-request-timeout-seconds")
+			if err != nil {
+				return Config{}, err
+			}
+			modelRequestTimeoutSec = value
+			numericFlags["MODEL_REQUEST_TIMEOUT_SECONDS"] = true
 		case arg == "--resume":
 			resumeRequested = true
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
@@ -751,6 +772,10 @@ func Load(args []string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	modelRequestTimeoutSec, _, err = resolvePositiveSetting("MODEL_REQUEST_TIMEOUT_SECONDS", modelRequestTimeoutSec, numericFlags["MODEL_REQUEST_TIMEOUT_SECONDS"], fileCfg, defaultModelRequestTimeoutSec)
+	if err != nil {
+		return Config{}, err
+	}
 	if toolRetryOnTimeout == -1 {
 		toolRetryOnTimeout = boolToInt(readBoolCfg("TOOL_RETRY_ON_TIMEOUT", fileCfg, defaultToolRetryOnTimeout))
 	}
@@ -785,6 +810,7 @@ func Load(args []string) (Config, error) {
 		Yolo:                      yolo,
 		MaxIterations:             maxIter,
 		MaxGoalIterations:         maxGoalIter,
+		ModelRequestTimeoutSec:    modelRequestTimeoutSec,
 		Subagents:                 subagentCfg,
 		ServerPort:                serverPort,
 		ServerAllowedOrigins:      readCfg("SERVER_ALLOWED_ORIGINS", fileCfg, ""),
@@ -1040,6 +1066,7 @@ REASONING_EFFORT = high
 SYSTEM_PROMPT =
 MAX_ITERATIONS = 40
 MAX_GOAL_ITERATIONS = 20
+MODEL_REQUEST_TIMEOUT_SECONDS = 300
 
 # Subagent orchestration limits (env vars: SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN,
 # SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS, SUBAGENT_MAX_RESULT_CHARS,

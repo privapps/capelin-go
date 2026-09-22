@@ -5,9 +5,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"capelin-go/internal/output"
 )
@@ -159,5 +162,27 @@ func TestOrdinaryOneShotFinalOnlyKeepsAnswerOnStdoutAndHintOnStderr(t *testing.T
 	}
 	if !strings.Contains(stderr, "[capelin-go] session ") || !strings.Contains(stderr, "; resume with --resume ") {
 		t.Fatalf("final-only hint missing from stderr: %q", stderr)
+	}
+}
+
+func TestOrdinaryOneShotUsesConfiguredOverallTimeout(t *testing.T) {
+	testApp := newInteractiveTurnTestApp(t)
+	testApp.app.cfg.modelRequestTimeout = 20 * time.Millisecond
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"late"}}]}`))
+	}))
+	defer server.Close()
+	testApp.app.client.endpoint = server.URL
+	testApp.app.client.http = server.Client()
+
+	started := time.Now()
+	err := testApp.app.runQuestion(context.Background(), "bounded request")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("one-shot timeout error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("one-shot timeout took %s, want less than one second", elapsed)
 	}
 }
