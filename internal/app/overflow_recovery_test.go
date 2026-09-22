@@ -124,8 +124,8 @@ func TestGoalOverflowRecoveryResetsBothStreaks(t *testing.T) {
 	if !validGoalCompletion(session.activeGoal, session.todos) {
 		t.Fatalf("goal did not complete: todos=%#v goal=%#v", session.todos, session.activeGoal)
 	}
-	if containsEvent(*events, "stalled after") || containsEvent(*events, "recovery limit") {
-		t.Fatalf("successful overflow recovery did not reset safeguards: %v", *events)
+	if containsEvent(events.snapshot(), "stalled after") || containsEvent(events.snapshot(), "recovery limit") {
+		t.Fatalf("successful overflow recovery did not reset safeguards: %v", events.snapshot())
 	}
 }
 
@@ -149,9 +149,9 @@ func TestGoalOverflowRecoveryFailureAdvancesRecoveryStreak(t *testing.T) {
 	session := goalOverflowTestSession(t, testApp, true)
 
 	_ = testApp.app.runGoal(context.Background(), session, "overflow fail")
-	terminal := goalLastIncompleteTerminal(*events)
+	terminal := goalLastIncompleteTerminal(events.snapshot())
 	if !strings.Contains(terminal, "recovery limit reached") {
-		t.Fatalf("expected recovery limit, got: %q (events: %v)", terminal, *events)
+		t.Fatalf("expected recovery limit, got: %q (events: %v)", terminal, events.snapshot())
 	}
 	if !strings.Contains(terminal, "overflow-recovery failure") {
 		t.Fatalf("expected overflow-recovery failure message, got: %q", terminal)
@@ -212,9 +212,9 @@ func TestGoalAutoCompactionCapExhaustionEndsResumably(t *testing.T) {
 	session := goalOverflowTestSession(t, testApp, true)
 
 	_ = testApp.app.runGoal(context.Background(), session, "cap exhaustion")
-	terminal := goalLastIncompleteTerminal(*events)
+	terminal := goalLastIncompleteTerminal(events.snapshot())
 	if terminal == "" {
-		t.Fatalf("no incomplete terminal outcome: %v", *events)
+		t.Fatalf("no incomplete terminal outcome: %v", events.snapshot())
 	}
 	if strings.Contains(terminal, "provider or tool failure") {
 		t.Fatalf("cap exhaustion ended as final failure: %q", terminal)
@@ -302,8 +302,8 @@ func TestGoalOverflowRecoverySucceededSignalResetsStreaks(t *testing.T) {
 	session := goalOverflowTestSession(t, testApp, true)
 
 	_ = testApp.app.runGoal(context.Background(), session, "streak reset via overflow")
-	if containsEvent(*events, "stalled after") {
-		t.Fatalf("stall guard fired despite overflow recovery: %v", *events)
+	if containsEvent(events.snapshot(), "stalled after") {
+		t.Fatalf("stall guard fired despite overflow recovery: %v", events.snapshot())
 	}
 }
 

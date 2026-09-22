@@ -887,7 +887,7 @@ func TestNestedSubagentResultDoesNotLeakToRootSink(t *testing.T) {
 		t.Fatalf("run_subagent: %v", err)
 	}
 
-	nested := &agentRuntime{sessionID: rootAgentID, depth: 1, allowedTools: root.allowedTools}
+	nested := &agentRuntime{sessionID: rootAgentID, scopeID: root.scopeID, depth: 1, allowedTools: root.allowedTools}
 	if _, err := a.runToolForRuntime(context.Background(), nested, types.ToolCall{
 		Function: types.FunctionCall{
 			Name:      toolAwaitSubagent,
@@ -2850,8 +2850,12 @@ func TestFormatToolResultDisplaySanitizesControlCharacters(t *testing.T) {
 	}
 }
 
-// spySink is a minimal OutputSink for testing.
+// spySink is a minimal OutputSink for testing. Its callbacks may be invoked
+// from multiple goroutines (for example the goal heartbeat emitter and the
+// test goroutine that mutates the same captured slice), so dispatch is guarded
+// by a mutex to keep the test harness race-free under -race.
 type spySink struct {
+	mu           sync.Mutex
 	onContent    func(string)
 	onToolCall   func(string, string)
 	onToolResult func(string, bool, string)
@@ -2859,23 +2863,35 @@ type spySink struct {
 }
 
 func (s *spySink) WriteContent(_ string, content string) {
-	if s.onContent != nil {
-		s.onContent(content)
+	s.mu.Lock()
+	fn := s.onContent
+	s.mu.Unlock()
+	if fn != nil {
+		fn(content)
 	}
 }
 func (s *spySink) WriteToolCall(_ string, toolName, args string) {
-	if s.onToolCall != nil {
-		s.onToolCall(toolName, args)
+	s.mu.Lock()
+	fn := s.onToolCall
+	s.mu.Unlock()
+	if fn != nil {
+		fn(toolName, args)
 	}
 }
 func (s *spySink) WriteToolResult(_ string, toolName string, isError bool, detail string) {
-	if s.onToolResult != nil {
-		s.onToolResult(toolName, isError, detail)
+	s.mu.Lock()
+	fn := s.onToolResult
+	s.mu.Unlock()
+	if fn != nil {
+		fn(toolName, isError, detail)
 	}
 }
 func (s *spySink) WriteSystem(_ string, msg string) {
-	if s.onSystem != nil {
-		s.onSystem(msg)
+	s.mu.Lock()
+	fn := s.onSystem
+	s.mu.Unlock()
+	if fn != nil {
+		fn(msg)
 	}
 }
 

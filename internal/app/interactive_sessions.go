@@ -262,10 +262,38 @@ func (a *app) switchToNewSession(session *interactiveSession) error {
 	if err != nil {
 		return err
 	}
+	// The destination session now exists, so the switch can no longer fail on
+	// persistence or creation. Only at this point is the old agent scope
+	// retired and a fresh empty one installed.
+	a.finishAgentScopeSwitch(next)
 	*session = *next
 	a.attachInteractiveRuntime(session)
 	a.attachInteractiveSaver(session)
 	return nil
+}
+
+// finishAgentScopeSwitch retires the outgoing agent scope, requests
+// cancellation of its outstanding pending, queued, and running workers, and
+// binds the destination session to the fresh scope. It is deliberately called
+// only after the destination conversation has been successfully created or
+// resolved, so a failed switch leaves the current conversation, scope, visible
+// workers, and worker control unchanged.
+func (a *app) finishAgentScopeSwitch(next *interactiveSession) {
+	retired, cancelled := a.rotateAgentScope()
+	if cancelled > 0 {
+		a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] cancelled %s from the previous session", pluralizeWorkers(cancelled)))
+	}
+	_ = retired
+	if next != nil {
+		next.runtime = a.rootRuntime()
+	}
+}
+
+func pluralizeWorkers(count int) string {
+	if count == 1 {
+		return "1 subagent"
+	}
+	return fmt.Sprintf("%d subagents", count)
 }
 
 func (a *app) switchToSavedSession(session *interactiveSession, selector string) error {
@@ -284,6 +312,9 @@ func (a *app) switchToSavedSession(session *interactiveSession, selector string)
 		return fmt.Errorf("save current session before resume: %w", err)
 	}
 	next := a.sessionFromSnapshot(snapshot)
+	// Agent trees are runtime state, never persisted, so a resumed
+	// conversation also begins with a clean live agent scope.
+	a.finishAgentScopeSwitch(next)
 	*session = *next
 	a.attachInteractiveRuntime(session)
 	a.attachInteractiveSaver(session)
@@ -449,7 +480,9 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 	session.runtime.allowedTools[toolCompleteGoal] = true
 	heartbeat := newGoalHeartbeatAt(goalStartedAt, a.writeInteractiveSystem, goalProfile.MaxGoalIterations, a.goalHeartbeatInitialDelay, a.goalHeartbeatCadence, goalHeartbeatProgress{
 		todosSnapshot: session.runtime.snapshotTodos,
-		agentSnapshot: a.subagents.ListAll,
+		// Progress reporting follows the same scope boundary as ::agents so a
+		// goal never counts workers from another conversation.
+		agentSnapshot: func() []contracts.SubagentNode { return a.subagents.listScope(a.currentAgentScope()) },
 	})
 	defer heartbeat.stop()
 	// terminalGoalStatus writes a goal outcome. Resumable bounded outcomes

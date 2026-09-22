@@ -106,7 +106,12 @@ Every ordinary line is sent as a new turn. Follow-up questions can refer to earl
   validation, cancellation, or persistence failure leaves the prior session
   unchanged. Compaction is an explicit command; it is not automatic.
 - `/session-new [prompt]` saves the current session, creates a blank one, and
-  optionally submits `prompt` as its first normal turn.
+  optionally submits `prompt` as its first normal turn. A successful switch also
+  retires the conversation's agent scope: outstanding subagents from the old
+  conversation are asked to cancel, their output is no longer shown, and they
+  can no longer be listed, read, run, awaited, or cancelled. If saving or
+  creating the destination session fails, the current conversation, its agent
+  scope, and its visible workers are left unchanged.
 - `/session-list` lists valid saved UUIDs newest-first and marks the current
   session. It also shows a deterministic label, recent direct input, message
   count, update timestamp, and checklist progress. `/session-resume [ID|PREFIX]`
@@ -125,7 +130,7 @@ are dispatched before the busy-turn rejection, so they answer immediately even
 while a turn or `/goal` is running. They never send anything to the model,
 never append conversation messages, never change the checklist, never write
 `last-response.md`, and never alter the persisted session snapshot. Tab
-completion offers `::agents`, `::session`, `::stats`, and `::todos`.
+completion offers `::agents`, `::limits`, `::session`, `::stats`, and `::todos`.
 
 - `::session` prints the current session's full persisted UUID, for example
   `[::session] 3f2b7c1d-9e4a-4a6b-8c2d-5f7e1a2b3c4d`. The value is never
@@ -141,7 +146,25 @@ completion offers `::agents`, `::session`, `::stats`, and `::todos`.
 - `::agents` shows the synthetic root coordinator, the nested subagent tree,
   previewed questions, descendant counts, and aggregate status counts. `-f` or
   `--full` shows complete question text. `::agent` still works as a deprecated
-  alias and prints a one-line deprecation note first.
+  alias and prints a one-line deprecation note first. The view is scoped to the
+  active conversation: only workers created by the current session are listed,
+  so `/session-new` and `/session-resume` start from an empty root with zero
+  workers. Subagent workers are ephemeral runtime state and are never restored
+  from a saved session snapshot.
+- `::limits` shows the effective runtime limits bounding the current session on
+  one line, for example:
+
+  ```text
+  [::limits] profile: ordinary; root iterations: 40; goal iterations: 20; subagent depth: 1; subagent children: 8; subagent parallel: 4; subagent iterations: 20; subagent timeout: 600s; tool parallel: 8; tool timeout: 60s; tool retry: true; preview budget: 160; idle hook: "my-hook" (source=env, timeout=5s)
+  ```
+
+  `profile:` is `ordinary` or `goal` and reports `goal` only while an accepted
+  `/goal` has the goal profile selected, so goal-run budgets are always
+  distinguishable from ordinary ones. `preview budget:` is the resolved
+  `AGENT_QUESTION_PREVIEW_MAX` value, and the idle-hook field reads
+  `idle hook: disabled` when no hook is configured or `--no-idle-hook` was
+  used. It accepts no arguments: `::limits anything` replies
+  `[capelin-go] ::limits accepts no arguments`.
 - `::stats` shows portable process and runtime diagnostics (working folder,
   model, reasoning effort, OS/arch, Go version, CPUs, goroutines, and memory in
   grouped kilobytes). It accepts no arguments.

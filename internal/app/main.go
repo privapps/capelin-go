@@ -19,6 +19,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chzyer/readline"
@@ -108,6 +110,93 @@ type app struct {
 	interactiveIdleHook       func()
 	goalHeartbeatInitialDelay time.Duration
 	goalHeartbeatCadence      time.Duration
+
+	// agentScopeMu guards the active agent scope. A turn runs on its own
+	// goroutine while ::agents and /session-new are dispatched from the
+	// readline goroutine, so scope reads and rotation must be serialized.
+	agentScopeMu sync.Mutex
+	// agentScope is the ephemeral identifier of the live agent scope. It is
+	// runtime state only: it is never written to a durable session snapshot,
+	// so loading a saved conversation always starts from a fresh empty scope.
+	agentScope string
+	// retiredAgentScopes records scopes closed by a session switch. Output
+	// from a retired scope is suppressed so it can never be rendered as work
+	// belonging to the conversation that replaced it. retiredAgentScopeOrder
+	// bounds the set: cancellation is asynchronous, so a scope only needs to
+	// stay silenced long enough for its workers to unwind.
+	retiredAgentScopes     map[string]bool
+	retiredAgentScopeOrder []string
+}
+
+// maxRetiredAgentScopes bounds the silenced-scope set so a long interactive
+// process that switches sessions repeatedly cannot grow it without limit.
+const maxRetiredAgentScopes = 64
+
+// agentScopeSequence backs the transient agent-scope identifier. The durable
+// conversation UUID is deliberately not reused: resuming a snapshot must not
+// resurrect ephemeral workers, so scope identity is process-local and unique
+// per live conversation.
+var agentScopeSequence atomic.Uint64
+
+func newAgentScopeID() string {
+	return fmt.Sprintf("agent-scope-%d-%d", os.Getpid(), agentScopeSequence.Add(1))
+}
+
+// currentAgentScope returns the active agent scope, allocating one on first
+// use. Every runtime created by this application instance carries it, so the
+// synthetic root identity stays "root" while visibility is bounded by scope.
+func (a *app) currentAgentScope() string {
+	if a == nil {
+		return ""
+	}
+	a.agentScopeMu.Lock()
+	defer a.agentScopeMu.Unlock()
+	if a.agentScope == "" {
+		a.agentScope = newAgentScopeID()
+	}
+	return a.agentScope
+}
+
+// rotateAgentScope closes the active scope and installs a fresh empty one. It
+// must be called only after the destination session has been successfully
+// created or resolved, so a failed switch leaves the current scope intact. It
+// returns the retired scope and the number of workers asked to cancel.
+func (a *app) rotateAgentScope() (string, int) {
+	if a == nil {
+		return "", 0
+	}
+	previous := a.currentAgentScope()
+	cancelled := 0
+	if a.subagents != nil {
+		cancelled = a.subagents.closeScope(previous)
+	}
+	a.agentScopeMu.Lock()
+	if a.retiredAgentScopes == nil {
+		a.retiredAgentScopes = make(map[string]bool)
+	}
+	if !a.retiredAgentScopes[previous] {
+		a.retiredAgentScopes[previous] = true
+		a.retiredAgentScopeOrder = append(a.retiredAgentScopeOrder, previous)
+		for len(a.retiredAgentScopeOrder) > maxRetiredAgentScopes {
+			delete(a.retiredAgentScopes, a.retiredAgentScopeOrder[0])
+			a.retiredAgentScopeOrder = a.retiredAgentScopeOrder[1:]
+		}
+	}
+	a.agentScope = newAgentScopeID()
+	a.agentScopeMu.Unlock()
+	return previous, cancelled
+}
+
+// agentScopeIsActive reports whether a scope may still emit output. A worker
+// left over from a retired scope is silenced so its content, tool, and status
+// events cannot appear as work in the conversation that replaced it.
+func (a *app) agentScopeIsActive(scopeID string) bool {
+	if a == nil {
+		return true
+	}
+	a.agentScopeMu.Lock()
+	defer a.agentScopeMu.Unlock()
+	return !a.retiredAgentScopes[scopeID]
 }
 
 type interactiveSession struct {
@@ -310,23 +399,24 @@ func loadConfig(args []string) (config, error) {
 			Model:             parsed.Subagents.Model,
 			ReasoningEffort:   parsed.Subagents.ReasoningEffort,
 		},
-		serverPort:         parsed.ServerPort,
-		securityPolicy:     securityPolicy,
-		securityEnabled:    parsed.ServerSecurityEnabled,
-		idleHookCommand:    parsed.IdleHookCommand,
-		idleHookArgs:       append([]string(nil), parsed.IdleHookArgs...),
-		idleHookTimeoutSec: parsed.IdleHookTimeout,
-		idleHookSource:     parsed.IdleHookSource,
-		noIdleHook:         parsed.NoIdleHook,
-		toolMaxParallel:    parsed.ToolMaxParallel,
-		toolTimeoutSec:     parsed.ToolTimeoutSec,
-		toolRetryOnTimeout: parsed.ToolRetryOnTimeout,
-		contextWindow:      parsed.ContextWindow,
-		ordinaryProfile:    parsed.OrdinaryProfile(),
-		goalProfile:        parsed.GoalProfile(),
-		profilesResolved:   true,
-		asyncTimeout:       parsed.AsyncTimeout,
-		debug:              parsed.Debug,
+		serverPort:              parsed.ServerPort,
+		securityPolicy:          securityPolicy,
+		securityEnabled:         parsed.ServerSecurityEnabled,
+		idleHookCommand:         parsed.IdleHookCommand,
+		idleHookArgs:            append([]string(nil), parsed.IdleHookArgs...),
+		idleHookTimeoutSec:      parsed.IdleHookTimeout,
+		idleHookSource:          parsed.IdleHookSource,
+		noIdleHook:              parsed.NoIdleHook,
+		toolMaxParallel:         parsed.ToolMaxParallel,
+		toolTimeoutSec:          parsed.ToolTimeoutSec,
+		toolRetryOnTimeout:      parsed.ToolRetryOnTimeout,
+		contextWindow:           parsed.ContextWindow,
+		agentQuestionPreviewMax: parsed.AgentQuestionPreviewMax,
+		ordinaryProfile:         parsed.OrdinaryProfile(),
+		goalProfile:             parsed.GoalProfile(),
+		profilesResolved:        true,
+		asyncTimeout:            parsed.AsyncTimeout,
+		debug:                   parsed.Debug,
 	}, nil
 }
 
@@ -385,7 +475,8 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "  --final-only               one-shot mode: suppress intermediate tool output, show only the final answer")
 	fmt.Fprintln(w, "  --debug                    dump HTTP request and response to stderr")
 	fmt.Fprintln(w, "Env: ENDPOINT, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS, MAX_GOAL_ITERATIONS, CONTEXT_WINDOW")
-	fmt.Fprintln(w, "     IDLE_HOOK_COMMAND, IDLE_HOOK_ARGS (JSON string array; local one-shot and interactive, requires execute_program permission)")
+	fmt.Fprintln(w, "     IDLE_HOOK_COMMAND, IDLE_HOOK_ARGS (JSON string array), IDLE_HOOK_TIMEOUT (seconds; local one-shot and interactive)")
+	fmt.Fprintln(w, "     Idle hook flags: --idle-hook COMMAND, --no-idle-hook; a configured hook implicitly grants the dedicated idle_hook permission (never execute_program)")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT")
@@ -1227,10 +1318,14 @@ func (a *app) isToolEnabled(runtime *agentRuntime, name string) bool {
 	return runtime.allowedTools[name]
 }
 
+// rootRuntime builds the synthetic root agent for the active agent scope. The
+// agent identity remains rootAgentID for output and tree formatting; the scope
+// is what bounds visibility and control to one interactive conversation.
 func (a *app) rootRuntime() *agentRuntime {
 	profile := a.cfg.ordinaryRuntimeProfile()
 	return &agentRuntime{
 		sessionID:         rootAgentID,
+		scopeID:           a.currentAgentScope(),
 		depth:             0,
 		role:              agentRoleCoordinator,
 		allowedTools:      cloneAllowedTools(a.cfg.allowedTools),
@@ -1250,13 +1345,16 @@ func (a *app) runSubagentSession(ctx context.Context, runtime *agentRuntime, ses
 	if question == "" {
 		return "", false, errors.New("subagent question is empty")
 	}
-	emit := runtime.emitOutput
+	// A worker belonging to a retired agent scope must never emit into the
+	// conversation that replaced it. Its result is still computed and recorded
+	// on its own session record, but the shared sink stays silent.
+	emit := runtime.emitOutput && a.agentScopeIsActive(runtime.scopeID)
 	if emit && a.sink != nil {
 		a.sink.WriteSystem(session.ID, fmt.Sprintf("[subagent %s] running: %s", session.ID, subagentStatusQuestion(question)))
 	}
 	started := time.Now()
 	answer, err := a.runConversation(ctx, question, runtime, toolset, emit)
-	if emit && a.sink != nil {
+	if emit && a.agentScopeIsActive(runtime.scopeID) && a.sink != nil {
 		elapsed := time.Since(started).Round(time.Second)
 		a.sink.WriteSystem(session.ID, fmt.Sprintf("[subagent %s] %s in %s", session.ID, subagentOutcome(err), elapsed))
 	}

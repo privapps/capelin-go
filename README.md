@@ -87,7 +87,9 @@ when entered at the REPL.
   leaves the existing session unchanged; compaction is manual and never
   automatic.
 - `/session-new [prompt]` saves the current conversation and switches to a
-  blank session; an optional prompt is sent as its first turn.
+  blank session; an optional prompt is sent as its first turn. Outstanding
+  subagents from the previous conversation are asked to cancel and become
+  invisible to the new one; a failed switch changes nothing.
 - `/session-list` shows full saved session IDs newest-first and marks the current
   session. Each row includes a label, recent direct input, message count, update
   time, and checklist progress. `/session-resume [ID|PREFIX]` switches to an exact,
@@ -106,6 +108,12 @@ they also work while a turn or `/goal` is running.
   turn is active.
 - `::agents` shows the coordinator/subagent tree with aggregate status counts
   (`-f`/`--full` disables question truncation). `::agent` is a deprecated alias.
+  The tree is scoped to the active conversation, so `/session-new` and
+  `/session-resume` start from an empty root with zero workers.
+- `::limits` shows the effective runtime limits bounding the session: the active
+  profile (`ordinary` or `goal`), root and goal iterations, subagent
+  depth/children/parallelism/iterations/timeout, tool parallelism/timeout/retry,
+  the preview budget, and the idle-hook state. It accepts no arguments.
 - `::stats` shows portable process and runtime diagnostics.
 
 - `/goal <objective>` — start a fresh bounded objective generation and checklist; prior completion claims and the previous checklist are not inherited; requires `--yolo`

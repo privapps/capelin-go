@@ -103,7 +103,12 @@ func fromSubagentProfile(profile subagents.RuntimeProfile) configpkg.RuntimeProf
 }
 
 type agentRuntime struct {
-	sessionID         string
+	sessionID string
+	// scopeID is the ephemeral agent scope owning this runtime. Each live
+	// interactive conversation has exactly one scope; the synthetic root
+	// identity stays "root" so existing status output is unchanged. One-shot
+	// and server runtimes keep the empty legacy scope.
+	scopeID           string
 	depth             int
 	role              agentRole
 	allowedTools      map[string]bool
@@ -425,6 +430,7 @@ func appRuntime(runtime *subagents.Runtime) *agentRuntime {
 	profile := fromSubagentProfile(runtime.ExecutionProfile)
 	return &agentRuntime{
 		sessionID:         runtime.SessionID,
+		scopeID:           runtime.ScopeID,
 		depth:             runtime.Depth,
 		role:              agentRole(runtime.Role),
 		allowedTools:      cloneAllowedTools(runtime.AllowedTools),
@@ -442,6 +448,7 @@ func subagentRuntime(runtime *agentRuntime) *subagents.Runtime {
 	}
 	return &subagents.Runtime{
 		SessionID:         runtime.sessionID,
+		ScopeID:           runtime.scopeID,
 		Depth:             runtime.depth,
 		Role:              string(runtime.role),
 		AllowedTools:      cloneAllowedTools(runtime.allowedTools),
@@ -462,6 +469,26 @@ func (m *subagentManager) ListAll() []contracts.SubagentNode {
 		return nil
 	}
 	return m.core.ListAll()
+}
+
+// listScope is the scope-aware status snapshot used by the interactive
+// ::agents view and by the goal heartbeat, so both observe exactly the workers
+// belonging to the active conversation.
+func (m *subagentManager) listScope(scopeID string) []contracts.SubagentNode {
+	if m == nil || m.core == nil {
+		return nil
+	}
+	return m.core.ListScope(scopeID)
+}
+
+// closeScope cancels outstanding work in a retired agent scope. It returns the
+// number of workers whose cancellation was requested; an empty or already
+// drained scope reports zero without error.
+func (m *subagentManager) closeScope(scopeID string) int {
+	if m == nil || m.core == nil {
+		return 0
+	}
+	return m.core.CloseScope(scopeID)
 }
 
 func (m *subagentManager) bindParentContext(parent *agentRuntime, ctx context.Context) {

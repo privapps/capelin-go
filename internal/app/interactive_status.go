@@ -1,6 +1,7 @@
 package app
 
 import (
+	configpkg "capelin-go/internal/config"
 	"capelin-go/internal/contracts"
 	"capelin-go/internal/output"
 	"capelin-go/internal/subagents"
@@ -30,6 +31,14 @@ const (
 	// the namespace, is answered locally so it stays available during a busy
 	// turn without invoking the provider or touching persisted state.
 	statusCommandSession = "::session"
+	// statusCommandLimits reports the effective runtime limits bounding the
+	// current interactive session: the active execution profile, the root and
+	// goal iteration budgets, the subagent and tool limits, the agent-question
+	// preview budget, and the idle-hook state. It accepts no arguments and,
+	// like every other command in the namespace, is answered locally so it
+	// stays available during a busy turn or an active goal without invoking
+	// the provider or touching persisted state.
+	statusCommandLimits = "::limits"
 )
 
 // statusAgentsDeprecationNote is the one-line note emitted before the view
@@ -39,7 +48,7 @@ const statusAgentsDeprecationNote = "[capelin-go] ::agent is deprecated; use ::a
 // statusCommandNames is the completion catalog for the :: namespace. Keep it
 // sorted for stable completion output. The deprecated ::agent alias is
 // deliberately absent so completion only advertises the supported spelling.
-var statusCommandNames = []string{statusCommandAgents, statusCommandSession, statusCommandStats, statusCommandTodos}
+var statusCommandNames = []string{statusCommandAgents, statusCommandLimits, statusCommandSession, statusCommandStats, statusCommandTodos}
 
 // handleStatusCommand owns interpretation of the reserved :: namespace. It
 // returns true when the input was consumed locally. Unknown commands and
@@ -59,8 +68,7 @@ func (a *app) handleStatusCommand(session *interactiveSession, input string, bus
 	}
 	switch command {
 	case statusCommandTodos:
-		if rest != "" {
-			a.writeInteractiveSystem("[capelin-go] ::todos accepts no arguments")
+		if a.rejectArgs(command, rest) {
 			return true
 		}
 		a.writeInteractiveSystem(formatInteractiveTodos(session, worker))
@@ -71,21 +79,36 @@ func (a *app) handleStatusCommand(session *interactiveSession, input string, bus
 		options := parseAgentsViewOptions(rest)
 		a.writeInteractiveSystem(a.formatInteractiveAgents(busy, options.full))
 	case statusCommandStats:
-		if rest != "" {
-			a.writeInteractiveSystem("[capelin-go] ::stats accepts no arguments")
+		if a.rejectArgs(command, rest) {
 			return true
 		}
 		a.writeInteractiveSystem(formatInteractiveStats(a.cfg))
 	case statusCommandSession:
-		if rest != "" {
-			a.writeInteractiveSystem("[capelin-go] ::session accepts no arguments")
+		if a.rejectArgs(command, rest) {
 			return true
 		}
 		a.writeInteractiveSystem(formatInteractiveSession(session))
+	case statusCommandLimits:
+		if a.rejectArgs(command, rest) {
+			return true
+		}
+		a.writeInteractiveSystem(a.formatInteractiveLimits(session))
 	default:
-		a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] unknown status command %q; available: ::todos, ::agents, ::stats, ::session", command))
+		a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] unknown status command %q; available: %s", command, strings.Join(statusCommandNames, ", ")))
 	}
 	return true
+}
+
+// rejectArgs enforces the shared "accepts no arguments" contract of the
+// argument-free :: commands. It reports true when the command was rejected,
+// after emitting the single local usage error, so each case can return
+// immediately without repeating the message.
+func (a *app) rejectArgs(command, rest string) bool {
+	if rest != "" {
+		a.writeInteractiveSystem("[capelin-go] " + command + " accepts no arguments")
+		return true
+	}
+	return false
 }
 
 // agentsViewOptions holds the parsed display options of the ::agents status
@@ -258,9 +281,12 @@ func (a *app) formatInteractiveAgents(busy bool, full bool) string {
 	var builder strings.Builder
 	builder.WriteString("[::agents]")
 
+	// Only the active interactive agent scope is rendered. Workers created by
+	// a previous conversation belong to a retired scope and are invisible
+	// here, so a new session never appears to inherit work it did not create.
 	var nodes []contracts.SubagentNode
 	if a != nil && a.subagents != nil {
-		nodes = a.subagents.ListAll()
+		nodes = a.subagents.listScope(a.currentAgentScope())
 	}
 	known := make(map[string]bool, len(nodes))
 	for _, node := range nodes {
@@ -363,4 +389,78 @@ func formatInteractiveStats(cfg config) string {
 		cwd, model, reasoning, runtime.GOOS, runtime.GOARCH, runtime.Version(), runtime.NumCPU(), runtime.GOMAXPROCS(0), runtime.NumGoroutine(),
 		formatGroupedUint(memory.Alloc/bytesPerKB), formatGroupedUint(memory.Sys/bytesPerKB),
 	)
+}
+
+// formatInteractiveLimits renders the effective runtime limits of the current
+// interactive session as one line. The format is stable and intentionally
+// compact:
+//
+//	[::limits] profile: ordinary; root iterations: 40; goal iterations: 20; subagent depth: 1; subagent children: 8; subagent parallel: 4; subagent iterations: 20; subagent timeout: 600s; tool parallel: 8; tool timeout: 60s; tool retry: true; preview budget: 160; idle hook: "my-hook" (source=env, timeout=5s)
+//
+// Field contract:
+//   - "[::limits] " is the fixed label; every remaining field is a
+//     "label: value" pair joined by "; " in the order shown above.
+//   - "profile:" is exactly "ordinary" or "goal". It reports "goal" only when
+//     the session runtime's selected execution profile equals the resolved
+//     goal profile and that profile actually differs from the ordinary one; a
+//     nil session or nil runtime always reports "ordinary".
+//   - Iteration, subagent, and tool values are read from the active profile
+//     through the ordinaryRuntimeProfile/goalRuntimeProfile accessors so the
+//     view cannot drift from what the runtime applies. Subagent and tool
+//     timeouts carry a trailing "s" for seconds; "tool retry" is the bare Go
+//     boolean literal true or false.
+//   - "preview budget:" is the resolved agent-question preview cap, or the
+//     built-in default 160 when no positive value is configured.
+//   - "idle hook:" is either the quoted command with its source and timeout,
+//     or the literal "disabled" when no command is configured or the hook was
+//     turned off with --no-idle-hook.
+//
+// The renderer is read-only: it reads a value copy of the resolved
+// configuration and the session runtime's selected profile, and it mutates
+// nothing.
+func (a *app) formatInteractiveLimits(session *interactiveSession) string {
+	var cfg config
+	if a != nil {
+		cfg = a.cfg
+	}
+	ordinary := cfg.ordinaryRuntimeProfile()
+	goal := cfg.goalRuntimeProfile()
+	active, label := ordinary, "ordinary"
+	if session != nil && session.runtime != nil && goal != ordinary && session.runtime.executionProfile == goal {
+		active, label = goal, "goal"
+	}
+	// The defensive fallback still matters for synthetic configurations such
+	// as &app{cfg: config{}}, which carry no resolved preview budget.
+	preview := cfg.agentQuestionPreviewMax
+	if preview <= 0 {
+		preview = configpkg.DefaultAgentQuestionPreviewMax
+	}
+	fields := []string{
+		"profile: " + label,
+		fmt.Sprintf("root iterations: %d", active.MaxIterations),
+		fmt.Sprintf("goal iterations: %d", active.MaxGoalIterations),
+		fmt.Sprintf("subagent depth: %d", active.Subagents.MaxDepth),
+		fmt.Sprintf("subagent children: %d", active.Subagents.MaxChildren),
+		fmt.Sprintf("subagent parallel: %d", active.Subagents.MaxParallel),
+		fmt.Sprintf("subagent iterations: %d", active.Subagents.MaxToolIterations),
+		fmt.Sprintf("subagent timeout: %ds", active.Subagents.DefaultTimeoutSec),
+		fmt.Sprintf("tool parallel: %d", active.ToolMaxParallel),
+		fmt.Sprintf("tool timeout: %ds", active.ToolTimeoutSec),
+		fmt.Sprintf("tool retry: %t", active.ToolRetryOnTimeout),
+		fmt.Sprintf("preview budget: %d", preview),
+		formatIdleHookLimitsField(cfg),
+	}
+	return fmt.Sprintf("[::limits] %s", strings.Join(fields, "; "))
+}
+
+// formatIdleHookLimitsField renders the idle-hook portion of the ::limits
+// line. A blank command or an explicit --no-idle-hook renders the literal
+// "idle hook: disabled" so the operator can tell a disabled hook from an
+// unreported one.
+func formatIdleHookLimitsField(cfg config) string {
+	command := strings.TrimSpace(cfg.idleHookCommand)
+	if command == "" || cfg.noIdleHook {
+		return "idle hook: disabled"
+	}
+	return fmt.Sprintf("idle hook: %q (source=%s, timeout=%ds)", command, idleHookSourceLabel(cfg.idleHookSource), cfg.idleHookTimeoutSec)
 }

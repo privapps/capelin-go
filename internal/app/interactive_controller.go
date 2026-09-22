@@ -295,6 +295,7 @@ func cloneInteractiveRuntime(runtime *agentRuntime) *agentRuntime {
 	}
 	clone := &agentRuntime{
 		sessionID:         runtime.sessionID,
+		scopeID:           runtime.scopeID,
 		depth:             runtime.depth,
 		role:              runtime.role,
 		allowedTools:      cloneAllowedTools(runtime.allowedTools),

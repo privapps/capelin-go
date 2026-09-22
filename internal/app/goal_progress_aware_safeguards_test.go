@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -52,8 +53,8 @@ func TestGoalRecoverableErrorThenSuccessfulActivityContinues(t *testing.T) {
 	if got := len(testApp.userPrompts()); got != 8 {
 		t.Fatalf("provider calls=%d, want 8", got)
 	}
-	if containsEvent(*events, "recovery limit reached") || containsEvent(*events, "stalled after") {
-		t.Fatalf("successful activity did not reset the safeguards: %v", *events)
+	if containsEvent(events.snapshot(), "recovery limit reached") || containsEvent(events.snapshot(), "stalled after") {
+		t.Fatalf("successful activity did not reset the safeguards: %v", events.snapshot())
 	}
 }
 
@@ -84,8 +85,8 @@ func TestGoalChecklistChangeResetsRecoveryStreakDespiteErrors(t *testing.T) {
 	if !validGoalCompletion(session.activeGoal, session.todos) {
 		t.Fatalf("goal did not complete: todos=%#v goal=%#v", session.todos, session.activeGoal)
 	}
-	if containsEvent(*events, "recovery limit reached") {
-		t.Fatalf("checklist change did not reset the recovery streak: %v", *events)
+	if containsEvent(events.snapshot(), "recovery limit reached") {
+		t.Fatalf("checklist change did not reset the recovery streak: %v", events.snapshot())
 	}
 }
 
@@ -111,8 +112,8 @@ func TestGoalFailedCommandsDoNotCountAsActivity(t *testing.T) {
 	if stopped := testApp.app.runGoal(context.Background(), session, ""); stopped {
 		t.Fatal("failed-command goal unexpectedly stopped the REPL")
 	}
-	if !containsEvent(*events, "recovery limit reached") {
-		t.Fatalf("failed commands were treated as activity: %v", *events)
+	if !containsEvent(events.snapshot(), "recovery limit reached") {
+		t.Fatalf("failed commands were treated as activity: %v", events.snapshot())
 	}
 	if got := len(testApp.userPrompts()); got != maxConsecutiveGoalRecoveries*2 {
 		t.Fatalf("provider calls=%d, want bounded %d", got, maxConsecutiveGoalRecoveries*2)
@@ -142,8 +143,8 @@ func TestGoalControlPlaneCallsDoNotResetRecoveryGuard(t *testing.T) {
 	if stopped := testApp.app.runGoal(context.Background(), session, ""); stopped {
 		t.Fatal("control-plane goal unexpectedly stopped the REPL")
 	}
-	if !containsEvent(*events, "recovery limit reached") {
-		t.Fatalf("control-plane calls reset the recovery guard: %v", *events)
+	if !containsEvent(events.snapshot(), "recovery limit reached") {
+		t.Fatalf("control-plane calls reset the recovery guard: %v", events.snapshot())
 	}
 	if got := len(testApp.userPrompts()); got != maxConsecutiveGoalRecoveries*2 {
 		t.Fatalf("provider calls=%d, want bounded %d", got, maxConsecutiveGoalRecoveries*2)
@@ -175,7 +176,7 @@ func TestGoalAlternatingErrorAndNoOpTurnsStayBounded(t *testing.T) {
 	if stopped := testApp.app.runGoal(context.Background(), session, ""); stopped {
 		t.Fatal("alternating goal unexpectedly stopped the REPL")
 	}
-	terminal := goalLastIncompleteTerminal(*events)
+	terminal := goalLastIncompleteTerminal(events.snapshot())
 	if !strings.Contains(terminal, "stalled after 4 iteration(s)") {
 		t.Fatalf("alternating turns were not bounded by the stall guard: %q", terminal)
 	}
@@ -206,20 +207,20 @@ func TestGoalSuccessfulActivityAloneNeverCompletes(t *testing.T) {
 	if stopped := testApp.app.runGoal(context.Background(), session, "verify and finish"); stopped {
 		t.Fatal("activity-only goal unexpectedly stopped the REPL")
 	}
-	if !containsEvent(*events, "handshake is missing or stale") {
-		t.Fatalf("completed checklist without handshake did not continue explicitly: %v", *events)
+	if !containsEvent(events.snapshot(), "handshake is missing or stale") {
+		t.Fatalf("completed checklist without handshake did not continue explicitly: %v", events.snapshot())
 	}
 	if !validGoalCompletion(session.activeGoal, session.todos) {
 		t.Fatalf("goal did not complete after the handshake: goal=%#v todos=%#v", session.activeGoal, session.todos)
 	}
 	successSeen := false
-	for _, event := range *events {
+	for _, event := range events.snapshot() {
 		if strings.Contains(event, "[goal] complete after") {
 			successSeen = true
 		}
 	}
 	if !successSeen {
-		t.Fatalf("goal never reported success: %v", *events)
+		t.Fatalf("goal never reported success: %v", events.snapshot())
 	}
 }
 
@@ -323,9 +324,9 @@ func TestGoalResumeGuidanceIsExplicit(t *testing.T) {
 				cancel()
 			}
 			_ = testApp.app.runGoal(ctx, session, test.objective)
-			terminal := goalLastIncompleteTerminal(*events)
+			terminal := goalLastIncompleteTerminal(events.snapshot())
 			if terminal == "" {
-				t.Fatalf("no incomplete terminal outcome: %v", *events)
+				t.Fatalf("no incomplete terminal outcome: %v", events.snapshot())
 			}
 			if !strings.Contains(terminal, test.reason) {
 				t.Fatalf("terminal %q lacks reason %q", terminal, test.reason)
@@ -369,7 +370,7 @@ func TestGoalFailureOutcomesDoNotClaimResumeGuidance(t *testing.T) {
 			}
 			events := goalSystemEvents(testApp)
 			_ = testApp.app.runGoal(context.Background(), session, "failure outcome")
-			terminal := goalLastIncompleteTerminal(*events)
+			terminal := goalLastIncompleteTerminal(events.snapshot())
 			if !strings.Contains(terminal, test.reason) {
 				t.Fatalf("terminal %q lacks reason %q", terminal, test.reason)
 			}
@@ -393,10 +394,36 @@ func goalTestSession(t *testing.T, testApp *interactiveTurnTestApp, seed bool) *
 	return session
 }
 
-func goalSystemEvents(testApp *interactiveTurnTestApp) *[]string {
-	events := new([]string)
-	testApp.app.sink.(*spySink).onSystem = func(message string) { *events = append(*events, message) }
-	return events
+// systemCapture is a thread-safe accumulator of system messages. The goal
+// turn goroutine and the goal heartbeat goroutine both emit system lines
+// concurrently, so an unsynchronized append to a shared slice races under
+// -race. Capture guards the slice and exposes a snapshot copy for assertions.
+type systemCapture struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (c *systemCapture) add(message string) {
+	c.mu.Lock()
+	c.events = append(c.events, message)
+	c.mu.Unlock()
+}
+
+func (c *systemCapture) snapshot() []string {
+	c.mu.Lock()
+	out := make([]string, len(c.events))
+	copy(out, c.events)
+	c.mu.Unlock()
+	return out
+}
+
+func goalSystemEvents(testApp *interactiveTurnTestApp) *systemCapture {
+	capture := &systemCapture{}
+	sink := testApp.app.sink.(*spySink)
+	sink.mu.Lock()
+	sink.onSystem = capture.add
+	sink.mu.Unlock()
+	return capture
 }
 
 func goalErrorOnlyResponses(iterations int) []string {

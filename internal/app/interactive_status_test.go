@@ -1,6 +1,7 @@
 package app
 
 import (
+	configpkg "capelin-go/internal/config"
 	"capelin-go/internal/contracts"
 	"context"
 	"errors"
@@ -28,9 +29,9 @@ func TestInteractiveStatusCompleterOffersColonCommands(t *testing.T) {
 	for _, candidate := range candidates {
 		got = append(got, string(candidate))
 	}
-	// The catalog is sorted, so ::session takes its place between ::agents and
-	// ::stats rather than being appended.
-	want := []string{"agents ", "session ", "stats ", "todos "}
+	// The catalog is sorted, so ::limits and ::session take their places
+	// between ::agents and ::stats rather than being appended.
+	want := []string{"agents ", "limits ", "session ", "stats ", "todos "}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected :: candidates: got %#v, want %#v", got, want)
 	}
@@ -272,6 +273,11 @@ func TestStatusCommandsRunDuringBusyTurnWhileOrdinaryInputIsRejected(t *testing.
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
+	// Wait for the second turn to fully finish, including its session-file
+	// persist in the turn goroutine, before returning. Without this, t.Cleanup
+	// (RemoveAll on the TempDir) races the pending write and fails with
+	// "directory not empty" under -count and parallel execution.
+	controller.wait()
 }
 
 func TestStatusCommandsLeaveSessionAndPersistenceUnchanged(t *testing.T) {
@@ -368,7 +374,7 @@ func TestInteractiveStatusCompletionContinuesMidLine(t *testing.T) {
 		t.Fatalf("unexpected continuation offset: got %d, want %d", offset, 2)
 	}
 	got := runeStrings(candidates)
-	want := []string{"agents ", "session ", "stats ", "todos "}
+	want := []string{"agents ", "limits ", "session ", "stats ", "todos "}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("mid-line :: candidates: got %#v, want %#v", got, want)
 	}
@@ -537,9 +543,12 @@ func TestInteractiveAgentsShowsQuestionsAndDescendantCounts(t *testing.T) {
 	testApp.app.subagents = newSubagentManager(cfg, func(context.Context, *agentRuntime, *subagentSession) (string, bool, error) {
 		return "child result", false, nil
 	})
+	// The synthetic root and its descendants must live in the application's
+	// active agent scope, which is the boundary ::agents renders.
 	newTestRuntime := func(id string, depth int) *agentRuntime {
 		return &agentRuntime{
 			sessionID:         id,
+			scopeID:           testApp.app.currentAgentScope(),
 			depth:             depth,
 			allowedTools:      map[string]bool{toolListFiles: true, toolCreateSubagent: true},
 			maxToolIterations: 5,
@@ -695,7 +704,7 @@ func TestAgentsFullFlagShowsCompleteQuestion(t *testing.T) {
 		t.Fatal(err)
 	}
 	longQuestion := strings.Repeat("alpha ", 80) + strings.Repeat("β", 40)
-	if _, err := testApp.app.subagents.create(context.Background(), &agentRuntime{sessionID: rootAgentID, depth: 0, allowedTools: map[string]bool{toolCreateSubagent: true}}, createSubagentArgs{Question: longQuestion}); err != nil {
+	if _, err := testApp.app.subagents.create(context.Background(), &agentRuntime{sessionID: rootAgentID, scopeID: testApp.app.currentAgentScope(), depth: 0, allowedTools: map[string]bool{toolCreateSubagent: true}}, createSubagentArgs{Question: longQuestion}); err != nil {
 		t.Fatal(err)
 	}
 	var systems []string
@@ -723,7 +732,7 @@ func TestAgentsGraphemePreviewSuffix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testApp.app.subagents.create(context.Background(), &agentRuntime{sessionID: rootAgentID, depth: 0, allowedTools: map[string]bool{toolCreateSubagent: true}}, createSubagentArgs{Question: strings.Repeat("🍎", 300)}); err != nil {
+	if _, err := testApp.app.subagents.create(context.Background(), &agentRuntime{sessionID: rootAgentID, scopeID: testApp.app.currentAgentScope(), depth: 0, allowedTools: map[string]bool{toolCreateSubagent: true}}, createSubagentArgs{Question: strings.Repeat("🍎", 300)}); err != nil {
 		t.Fatal(err)
 	}
 	var systems []string
@@ -1404,7 +1413,7 @@ func TestStatusCommandCatalogContainsSessionAndStaysSorted(t *testing.T) {
 		}
 		seen[name] = true
 	}
-	for _, want := range []string{statusCommandTodos, statusCommandAgents, statusCommandStats, statusCommandSession} {
+	for _, want := range []string{statusCommandTodos, statusCommandAgents, statusCommandStats, statusCommandSession, statusCommandLimits} {
 		if !seen[want] {
 			t.Fatalf("statusCommandNames missing %q: %#v", want, statusCommandNames)
 		}
@@ -1414,6 +1423,12 @@ func TestStatusCommandCatalogContainsSessionAndStaysSorted(t *testing.T) {
 	}
 	if statusCommandSession != "::session" {
 		t.Fatalf("statusCommandSession = %q, want ::session", statusCommandSession)
+	}
+	if statusCommandLimits != "::limits" {
+		t.Fatalf("statusCommandLimits = %q, want ::limits", statusCommandLimits)
+	}
+	if want := []string{"::agents", "::limits", "::session", "::stats", "::todos"}; !reflect.DeepEqual(statusCommandNames, want) {
+		t.Fatalf("statusCommandNames = %#v, want %#v", statusCommandNames, want)
 	}
 }
 
@@ -1427,7 +1442,7 @@ func TestInteractiveSessionCompletionOffersTheCommand(t *testing.T) {
 		t.Fatalf("unexpected :: completion offset: got %d, want 2", offset)
 	}
 	got := runeStrings(candidates)
-	want := []string{"agents ", "session ", "stats ", "todos "}
+	want := []string{"agents ", "limits ", "session ", "stats ", "todos "}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected :: candidates: got %#v, want %#v", got, want)
 	}
@@ -1466,7 +1481,7 @@ func TestUnknownStatusCommandHelpListsSession(t *testing.T) {
 		t.Fatalf("unknown-command help lost its report: %q", line)
 	}
 	available := line[strings.Index(line, "available:"):]
-	for _, want := range []string{"::todos", "::agents", "::stats", "::session"} {
+	for _, want := range []string{"::todos", "::agents", "::stats", "::session", "::limits"} {
 		if !strings.Contains(available, want) {
 			t.Fatalf("unknown-command help missing %q: %q", want, line)
 		}
@@ -1534,5 +1549,295 @@ func TestExistingStatusCommandsRemainCompatibleWithSession(t *testing.T) {
 	}
 	if got := testApp.userPrompts(); len(got) != 0 {
 		t.Fatalf("existing status commands reached the model: %#v", got)
+	}
+}
+
+// --- Ticket 03: ::limits runtime-limits status command ---
+
+// limitsTestApp builds an interactive test app whose resolved runtime profiles
+// and idle-hook settings are explicit, so ::limits assertions pin real
+// configured values rather than package defaults.
+func limitsTestApp(t *testing.T) *interactiveTurnTestApp {
+	t.Helper()
+	testApp := newInteractiveTurnTestApp(t)
+	// Build both profiles explicitly rather than through testRuntimeProfiles,
+	// which deliberately shares one MaxGoalIterations between the ordinary and
+	// goal profiles. ::limits must report the two budgets independently.
+	ordinary := configpkg.RuntimeProfile{
+		MaxIterations:     40,
+		MaxGoalIterations: 20,
+		Subagents: configpkg.SubagentConfig{
+			MaxDepth: 1, MaxChildren: 8, MaxParallel: 4,
+			DefaultTimeoutSec: 600, MaxTimeoutSec: 1800, MaxToolIterations: 20,
+		},
+		ToolMaxParallel:    8,
+		ToolTimeoutSec:     60,
+		ToolRetryOnTimeout: true,
+	}
+	goal := configpkg.RuntimeProfile{
+		MaxIterations:     256,
+		MaxGoalIterations: 64,
+		Subagents: configpkg.SubagentConfig{
+			MaxDepth: 2, MaxChildren: 8, MaxParallel: 8,
+			DefaultTimeoutSec: 600, MaxTimeoutSec: 1800, MaxToolIterations: 32,
+		},
+		ToolMaxParallel:    16,
+		ToolTimeoutSec:     300,
+		ToolRetryOnTimeout: true,
+	}
+	testApp.app.cfg.ordinaryProfile = ordinary
+	testApp.app.cfg.goalProfile = goal
+	testApp.app.cfg.profilesResolved = true
+	testApp.app.cfg.agentQuestionPreviewMax = 90
+	testApp.app.cfg.idleHookCommand = "my-hook"
+	testApp.app.cfg.idleHookSource = "env"
+	testApp.app.cfg.idleHookTimeoutSec = 5
+	return testApp
+}
+
+// TestInteractiveLimitsReportsEffectiveOrdinaryLimits pins acceptance criteria
+// 12 and 13: one local [::limits] result naming the active profile and every
+// required effective limit, with no provider request.
+func TestInteractiveLimitsReportsEffectiveOrdinaryLimits(t *testing.T) {
+	testApp := limitsTestApp(t)
+	var systems []string
+	testApp.app.sink.(*spySink).onSystem = func(message string) { systems = append(systems, message) }
+	session, err := testApp.app.newInteractiveSession([]contracts.Message{{Role: "system", Content: "test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped := testApp.app.handleInteractiveInput(context.Background(), session, "::limits"); stopped {
+		t.Fatal("::limits unexpectedly stopped the session")
+	}
+	if got := testApp.userPrompts(); len(got) != 0 {
+		t.Fatalf("::limits reached the model: %#v", got)
+	}
+	if len(systems) != 1 {
+		t.Fatalf("::limits emitted %d system messages, want 1: %#v", len(systems), systems)
+	}
+	line := systems[0]
+	if !strings.HasPrefix(line, "[::limits] ") {
+		t.Fatalf("::limits result lost its label: %q", line)
+	}
+	for _, want := range []string{
+		"profile: ordinary",
+		"root iterations: 40",
+		"goal iterations: 20",
+		"subagent depth: 1",
+		"subagent children: 8",
+		"subagent parallel: 4",
+		"subagent iterations: 20",
+		"subagent timeout: 600s",
+		"tool parallel: 8",
+		"tool timeout: 60s",
+		"tool retry: true",
+		"preview budget: 90",
+		`idle hook: "my-hook" (source=env, timeout=5s)`,
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("::limits output missing %q: %q", want, line)
+		}
+	}
+	if strings.Contains(line, "\n") {
+		t.Fatalf("::limits rendered more than one line: %q", line)
+	}
+}
+
+// TestInteractiveLimitsReportsGoalProfileWhenSelected pins the profile half of
+// acceptance criterion 13: selecting the goal profile on the session runtime
+// switches the reported profile and its values.
+func TestInteractiveLimitsReportsGoalProfileWhenSelected(t *testing.T) {
+	testApp := limitsTestApp(t)
+	var systems []string
+	testApp.app.sink.(*spySink).onSystem = func(message string) { systems = append(systems, message) }
+	session, err := testApp.app.newInteractiveSession([]contracts.Message{{Role: "system", Content: "test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := session.runtime.selectExecutionProfile(testApp.app.cfg.goalRuntimeProfile())
+	if stopped := testApp.app.handleInteractiveInput(context.Background(), session, "::limits"); stopped {
+		t.Fatal("::limits unexpectedly stopped the session")
+	}
+	if len(systems) != 1 {
+		t.Fatalf("::limits emitted %d system messages, want 1: %#v", len(systems), systems)
+	}
+	goalLine := systems[0]
+	for _, want := range []string{
+		"profile: goal",
+		"root iterations: 256",
+		"goal iterations: 64",
+		"subagent depth: 2",
+		"subagent parallel: 8",
+		"subagent iterations: 32",
+		"tool parallel: 16",
+		"tool timeout: 300s",
+	} {
+		if !strings.Contains(goalLine, want) {
+			t.Fatalf("goal ::limits output missing %q: %q", want, goalLine)
+		}
+	}
+	if strings.Contains(goalLine, "profile: ordinary") {
+		t.Fatalf("goal ::limits still reported the ordinary profile: %q", goalLine)
+	}
+
+	// Restoring the ordinary profile restores the ordinary report.
+	restore()
+	systems = nil
+	if stopped := testApp.app.handleInteractiveInput(context.Background(), session, "::limits"); stopped {
+		t.Fatal("::limits unexpectedly stopped the session after restore")
+	}
+	if len(systems) != 1 || !strings.Contains(systems[0], "profile: ordinary") {
+		t.Fatalf("restored ::limits did not report the ordinary profile: %#v", systems)
+	}
+}
+
+// TestInteractiveLimitsRunsDuringBusyTurn pins acceptance criterion 14: the
+// command is answered locally while a turn owns the session.
+func TestInteractiveLimitsRunsDuringBusyTurn(t *testing.T) {
+	testApp := limitsTestApp(t)
+	session, err := testApp.app.newInteractiveSession([]contracts.Message{{Role: "system", Content: "test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var controller *interactiveTurnController
+	controller = newInteractiveTurnController(nil, nil, nil, func(outcome interactiveTurnOutcome) {
+		testApp.app.finishInteractiveTurn(controller, session, outcome)
+	}, nil)
+	if !testApp.app.startInteractiveTurn(context.Background(), controller, session, func(_ context.Context, _ *interactiveSession) (bool, error) {
+		close(started)
+		<-release
+		return false, nil
+	}) {
+		t.Fatal("busy turn did not start")
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("busy turn did not reach the blocking worker")
+	}
+	var systems []string
+	testApp.app.sink.(*spySink).onSystem = func(message string) { systems = append(systems, message) }
+	if stopped := testApp.app.handleInteractiveInputAsync(context.Background(), controller, session, nil, nil, "::limits"); stopped {
+		t.Fatal("busy ::limits unexpectedly ended the session")
+	}
+	if len(systems) != 1 || !strings.HasPrefix(systems[0], "[::limits] ") {
+		t.Fatalf("busy ::limits did not answer locally: %#v", systems)
+	}
+	if !strings.Contains(systems[0], "profile: ordinary") || !strings.Contains(systems[0], "preview budget: 90") {
+		t.Fatalf("busy ::limits lost its fields: %q", systems[0])
+	}
+	if got := testApp.userPrompts(); len(got) != 0 {
+		t.Fatalf("busy ::limits reached the model: %#v", got)
+	}
+	close(release)
+	controller.wait()
+}
+
+// TestInteractiveLimitsRejectsArgumentsLocally pins acceptance criterion 16.
+func TestInteractiveLimitsRejectsArgumentsLocally(t *testing.T) {
+	testApp := limitsTestApp(t)
+	var systems []string
+	testApp.app.sink.(*spySink).onSystem = func(message string) { systems = append(systems, message) }
+	session, err := testApp.app.newInteractiveSession(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped := testApp.app.handleInteractiveInput(context.Background(), session, "::limits extra"); stopped {
+		t.Fatal("::limits extra unexpectedly stopped the session")
+	}
+	if len(systems) != 1 || systems[0] != "[capelin-go] ::limits accepts no arguments" {
+		t.Fatalf("::limits argument rejection changed: %#v", systems)
+	}
+	if got := testApp.userPrompts(); len(got) != 0 {
+		t.Fatalf("::limits extra reached the model: %#v", got)
+	}
+}
+
+// TestInteractiveLimitsLeavesSessionAndPersistenceUnchanged pins acceptance
+// criterion 15: the command mutates no conversation, checklist, response, or
+// persisted state.
+func TestInteractiveLimitsLeavesSessionAndPersistenceUnchanged(t *testing.T) {
+	testApp := limitsTestApp(t)
+	var systems []string
+	testApp.app.sink.(*spySink).onSystem = func(message string) { systems = append(systems, message) }
+	session, err := testApp.app.newInteractiveSession([]contracts.Message{{Role: "system", Content: "test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.todos = []todoItem{{ID: "1", Content: "keep", Status: todoStatusPending}}
+	syncRuntimeTodos(session)
+	session.lastResponse = "kept response"
+	if err := testApp.app.saveInteractiveSession(session); err != nil {
+		t.Fatal(err)
+	}
+	before, err := testApp.app.sessionStore.resolve(session.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped := testApp.app.handleInteractiveInput(context.Background(), session, "::limits"); stopped {
+		t.Fatal("::limits unexpectedly stopped the session")
+	}
+	if len(session.messages) != 1 {
+		t.Fatalf("::limits changed the conversation: %#v", session.messages)
+	}
+	if len(session.todos) != 1 || session.todos[0].Content != "keep" {
+		t.Fatalf("::limits changed the checklist: %#v", session.todos)
+	}
+	if session.lastResponse != "kept response" {
+		t.Fatalf("::limits changed the last response: %q", session.lastResponse)
+	}
+	after, err := testApp.app.sessionStore.resolve(session.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("::limits changed persisted session state:\nbefore=%#v\nafter=%#v", before, after)
+	}
+	if _, err := os.Stat(filepath.Join(testApp.workspaceRoot, interactiveResponseFile)); !os.IsNotExist(err) {
+		t.Fatalf("::limits wrote the response file: %v", err)
+	}
+	if len(systems) != 1 {
+		t.Fatalf("::limits emitted %d system messages, want 1: %#v", len(systems), systems)
+	}
+}
+
+// TestInteractiveLimitsWithoutSessionOrConfigDoesNotPanic proves the renderer
+// tolerates a nil session and an unresolved compatibility configuration, and
+// still reports a usable line.
+func TestInteractiveLimitsWithoutSessionOrConfigDoesNotPanic(t *testing.T) {
+	var systems []string
+	application := &app{cfg: config{}, sink: &spySink{onSystem: func(message string) { systems = append(systems, message) }}}
+	if consumed := application.handleStatusCommand(nil, "::limits", false, nil); !consumed {
+		t.Fatal("::limits was not consumed locally")
+	}
+	if len(systems) != 1 || !strings.HasPrefix(systems[0], "[::limits] ") {
+		t.Fatalf("nil-session ::limits result changed: %#v", systems)
+	}
+	for _, want := range []string{"profile: ordinary", "preview budget: 160", "idle hook: disabled"} {
+		if !strings.Contains(systems[0], want) {
+			t.Fatalf("nil-session ::limits missing %q: %q", want, systems[0])
+		}
+	}
+}
+
+// TestInteractiveLimitsCompletionOffersTheCommand pins acceptance criterion 17
+// for the completion half: ::limits is reachable through the completer,
+// including as a unique prefix.
+func TestInteractiveLimitsCompletionOffersTheCommand(t *testing.T) {
+	completer := interactiveCommandCompleter()
+	candidates, offset := completer.Do([]rune("::"), 2)
+	if offset != 2 {
+		t.Fatalf("unexpected :: completion offset: got %d, want 2", offset)
+	}
+	got := runeStrings(candidates)
+	want := []string{"agents ", "limits ", "session ", "stats ", "todos "}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected :: candidates: got %#v, want %#v", got, want)
+	}
+	candidates, offset = completer.Do([]rune("::l"), 3)
+	if offset != 3 || !reflect.DeepEqual(runeStrings(candidates), []string{"imits "}) {
+		t.Fatalf("unique ::limits completion mismatch: candidates=%q offset=%d", candidates, offset)
 	}
 }

@@ -86,6 +86,18 @@ func ExpandYOLO(allowed map[string]bool) map[string]bool {
 	return result
 }
 
+// GrantIdleHook adds the dedicated idle_hook opt-in permission to allowed,
+// allocating the map when nil. It encodes the policy rule that a configured
+// local idle hook implicitly consumes the idle_hook permission; callers pass the
+// resolved permission set rather than re-implementing the grant.
+func GrantIdleHook(allowed map[string]bool) map[string]bool {
+	if allowed == nil {
+		allowed = map[string]bool{}
+	}
+	allowed[IdleHook] = true
+	return allowed
+}
+
 func CloneAllowedTools(in map[string]bool) map[string]bool {
 	out := make(map[string]bool, len(in))
 	for name, enabled := range in {

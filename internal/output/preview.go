@@ -1,15 +1,11 @@
 package output
 
 import (
-	"errors"
 	"strings"
 	"unicode"
 )
 
 const defaultPreviewMax = 160
-
-// errBadPreviewInt reports an invalid AGENT_QUESTION_PREVIEW_MAX value.
-var errBadPreviewInt = errors.New("invalid AGENT_QUESTION_PREVIEW_MAX")
 
 // previewMaxRunes is the total display budget applied by Preview. This package
 // owns sinks and rendering, not configuration: the value is wired in by the
@@ -26,6 +22,14 @@ func SetPreviewMax(n int) {
 		return
 	}
 	previewMaxRunes = defaultPreviewMax
+}
+
+// PreviewMax reports the preview display budget in runes currently in effect.
+// It exists so callers that temporarily override the budget (tests, in
+// particular) can save and restore the prior value instead of assuming the
+// built-in default.
+func PreviewMax() int {
+	return previewMaxRunes
 }
 
 // isGraphemeExtender reports whether r is a combining mark, enclosing mark,
@@ -85,23 +89,6 @@ func Preview(text string, full bool) string {
 	}
 	omitted := len(runes) - shown
 	return string(runes[:shown]) + "… (+" + itoa(omitted) + " more chars)"
-}
-
-func parsePreviewInt(s string) (int, error) {
-	n := 0
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return 0, errBadPreviewInt
-		}
-		n = n*10 + int(r-'0')
-		if n > 1_000_000 {
-			return 0, errBadPreviewInt
-		}
-	}
-	if n == 0 {
-		return 0, errBadPreviewInt
-	}
-	return n, nil
 }
 
 func itoa(n int) string {

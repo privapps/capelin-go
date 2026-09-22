@@ -31,6 +31,7 @@ func isolateLoad(t *testing.T) string {
 	for _, key := range append([]string{
 		"ENDPOINT", "MODEL", "TOKEN", "REASONING_EFFORT", "SYSTEM_PROMPT",
 		"SUBAGENT_MODEL", "SUBAGENT_REASONING_EFFORT", "IDLE_HOOK_COMMAND", "IDLE_HOOK_ARGS",
+		"IDLE_HOOK_TIMEOUT", "AGENT_QUESTION_PREVIEW_MAX",
 	}, numericConfigKeys...) {
 		t.Setenv(key, "")
 	}
@@ -671,4 +672,157 @@ func TestIdleHookTimeoutDefaultAndEnv(t *testing.T) {
 	if cfg2.IdleHookTimeout != 10 {
 		t.Fatalf("IDLE_HOOK_TIMEOUT=10 gave IdleHookTimeout = %d, want 10", cfg2.IdleHookTimeout)
 	}
+}
+
+// TestYoloGrantsIdleHookThroughOptInExpansion pins acceptance criterion 6:
+// --yolo continues to grant the dedicated idle_hook permission through the
+// existing opt-in expansion, with no hook command configured.
+func TestYoloGrantsIdleHookThroughOptInExpansion(t *testing.T) {
+	isolateLoad(t)
+	cfg, err := Load([]string{"--yolo", "task"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Yolo {
+		t.Fatal("--yolo did not set Yolo")
+	}
+	if !cfg.AllowedTools[policy.IdleHook] {
+		t.Fatalf("--yolo did not grant %q: %#v", policy.IdleHook, cfg.AllowedTools)
+	}
+	if cfg.IdleHookCommand != "" {
+		t.Fatalf("--yolo unexpectedly configured a hook command: %q", cfg.IdleHookCommand)
+	}
+}
+
+// TestIdleHookGrantFromCLIFlagAndSavedConfig pins acceptance criterion 1 for
+// the CLI and saved-config sources, which the environment-only case does not
+// cover, and re-asserts the narrowness of the grant.
+func TestIdleHookGrantFromCLIFlagAndSavedConfig(t *testing.T) {
+	t.Run("cli flag grants idle_hook", func(t *testing.T) {
+		isolateLoad(t)
+		cfg, err := Load([]string{"--idle-hook", "cli-hook", "task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.AllowedTools[policy.IdleHook] {
+			t.Fatalf("--idle-hook did not grant %q: %#v", policy.IdleHook, cfg.AllowedTools)
+		}
+		if cfg.Yolo || cfg.AllowedTools[policy.ExecuteProgram] {
+			t.Fatalf("cli hook widened permissions: yolo=%v allowed=%#v", cfg.Yolo, cfg.AllowedTools)
+		}
+	})
+
+	t.Run("saved config grants idle_hook", func(t *testing.T) {
+		path := isolateLoad(t)
+		writeConfig(t, path, map[string]string{"ENDPOINT": defaultEndpoint, "IDLE_HOOK_COMMAND": "saved-hook"})
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.IdleHookSource != "saved" {
+			t.Fatalf("IdleHookSource = %q, want %q", cfg.IdleHookSource, "saved")
+		}
+		if !cfg.AllowedTools[policy.IdleHook] {
+			t.Fatalf("saved hook did not grant %q: %#v", policy.IdleHook, cfg.AllowedTools)
+		}
+		if cfg.Yolo || cfg.AllowedTools[policy.ExecuteProgram] {
+			t.Fatalf("saved hook widened permissions: yolo=%v allowed=%#v", cfg.Yolo, cfg.AllowedTools)
+		}
+	})
+
+	t.Run("--no-idle-hook overrides the cli flag", func(t *testing.T) {
+		isolateLoad(t)
+		cfg, err := Load([]string{"--idle-hook", "cli-hook", "--no-idle-hook", "task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.AllowedTools[policy.IdleHook] {
+			t.Fatalf("--no-idle-hook still granted %q: %#v", policy.IdleHook, cfg.AllowedTools)
+		}
+	})
+}
+
+// TestAgentQuestionPreviewMaxPrecedenceAndFallback pins acceptance criteria 8
+// and 9: environment > saved config > built-in 160, and every invalid or
+// non-positive value falls back to 160 without failing Load.
+func TestAgentQuestionPreviewMaxPrecedenceAndFallback(t *testing.T) {
+	t.Run("unset yields the built-in default", func(t *testing.T) {
+		isolateLoad(t)
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.AgentQuestionPreviewMax != DefaultAgentQuestionPreviewMax {
+			t.Fatalf("AgentQuestionPreviewMax = %d, want %d", cfg.AgentQuestionPreviewMax, DefaultAgentQuestionPreviewMax)
+		}
+	})
+
+	t.Run("environment override wins", func(t *testing.T) {
+		isolateLoad(t)
+		t.Setenv("AGENT_QUESTION_PREVIEW_MAX", "40")
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.AgentQuestionPreviewMax != 40 {
+			t.Fatalf("AgentQuestionPreviewMax = %d, want 40", cfg.AgentQuestionPreviewMax)
+		}
+	})
+
+	t.Run("saved config is used when the environment is unset", func(t *testing.T) {
+		path := isolateLoad(t)
+		if err := os.WriteFile(path, []byte("ENDPOINT = "+defaultEndpoint+"\nAGENT_QUESTION_PREVIEW_MAX = 75\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.AgentQuestionPreviewMax != 75 {
+			t.Fatalf("saved AgentQuestionPreviewMax = %d, want 75", cfg.AgentQuestionPreviewMax)
+		}
+	})
+
+	t.Run("environment overrides saved config", func(t *testing.T) {
+		path := isolateLoad(t)
+		if err := os.WriteFile(path, []byte("ENDPOINT = "+defaultEndpoint+"\nAGENT_QUESTION_PREVIEW_MAX = 75\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		t.Setenv("AGENT_QUESTION_PREVIEW_MAX", "40")
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.AgentQuestionPreviewMax != 40 {
+			t.Fatalf("environment did not win: AgentQuestionPreviewMax = %d, want 40", cfg.AgentQuestionPreviewMax)
+		}
+	})
+
+	for _, invalid := range []string{"0", "-3", "abc", "", "   ", "12.5"} {
+		t.Run("invalid value "+invalid+" falls back without error", func(t *testing.T) {
+			isolateLoad(t)
+			t.Setenv("AGENT_QUESTION_PREVIEW_MAX", invalid)
+			cfg, err := Load([]string{"task"})
+			if err != nil {
+				t.Fatalf("Load(%q) returned an error: %v", invalid, err)
+			}
+			if cfg.AgentQuestionPreviewMax != DefaultAgentQuestionPreviewMax {
+				t.Fatalf("AGENT_QUESTION_PREVIEW_MAX=%q gave %d, want %d", invalid, cfg.AgentQuestionPreviewMax, DefaultAgentQuestionPreviewMax)
+			}
+		})
+	}
+
+	t.Run("invalid saved value falls back without error", func(t *testing.T) {
+		path := isolateLoad(t)
+		if err := os.WriteFile(path, []byte("ENDPOINT = "+defaultEndpoint+"\nAGENT_QUESTION_PREVIEW_MAX = nope\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("Load returned an error for an invalid saved value: %v", err)
+		}
+		if cfg.AgentQuestionPreviewMax != DefaultAgentQuestionPreviewMax {
+			t.Fatalf("invalid saved value gave %d, want %d", cfg.AgentQuestionPreviewMax, DefaultAgentQuestionPreviewMax)
+		}
+	})
 }

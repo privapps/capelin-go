@@ -103,7 +103,12 @@ func (c *subagentRuntimeConfig) normalize() {
 }
 
 type agentRuntime struct {
-	sessionID         string
+	sessionID string
+	// scopeID is the ephemeral agent scope this runtime belongs to. Every
+	// live interactive conversation owns one scope; the synthetic root
+	// identity (sessionID == rootAgentID) is deliberately unchanged so
+	// existing output and tree formatting keep working inside a scope.
+	scopeID           string
 	depth             int
 	role              agentRole
 	allowedTools      map[string]bool
@@ -149,6 +154,10 @@ type subagentSession struct {
 	ExecutionMode string
 	AllowedTools  map[string]bool
 	Timeout       time.Duration
+	// ScopeID records the agent scope that owns this worker. It is assigned
+	// from the creating parent runtime and never changes, so closing a scope
+	// can never make a worker reachable from another live conversation.
+	ScopeID string
 
 	CreatedAt  time.Time
 	StartedAt  time.Time
@@ -222,7 +231,11 @@ func DefaultConfig() Config { return defaultSubagentRuntimeConfig() }
 // Runtime is the normalized execution context passed to a subagent runner.
 // It deliberately contains no application or tool implementation details.
 type Runtime struct {
-	SessionID         string
+	SessionID string
+	// ScopeID is the ephemeral agent scope owning this runtime. An empty
+	// value is the legacy unscoped identity used by one-shot and server
+	// executions, which retain their existing whole-manager behavior.
+	ScopeID           string
 	Depth             int
 	Role              string
 	AllowedTools      map[string]bool
@@ -241,6 +254,7 @@ func internalRuntime(runtime *Runtime) *agentRuntime {
 	}
 	return &agentRuntime{
 		sessionID:         runtime.SessionID,
+		scopeID:           runtime.ScopeID,
 		depth:             runtime.Depth,
 		role:              agentRole(runtime.Role),
 		allowedTools:      cloneAllowedTools(runtime.AllowedTools),
@@ -258,6 +272,7 @@ func publicRuntime(runtime *agentRuntime) *Runtime {
 	}
 	return &Runtime{
 		SessionID:         runtime.sessionID,
+		ScopeID:           runtime.scopeID,
 		Depth:             runtime.depth,
 		Role:              string(runtime.role),
 		AllowedTools:      cloneAllowedTools(runtime.allowedTools),
@@ -308,6 +323,28 @@ func (m *Manager) ListAll() []contracts.SubagentNode {
 	return m.core.ListAll()
 }
 
+// ListScope returns the status snapshot restricted to one agent scope. An
+// empty scope selects the legacy unscoped view, which is what one-shot and
+// server executions continue to use.
+func (m *Manager) ListScope(scopeID string) []contracts.SubagentNode {
+	if m == nil || m.core == nil {
+		return nil
+	}
+	return m.core.listScope(scopeID)
+}
+
+// CloseScope requests cancellation of every non-terminal worker belonging to
+// the supplied scope and detaches its parent-context bindings. Workers from
+// other scopes are never touched. Closing an empty or unknown scope is a
+// no-op, so a switch from a conversation with no workers cannot produce a
+// spurious cancellation error.
+func (m *Manager) CloseScope(scopeID string) int {
+	if m == nil || m.core == nil {
+		return 0
+	}
+	return m.core.closeScope(scopeID)
+}
+
 func (m *Manager) Create(ctx context.Context, parent *Runtime, args CreateArgs) (*Session, error) {
 	return m.core.create(ctx, internalRuntime(parent), args)
 }
@@ -338,7 +375,7 @@ func (m *Manager) BindParentContext(parent *Runtime, ctx context.Context) {
 	if m == nil || m.core == nil || parent == nil {
 		return
 	}
-	m.core.bindParentContext(parent.SessionID, ctx)
+	m.core.bindParentContext(parent.ScopeID, parent.SessionID, ctx)
 }
 
 // Snapshot returns a stable tool-result view of a session.
@@ -368,10 +405,22 @@ func newSubagentManager(cfg subagentRuntimeConfig, runner subagentRunner) *subag
 // ListAll returns a snapshot of all known subagent sessions (used by TUI agent tree panel).
 // Does NOT include the top-level agents — those are managed by the TUI model.
 func (m *subagentManager) ListAll() []contracts.SubagentNode {
+	return m.snapshotNodes(func(*subagentSession) bool { return true })
+}
+
+// listScope is ListAll restricted to one agent scope.
+func (m *subagentManager) listScope(scopeID string) []contracts.SubagentNode {
+	return m.snapshotNodes(func(s *subagentSession) bool { return s.ScopeID == scopeID })
+}
+
+func (m *subagentManager) snapshotNodes(include func(*subagentSession) bool) []contracts.SubagentNode {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	nodes := make([]contracts.SubagentNode, 0, len(m.sessions))
 	for _, s := range m.sessions {
+		if include != nil && !include(s) {
+			continue
+		}
 		nodes = append(nodes, contracts.SubagentNode{
 			ID:       s.ID,
 			Name:     s.Name,
@@ -386,6 +435,56 @@ func (m *subagentManager) ListAll() []contracts.SubagentNode {
 		return strings.Compare(a.ID, b.ID)
 	})
 	return nodes
+}
+
+// closeScope cancels outstanding work in one scope and drops its parent
+// bindings. It returns the number of workers whose cancellation was requested.
+func (m *subagentManager) closeScope(scopeID string) int {
+	if strings.TrimSpace(scopeID) == "" {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cancelled := 0
+	for _, session := range m.sessions {
+		if session.ScopeID != scopeID || isTerminalSubagentStatus(session.Status) {
+			continue
+		}
+		cancelled++
+		if session.cancel != nil {
+			session.cancel()
+			continue
+		}
+		session.Status = subagentStatusCancelled
+		session.Error = "subagent cancelled with its interactive session"
+		session.FinishedAt = time.Now().UTC()
+		session.closeDone()
+	}
+	// Detach parent-turn bindings owned by the closed scope so a later turn
+	// context cannot reach back into old-scope records. Bindings are keyed by
+	// scope, so the synthetic root of another live conversation is untouched.
+	prefix := scopeID + parentContextKeySeparator
+	for key, binding := range m.parentContexts {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if binding != nil {
+			close(binding.stop)
+		}
+		delete(m.parentContexts, key)
+	}
+	m.slotCond.Broadcast()
+	return cancelled
+}
+
+// parentContextKeySeparator joins a scope identifier and an agent session
+// identifier into one binding key. The synthetic root identity is shared by
+// every scope, so the scope must be part of the key or one conversation's
+// turn context would govern another conversation's children.
+const parentContextKeySeparator = "\x00"
+
+func parentContextKey(scopeID, sessionID string) string {
+	return scopeID + parentContextKeySeparator + sessionID
 }
 
 // profileFor resolves the profile active at a parent runtime. A runtime that
@@ -465,7 +564,8 @@ func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args
 	// unbounded session growth. Count every non-terminal handle here: once a
 	// queued handle has been run it must still consume queue capacity until it
 	// finishes, otherwise repeated create/run batches could grow without bound.
-	admitted := m.admittedChildrenLocked(parent.sessionID)
+	parentKey := parentContextKey(parent.scopeID, parent.sessionID)
+	admitted := m.admittedChildrenLocked(parentKey)
 	if admitted >= limits.MaxChildren && overflowMode == createSubagentOverflowFailFast {
 		return nil, fmt.Errorf("max children exceeded for parent %q (%d)", parent.sessionID, limits.MaxChildren)
 	}
@@ -480,6 +580,7 @@ func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args
 		Name:          strings.TrimSpace(args.Name),
 		Question:      question,
 		ParentID:      parent.sessionID,
+		ScopeID:       parent.scopeID,
 		Depth:         depth,
 		Role:          agentRoleWorker,
 		ExecutionMode: strings.ToLower(strings.TrimSpace(args.ExecutionMode)),
@@ -503,7 +604,7 @@ func (m *subagentManager) create(ctx context.Context, parent *agentRuntime, args
 		return nil, fmt.Errorf("invalid execution_mode %q", session.ExecutionMode)
 	}
 	m.sessions[id] = session
-	m.childrenByNode[parent.sessionID] = append(m.childrenByNode[parent.sessionID], id)
+	m.childrenByNode[parentKey] = append(m.childrenByNode[parentKey], id)
 	return cloneSession(session), nil
 }
 
@@ -564,7 +665,7 @@ func (m *subagentManager) run(ctx context.Context, parent *agentRuntime, args ru
 		// context, so use the parent-turn binding when one is available. Direct
 		// manager callers still get useful cancellation semantics from ctx.
 		session.parentCtx = context.Background()
-		if binding := m.parentContexts[parent.sessionID]; binding != nil {
+		if binding := m.parentContexts[parentContextKey(parent.scopeID, parent.sessionID)]; binding != nil {
 			session.parentCtx = binding.ctx
 		} else if ctx != nil && ctx.Done() != nil {
 			session.parentCtx = ctx
@@ -582,19 +683,29 @@ func (m *subagentManager) run(ctx context.Context, parent *agentRuntime, args ru
 	return queued, nil
 }
 
+// parentKey identifies this worker's parent within its own agent scope. The
+// synthetic root identity is shared across scopes, so per-parent bookkeeping
+// must be keyed by scope as well or one conversation's children would consume
+// another conversation's capacity.
+func (s *subagentSession) parentKey() string {
+	return parentContextKey(s.ScopeID, s.ParentID)
+}
+
 func (m *subagentManager) acquireChildSlot(session *subagentSession) bool {
+	key := session.parentKey()
 	return m.waitForAdmission(session,
-		func() bool { return m.activeChildren[session.ParentID] >= session.limits.MaxChildren },
-		func() { m.activeChildren[session.ParentID]++ },
+		func() bool { return m.activeChildren[key] >= session.limits.MaxChildren },
+		func() { m.activeChildren[key]++ },
 	)
 }
 
 func (m *subagentManager) releaseChildSlot(session *subagentSession) {
+	key := session.parentKey()
 	m.mu.Lock()
-	if active := m.activeChildren[session.ParentID]; active > 1 {
-		m.activeChildren[session.ParentID] = active - 1
+	if active := m.activeChildren[key]; active > 1 {
+		m.activeChildren[key] = active - 1
 	} else {
-		delete(m.activeChildren, session.ParentID)
+		delete(m.activeChildren, key)
 	}
 	m.slotCond.Broadcast()
 	m.mu.Unlock()
@@ -750,6 +861,7 @@ func (m *subagentManager) execute(session *subagentSession) {
 
 	runtime := &agentRuntime{
 		sessionID:         session.ID,
+		scopeID:           session.ScopeID,
 		depth:             session.Depth,
 		role:              session.Role,
 		allowedTools:      cloneAllowedTools(session.AllowedTools),
@@ -1005,7 +1117,16 @@ func (m *subagentManager) getVisibleSessionLocked(parent *agentRuntime, id strin
 	return session, nil
 }
 
+// isVisibleLocked decides whether one agent may observe or control a worker.
+// Scope is the outer boundary: a worker created in another live interactive
+// conversation is never visible, even to a synthetic root, so the status fix
+// cannot leave a control-plane escape across conversations. Within one scope
+// the established root-sees-all and ancestor-sees-descendant rules apply
+// unchanged.
 func (m *subagentManager) isVisibleLocked(parent *agentRuntime, session *subagentSession) bool {
+	if session.ScopeID != parent.scopeID {
+		return false
+	}
 	if parent.sessionID == rootAgentID {
 		return true
 	}
@@ -1169,6 +1290,7 @@ func cloneSession(in *subagentSession) *subagentSession {
 		Name:            in.Name,
 		Question:        in.Question,
 		ParentID:        in.ParentID,
+		ScopeID:         in.ScopeID,
 		Depth:           in.Depth,
 		Role:            in.Role,
 		ExecutionMode:   in.ExecutionMode,
@@ -1222,16 +1344,17 @@ func (s *subagentSession) closeDone() {
 // bindParentContext connects a parent turn's lifetime to its child tree. A
 // non-cancellable context is still retained as the lifetime source for normal
 // two-phase tool calls, but does not need a watcher.
-func (m *subagentManager) bindParentContext(parentID string, ctx context.Context) {
+func (m *subagentManager) bindParentContext(scopeID, parentID string, ctx context.Context) {
 	if m == nil || strings.TrimSpace(parentID) == "" || ctx == nil {
 		return
 	}
+	key := parentContextKey(scopeID, parentID)
 	binding := &parentContextBinding{ctx: ctx, stop: make(chan struct{})}
 	m.mu.Lock()
-	if previous := m.parentContexts[parentID]; previous != nil {
+	if previous := m.parentContexts[key]; previous != nil {
 		close(previous.stop)
 	}
-	m.parentContexts[parentID] = binding
+	m.parentContexts[key] = binding
 	m.mu.Unlock()
 	if ctx.Done() == nil {
 		return
@@ -1241,9 +1364,9 @@ func (m *subagentManager) bindParentContext(parentID string, ctx context.Context
 		select {
 		case <-ctx.Done():
 			m.mu.Lock()
-			if m.parentContexts[parentID] == binding {
-				delete(m.parentContexts, parentID)
-				m.cancelChildrenLocked(parentID)
+			if m.parentContexts[key] == binding {
+				delete(m.parentContexts, key)
+				m.cancelChildrenLocked(scopeID, parentID)
 			}
 			m.mu.Unlock()
 		case <-binding.stop:
@@ -1254,8 +1377,11 @@ func (m *subagentManager) bindParentContext(parentID string, ctx context.Context
 // cancelChildrenLocked finalizes work that has not entered the runner and
 // requests cancellation from work that is already running. It is called while
 // m.mu is held so every terminal transition wakes slot waiters.
-func (m *subagentManager) cancelChildrenLocked(parentID string) {
+func (m *subagentManager) cancelChildrenLocked(scopeID, parentID string) {
 	for _, session := range m.sessions {
+		if session.ScopeID != scopeID {
+			continue
+		}
 		if session.ParentID != parentID && !m.isDescendantOfLocked(session, parentID) {
 			continue
 		}

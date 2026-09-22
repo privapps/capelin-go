@@ -123,6 +123,7 @@ type Config struct {
 	ToolTimeoutSec            int    // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
 	ToolRetryOnTimeout        bool   // retry once on timeout (0 = disable; empty = default true)
 	ContextWindow             int    // optional conversation budget in characters; 0 = disabled (reactive-only recovery)
+	AgentQuestionPreviewMax   int    // rune budget for rendered question previews (env AGENT_QUESTION_PREVIEW_MAX; default 160)
 	AsyncTimeout              time.Duration
 	Debug                     bool
 	profileSources            profileSources
@@ -149,10 +150,12 @@ const (
 	defaultSubagentAggregateChars    = 12000
 )
 
-// defaultAgentQuestionPreviewMax mirrors internal/output's built-in preview
-// budget. It is the fallback when AGENT_QUESTION_PREVIEW_MAX is unset or not a
-// positive integer.
-const defaultAgentQuestionPreviewMax = 160
+// DefaultAgentQuestionPreviewMax mirrors internal/output's built-in preview
+// budget. It is the single exported source of truth for the fallback used when
+// AGENT_QUESTION_PREVIEW_MAX is unset or not a positive integer, so callers
+// outside this package (for example the ::limits status view) report the same
+// budget the runtime applies instead of duplicating the literal.
+const DefaultAgentQuestionPreviewMax = 160
 
 type agentRole string
 
@@ -654,6 +657,16 @@ func Load(args []string) (Config, error) {
 			idleHookSource = ""
 		}
 	}
+	// A real, enabled, local idle hook implicitly consumes the dedicated
+	// idle_hook opt-in permission. The grant is narrow by construction: it
+	// never sets Yolo and never implies policy.ExecuteProgram. Server mode and
+	// --no-idle-hook both leave idleHookCommand blank above, so neither reaches
+	// this grant. The permission rule itself lives in policy.GrantIdleHook;
+	// --yolo continues to grant idle_hook through the existing opt-in expansion
+	// at flag-parse time.
+	if strings.TrimSpace(idleHookCommand) != "" {
+		allowedTools = policy.GrantIdleHook(allowedTools)
+	}
 	if v, ok := os.LookupEnv("IDLE_HOOK_TIMEOUT"); ok {
 		if n, e := parsePositiveInt(v, "IDLE_HOOK_TIMEOUT"); e == nil && n > 0 {
 			idleHookTimeout = n
@@ -745,6 +758,16 @@ func Load(args []string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	// The agent-question preview budget is display-only, so an invalid,
+	// non-positive, or missing value silently falls back to the built-in
+	// default instead of blocking startup. Precedence matches every other
+	// setting: environment, then saved config, then the built-in default.
+	agentQuestionPreviewMax := DefaultAgentQuestionPreviewMax
+	if raw := strings.TrimSpace(readCfg("AGENT_QUESTION_PREVIEW_MAX", fileCfg, "")); raw != "" {
+		if parsed, parseErr := parsePositiveInt(raw, "AGENT_QUESTION_PREVIEW_MAX"); parseErr == nil {
+			agentQuestionPreviewMax = parsed
+		}
+	}
 
 	return Config{
 		Endpoint:                  endpoint,
@@ -777,6 +800,7 @@ func Load(args []string) (Config, error) {
 		ToolTimeoutSec:            toolTimeoutSec,
 		ToolRetryOnTimeout:        toolRetryOnTimeout != 0,
 		ContextWindow:             contextWindow,
+		AgentQuestionPreviewMax:   agentQuestionPreviewMax,
 		profileSources:            sources,
 		Debug:                     debug,
 	}, nil
