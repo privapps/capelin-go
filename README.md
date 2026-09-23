@@ -230,12 +230,37 @@ SERVER_ALLOWED_TARGETS=https://api.openai.com,https://opencode.ai
 
 Use `SERVER_ALLOWED_ORIGINS=*` or `SERVER_ALLOWED_TARGETS=*` only as an explicit compatibility escape hatch. Private/self-hosted targets additionally require `SERVER_ALLOW_PRIVATE_TARGETS=true` and an exact target entry. Requests without an `Origin` header remain supported for CLI/server-to-server use.
 
-- Endpoint: full URL including `/chat/completions` — use a hex-encoded path (`~<hex>`) or `?endpoint=` query parameter. Literal or percent-encoded URL paths are not accepted.
+- Endpoint: full URL including `/chat/completions` or `/responses` — use a hex-encoded path (`~<hex>`) or `?endpoint=` query parameter. Literal or percent-encoded URL paths are not accepted.
 - API token: standard `Authorization: Bearer <token>` header
 - Available tools: `web_search`, `fetch_page`, and subagent orchestration (`create_subagent`, `run_subagent`, `await_subagent`, `list_subagents`, `read_subagent`, `cancel_subagent`)
-- Response includes a `reasoning` field with LLM thinking, tool call traces, and subagent results
+- Chat Completions responses include a `reasoning` field with LLM thinking, tool call traces, and subagent results
 - Connection stays open until the agent completes (may take several minutes)
 - Returns OpenAI-format response with the final result
+
+Server mode also supports a focused non-streaming Responses request. The
+supported boundary fields are `model`, optional string `instructions`, a
+non-empty string `input`, optional `reasoning.effort`, and `stream: false`:
+
+```bash
+# The port is configurable; 8305 is the acceptance-environment example.
+./capelin-go --server-port 8305
+curl -X POST "http://localhost:8305/?endpoint=https://api.example.com/v1/responses" \
+  -H "Authorization: Bearer public" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-model","instructions":"Be concise.","input":"Summarize this.","reasoning":{"effort":"high"},"stream":false}'
+```
+
+Responses callers receive `object: "response"`, completed status, the
+effective model, original instructions, an assistant `output` message with
+`output_text` content and annotations, and top-level `output_text`. Reasoning
+or tool-trace text appears as a readable reasoning item before the assistant
+message when available. The `/async/` route stores this same Responses shape
+for `/data` polling. Chat Completions callers keep their existing
+`chat.completion` response, including when the upstream URL ends in
+`/responses`.
+
+Responses streaming, full input-item or multimodal input, provider-specific
+metadata preservation, and `previous_response_id` state are not supported.
 
 **Raw CORS proxy** (any HTTP(S) endpoint):
 

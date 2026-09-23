@@ -1,6 +1,6 @@
 # Server and API Guide
 
-Server mode turns Capelin into a local HTTP proxy. A caller sends an OpenAI-style chat request to Capelin; Capelin forwards the task to the remote AI service and returns the completed answer.
+Server mode turns Capelin into a local HTTP proxy. A caller sends an OpenAI-style Chat Completions or supported Responses request to Capelin; Capelin forwards the task to the remote AI service and returns the completed answer.
 
 ## Start the server
 
@@ -9,6 +9,7 @@ Server mode turns Capelin into a local HTTP proxy. A caller sends an OpenAI-styl
 ```
 
 The server listens on port `8899` in this example. Keep the terminal open while clients use it.
+The port is configurable; the acceptance environment can use `--server-port 8305`.
 
 Check that it is running:
 
@@ -52,7 +53,8 @@ The query-parameter form is usually easiest to generate safely.
 ### Request rules
 
 - Use `POST` for chat requests.
-- Include a non-empty `messages` list.
+- Chat Completions requests include a non-empty `messages` list. Responses requests use a non-empty string `input` instead.
+- Responses requests may include `instructions` as a string (or `null`), `model`, and `reasoning.effort`. Do not combine `messages` with `input` or `instructions`.
 - Include `Authorization: Bearer <token>`. Capelin forwards this token to the remote service.
 - Omit `stream` or set it to `false`; streaming is not supported.
 - `model` is optional and falls back to the configured model.
@@ -94,6 +96,57 @@ The response follows the usual chat-completion shape:
 ```
 
 When the remote service provides reasoning or tool activity, Capelin may add a `reasoning` field to the assistant message. It is omitted when there is no reasoning content or tool activity.
+
+## Use the supported Responses subset
+
+The server accepts a deliberately small, non-streaming Responses request. For
+example, with a server running on port `8305`:
+
+```bash
+./capelin-go --server-port 8305
+
+curl -X POST \
+  'http://localhost:8305/?endpoint=https%3A%2F%2Fexample.com%2Fv1%2Fresponses' \
+  -H 'Authorization: Bearer YOUR_REMOTE_TOKEN' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "your-model",
+    "instructions": "Answer briefly and clearly.",
+    "input": "What is Capelin?",
+    "reasoning": {"effort": "high"},
+    "stream": false
+  }'
+```
+
+The synchronous response is a minimal Responses-compatible envelope. Its
+stable client-facing fields are `object: "response"`, `status: "completed"`,
+`model`, `instructions`, `output[].content[].text`, and top-level
+`output_text`. If reasoning or tool-trace text is available, a readable
+`reasoning` output item precedes the assistant message. Provider-specific IDs,
+encrypted reasoning, and `copilot_usage` are not preserved.
+
+Responses requests can use the asynchronous route in the same way as Chat
+Completions requests:
+
+```bash
+curl -X POST \
+  'http://localhost:8305/async/?endpoint=https%3A%2F%2Fexample.com%2Fv1%2Fresponses' \
+  -H 'Authorization: Bearer YOUR_REMOTE_TOKEN' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"your-model","instructions":"Be concise.","input":"Hello"}'
+
+curl 'http://localhost:8305/data?key=<returned-id>'
+```
+
+The stored `/data` value uses the same `response` shape as the synchronous
+route. Existing Chat Completions requests continue to return
+`object: "chat.completion"`, even when their configured upstream URL ends in
+`/responses`; the upstream URL selects the provider adapter, not the caller's
+response format.
+
+This compatibility surface does not support streaming Responses output, full
+Responses input-item arrays or multimodal input, `previous_response_id` state,
+or transparent preservation of provider-specific metadata.
 
 ## Submit an asynchronous request
 
@@ -166,6 +219,9 @@ The server allows cross-origin browser requests and accepts `GET`, `PUT`, `POST`
 | `endpoint required` | No valid endpoint path or `endpoint` query parameter was supplied |
 | `Authorization: Bearer <token> header is required` | The request has no usable Bearer token |
 | `messages array is required and must not be empty` | The request has no conversation messages |
+| `input is required and must be a non-empty string` | A Responses request omitted `input`, sent an empty value, or sent input items instead of the supported string form |
+| `messages cannot be combined with Responses fields` | A request mixed Chat Completions `messages` with Responses `input` or `instructions` |
+| `previous_response_id is not supported` | Stateful Responses continuation is outside the server compatibility surface |
 | `streaming is not supported` | The request set `stream` to `true` |
 | `key not found` | An async job is still running, has expired, or used the wrong ID |
 | `async capacity exhausted` | Too many async jobs are already active |

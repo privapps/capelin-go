@@ -4469,6 +4469,61 @@ func TestServerApplicationHandlerRoutesBothDeliveryModes(t *testing.T) {
 	t.Fatalf("timed out polling application handler result %q", accepted["id"])
 }
 
+func TestServerResponsesCompatibilityUsesResponsesProviderWithoutChangingCallerFormat(t *testing.T) {
+	isolateConfigFile(t)
+	var requests []map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("upstream path = %q, want /responses", r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		requests = append(requests, payload)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output_text":null,"output":[{"type":"reasoning","encrypted_content":"not for callers","summary":[{"type":"summary_text","text":"provider reasoning"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"provider answer"}]}]}`))
+	}))
+	defer upstream.Close()
+
+	a := newServerParityApp(t, upstream.URL+"/responses", "configured-model", "configured-reasoning")
+	handler := newServerHandler(a, serverParityAllowedTools())
+	responsesBody := `{"model":"request-model","instructions":"Use plain language.","input":"Explain this.","reasoning":{"effort":"high"}}`
+	responsesReq := httptest.NewRequest(http.MethodPost, "/?endpoint="+url.QueryEscape(upstream.URL+"/responses"), strings.NewReader(responsesBody))
+	responsesReq.Header.Set("Authorization", "Bearer token")
+	responsesW := httptest.NewRecorder()
+	handler.ServeHTTP(responsesW, responsesReq)
+	if responsesW.Code != http.StatusOK || !strings.Contains(responsesW.Body.String(), `"object":"response"`) || !strings.Contains(responsesW.Body.String(), `"output_text":"provider answer"`) {
+		t.Fatalf("Responses caller response = %d: %s", responsesW.Code, responsesW.Body.String())
+	}
+
+	chatReq := httptest.NewRequest(http.MethodPost, "/?endpoint="+url.QueryEscape(upstream.URL+"/responses"), strings.NewReader(`{"model":"chat-model","messages":[{"role":"user","content":"Chat question"}]}`))
+	chatReq.Header.Set("Authorization", "Bearer token")
+	chatW := httptest.NewRecorder()
+	handler.ServeHTTP(chatW, chatReq)
+	if chatW.Code != http.StatusOK || !strings.Contains(chatW.Body.String(), `"object":"chat.completion"`) || !strings.Contains(chatW.Body.String(), `"content":"provider answer"`) {
+		t.Fatalf("Chat caller response = %d: %s", chatW.Code, chatW.Body.String())
+	}
+
+	if len(requests) != 2 {
+		t.Fatalf("upstream request count = %d, want 2", len(requests))
+	}
+	responsesPayload := requests[0]
+	if _, ok := responsesPayload["messages"]; ok {
+		t.Fatal("Responses upstream request contained Chat Completions messages")
+	}
+	if responsesPayload["model"] != "request-model" || responsesPayload["reasoning"].(map[string]any)["effort"] != "high" {
+		t.Fatalf("Responses upstream settings = %#v", responsesPayload)
+	}
+	input := responsesPayload["input"].([]any)
+	if len(input) != 2 || !strings.Contains(input[0].(map[string]any)["content"].(string), "Use plain language.") || input[1].(map[string]any)["content"] != "Explain this." {
+		t.Fatalf("Responses upstream input = %#v", input)
+	}
+	if _, ok := requests[1]["messages"]; ok {
+		t.Fatal("Chat request targeting /responses was sent as Chat Completions wire format")
+	}
+}
+
 func TestServerAsyncCapacityRejectsBeforeReadingBody(t *testing.T) {
 	original := asyncSem
 	asyncSem = make(chan struct{}, 1)

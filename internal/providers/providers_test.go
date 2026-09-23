@@ -343,6 +343,32 @@ func TestResponsesAcceptsStructuredTopLevelReasoning(t *testing.T) {
 	}
 }
 
+func TestResponsesExtractsReadableTextWhenProviderMetadataIsUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("request path = %q, want /responses", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"output_text":null,"output":[{"type":"reasoning","encrypted_content":"provider secret","summary":[{"type":"summary_text","text":"readable reasoning"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"readable answer"}]}]}`))
+	}))
+	defer server.Close()
+
+	provider := NewResponses(Config{Endpoint: server.URL + "/responses", HTTP: server.Client()})
+	completion, err := provider.Complete(context.Background(), provider.Initialize(nil, "hello"), nil, "model", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completion.Content() != "readable answer" {
+		t.Fatalf("content = %q, want readable answer", completion.Content())
+	}
+	if completion.ReasoningContent() != "readable reasoning" {
+		t.Fatalf("reasoning = %q, want readable reasoning", completion.ReasoningContent())
+	}
+	if strings.Contains(completion.ReasoningContent(), "provider secret") {
+		t.Fatal("encrypted provider reasoning leaked into normalized output")
+	}
+}
+
 func TestResponsesInvalidContinuationFallsBackToNormalizedMessages(t *testing.T) {
 	var request map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

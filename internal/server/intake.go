@@ -47,6 +47,16 @@ type requestPayload struct {
 	} `json:"reasoning,omitempty"`
 }
 
+// RequestFormat identifies the caller-facing response contract. The zero
+// value is deliberately the historical Chat Completions format so callers
+// that construct an ExecutionRequest directly retain the old behavior.
+type RequestFormat string
+
+const (
+	ChatCompletionsFormat RequestFormat = "chat.completion"
+	ResponsesFormat       RequestFormat = "response"
+)
+
 // RequestError is an HTTP-compatible normalization failure.
 type RequestError struct {
 	Code    int
@@ -62,6 +72,8 @@ type ExecutionRequest struct {
 	RemoteToken  string
 	Model        string
 	Reasoning    string
+	Format       RequestFormat
+	Instructions *string
 	Messages     []contracts.Message
 	Question     string
 	AllowedTools map[string]bool
@@ -113,7 +125,36 @@ func NormalizeRequest(r *http.Request, cfg IntakeConfig, pathPrefix string) (*Ex
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, &RequestError{Code: http.StatusBadRequest, Message: "invalid JSON: " + err.Error()}
 	}
-	if len(payload.Messages) == 0 {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, &RequestError{Code: http.StatusBadRequest, Message: "invalid JSON: " + err.Error()}
+	}
+	_, hasMessages := fields["messages"]
+	_, hasInput := fields["input"]
+	_, hasInstructions := fields["instructions"]
+	if _, hasPreviousResponseID := fields["previous_response_id"]; hasPreviousResponseID {
+		return nil, &RequestError{Code: http.StatusBadRequest, Message: "previous_response_id is not supported"}
+	}
+	responsesRequest := hasInput || hasInstructions
+	if hasMessages && responsesRequest {
+		return nil, &RequestError{Code: http.StatusBadRequest, Message: "messages cannot be combined with Responses fields"}
+	}
+
+	var input string
+	var instructions *string
+	if responsesRequest {
+		rawInput, ok := fields["input"]
+		if !ok || json.Unmarshal(rawInput, &input) != nil || strings.TrimSpace(input) == "" {
+			return nil, &RequestError{Code: http.StatusBadRequest, Message: "input is required and must be a non-empty string"}
+		}
+		if rawInstructions, ok := fields["instructions"]; ok {
+			var value *string
+			if err := json.Unmarshal(rawInstructions, &value); err != nil {
+				return nil, &RequestError{Code: http.StatusBadRequest, Message: "instructions must be a string or null"}
+			}
+			instructions = value
+		}
+	} else if len(payload.Messages) == 0 {
 		return nil, &RequestError{Code: http.StatusBadRequest, Message: "messages array is required and must not be empty"}
 	}
 	if payload.Stream {
@@ -127,21 +168,34 @@ func NormalizeRequest(r *http.Request, cfg IntakeConfig, pathPrefix string) (*Ex
 	if payload.Reasoning.Effort != "" {
 		reasoning = payload.Reasoning.Effort
 	}
+	format := ChatCompletionsFormat
 	messages := make([]contracts.Message, len(payload.Messages))
 	copy(messages, payload.Messages)
-	if messages[0].Role == "system" {
-		messages[0].Content += "\n\nOnly web_search and fetch_page tools are available. No file, code execution, or skill tools."
-	} else {
-		messages = append([]contracts.Message{{Role: "system", Content: ServerModeSystemPrompt}}, messages...)
-	}
 	question := ""
-	if messages[len(messages)-1].Role == "user" {
-		question = messages[len(messages)-1].Content
-		messages = messages[:len(messages)-1]
+	if responsesRequest {
+		format = ResponsesFormat
+		systemContent := ServerModeSystemPrompt
+		if instructions != nil && *instructions != "" {
+			systemContent += "\n\n" + *instructions
+		}
+		systemContent += "\n\nOnly web_search and fetch_page tools are available. No file, code execution, or skill tools."
+		messages = []contracts.Message{{Role: "system", Content: systemContent}}
+		question = input
+	} else {
+		if messages[0].Role == "system" {
+			messages[0].Content += "\n\nOnly web_search and fetch_page tools are available. No file, code execution, or skill tools."
+		} else {
+			messages = append([]contracts.Message{{Role: "system", Content: ServerModeSystemPrompt}}, messages...)
+		}
+		if messages[len(messages)-1].Role == "user" {
+			question = messages[len(messages)-1].Content
+			messages = messages[:len(messages)-1]
+		}
 	}
 	return &ExecutionRequest{
 		RemoteBase: remoteBase, RemoteToken: remoteToken, Model: model, Reasoning: reasoning,
-		Messages: messages, Question: question, AllowedTools: cloneAllowedTools(cfg.AllowedTools),
+		Format: format, Instructions: instructions, Messages: messages, Question: question,
+		AllowedTools: cloneAllowedTools(cfg.AllowedTools),
 	}, nil
 }
 

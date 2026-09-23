@@ -184,7 +184,12 @@ func (d *Delivery) HandleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deferredPanic = false
-	WriteChatCompletionResponse(w, execution.Model, result.Content, result.Reasoning)
+	writeResponse(w, execution, result)
+}
+
+func writeResponse(w http.ResponseWriter, execution *ExecutionRequest, result ExecutionResult) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, buildExecutionResultJSON(execution, result))
 }
 
 func WriteChatCompletionResponse(w http.ResponseWriter, model, content, reasoning string) {
@@ -200,6 +205,30 @@ func BuildChatCompletionJSON(model, content, reasoning string) string {
 	response := map[string]any{
 		"id": fmt.Sprintf("capelin-%d", time.Now().UnixNano()), "object": "chat.completion", "created": time.Now().Unix(), "model": model,
 		"choices": []map[string]any{{"index": 0, "message": message, "finish_reason": "stop"}},
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return `{"error":{"message":"internal error","type":"async_error"}}`
+	}
+	return string(encoded)
+}
+
+func buildResponsesJSON(model string, instructions *string, content, reasoning string) string {
+	output := make([]map[string]any, 0, 2)
+	if reasoning != "" {
+		output = append(output, map[string]any{
+			"id": "rs_" + GenerateUUID(), "type": "reasoning", "status": "completed",
+			"summary": []map[string]string{{"type": "summary_text", "text": reasoning}},
+		})
+	}
+	output = append(output, map[string]any{
+		"id": "msg_" + GenerateUUID(), "type": "message", "status": "completed", "role": "assistant",
+		"content": []map[string]any{{"type": "output_text", "text": content, "annotations": []any{}}},
+	})
+	response := map[string]any{
+		"id": "resp_" + GenerateUUID(), "object": "response", "created_at": time.Now().Unix(),
+		"status": "completed", "model": model, "instructions": instructions,
+		"output": output, "output_text": content,
 	}
 	encoded, err := json.Marshal(response)
 	if err != nil {
@@ -286,7 +315,18 @@ func (d *Delivery) RunAsync(id string, execution *ExecutionRequest) {
 		}
 		return
 	}
-	d.StoreAsyncResult(id, BuildChatCompletionJSON(execution.Model, result.Content, result.Reasoning))
+	d.StoreAsyncResult(id, buildExecutionResultJSON(execution, result))
+}
+
+func buildExecutionResultJSON(execution *ExecutionRequest, result ExecutionResult) string {
+	if execution != nil && execution.Format == ResponsesFormat {
+		return buildResponsesJSON(execution.Model, execution.Instructions, result.Content, result.Reasoning)
+	}
+	model := ""
+	if execution != nil {
+		model = execution.Model
+	}
+	return BuildChatCompletionJSON(model, result.Content, result.Reasoning)
 }
 
 func (d *Delivery) StoreAsyncResult(id, value string) {
