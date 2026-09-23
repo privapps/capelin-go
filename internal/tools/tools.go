@@ -1193,13 +1193,13 @@ type execResult struct {
 	Error     string   `json:"error,omitempty"`
 }
 
-func runExecuteProgram(ctx context.Context, workspaceRoot string, yolo bool, args executeProgramArgs) (string, error) {
+func prepareExecuteProgram(workspaceRoot string, yolo bool, args executeProgramArgs) (string, string, error) {
 	command := strings.TrimSpace(args.Command)
 	if command == "" {
-		return "", errors.New("execute_program command is required")
+		return "", "", errors.New("execute_program command is required")
 	}
 	if !yolo && containsDangerousPattern(command, args.Args) {
-		return "", errors.New("execute_program blocked by dangerous-pattern policy")
+		return "", "", errors.New("execute_program blocked by dangerous-pattern policy")
 	}
 
 	cwd := "."
@@ -1208,13 +1208,78 @@ func runExecuteProgram(ctx context.Context, workspaceRoot string, yolo bool, arg
 	}
 	resolvedCWD, err := resolvePathForTool(workspaceRoot, cwd, yolo)
 	if err != nil {
+		return "", "", err
+	}
+	return command, resolvedCWD, nil
+}
+
+// runDetachedProgram validates and starts a direct child process, then hands
+// responsibility for waiting to a goroutine. The child receives no inherited
+// application output streams, and no context-bound timeout is applied after
+// Start succeeds. A parent cancellation observed before Start still rejects
+// the launch; cancellation after Start deliberately does not kill the child.
+func runDetachedProgram(ctx context.Context, workspaceRoot string, yolo bool, args executeProgramArgs) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("execute_program: detached launch cancelled: %w", err)
+	}
+	command, resolvedCWD, err := prepareExecuteProgram(workspaceRoot, yolo, args)
+	if err != nil {
+		return err
+	}
+
+	// CommandContext with an uncancellable context gives the platform-specific
+	// process-group setup a valid Cancel hook while still leaving the child
+	// independent of the caller after Start succeeds.
+	cmd := exec.CommandContext(context.Background(), command, args.Args...)
+	cmd.Dir = resolvedCWD
+	setupProcessGroup(cmd)
+	childOutput, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("execute_program: opening detached output sink: %w", err)
+	}
+	cmd.Stdout = childOutput
+	cmd.Stderr = childOutput
+	if err := cmd.Start(); err != nil {
+		_ = childOutput.Close()
+		return fmt.Errorf("execute_program: failed to start %q: %w", command, err)
+	}
+	// The child inherited its own descriptors. Closing the parent's copy avoids
+	// retaining a file handle while the asynchronously reaped child runs.
+	_ = childOutput.Close()
+	go func() {
+		// Waiting in this goroutine allows the OS to release the process
+		// resources without making the caller wait for the child lifetime.
+		_ = cmd.Wait()
+	}()
+	return nil
+}
+
+func runExecuteProgram(ctx context.Context, workspaceRoot string, yolo bool, args executeProgramArgs) (string, error) {
+	return runExecuteProgramWithTimeoutLimit(ctx, workspaceRoot, yolo, args, 120)
+}
+
+// runIdleHookProgram keeps the idle-hook wait adapter on the tool package's
+// process and result envelope while allowing its own configured 600-second
+// lifecycle ceiling. The ordinary execute_program contract remains capped at
+// 120 seconds.
+func runIdleHookProgram(ctx context.Context, workspaceRoot string, yolo bool, args executeProgramArgs) (string, error) {
+	return runExecuteProgramWithTimeoutLimit(ctx, workspaceRoot, yolo, args, ToolTimeoutMax)
+}
+
+func runExecuteProgramWithTimeoutLimit(ctx context.Context, workspaceRoot string, yolo bool, args executeProgramArgs, maxTimeoutSeconds int) (string, error) {
+	command, resolvedCWD, err := prepareExecuteProgram(workspaceRoot, yolo, args)
+	if err != nil {
 		return "", err
+	}
+	cwd := "."
+	if strings.TrimSpace(args.Cwd) != "" {
+		cwd = args.Cwd
 	}
 
 	timeout := toolTimeout
 	if args.TimeoutSeconds > 0 {
-		if args.TimeoutSeconds > 120 {
-			return "", errors.New("execute_program timeout_seconds exceeds 120")
+		if args.TimeoutSeconds > maxTimeoutSeconds {
+			return "", fmt.Errorf("execute_program timeout_seconds exceeds %d", maxTimeoutSeconds)
 		}
 		timeout = time.Duration(args.TimeoutSeconds) * time.Second
 	}

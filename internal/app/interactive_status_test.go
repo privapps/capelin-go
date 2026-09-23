@@ -1591,6 +1591,7 @@ func limitsTestApp(t *testing.T) *interactiveTurnTestApp {
 	testApp.app.cfg.agentQuestionPreviewMax = 90
 	testApp.app.cfg.idleHookCommand = "my-hook"
 	testApp.app.cfg.idleHookSource = "env"
+	testApp.app.cfg.idleHookMode = idleHookModeDetached
 	testApp.app.cfg.idleHookTimeoutSec = 5
 	return testApp
 }
@@ -1632,7 +1633,7 @@ func TestInteractiveLimitsReportsEffectiveOrdinaryLimits(t *testing.T) {
 		"tool timeout: 60s",
 		"tool retry: true",
 		"preview budget: 90",
-		`idle hook: "my-hook" (source=env, timeout=5s)`,
+		`idle hook: "my-hook" (source=env, mode=detached, timeout=disabled)`,
 	} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("::limits output missing %q: %q", want, line)

@@ -395,7 +395,7 @@ func formatInteractiveStats(cfg config) string {
 // interactive session as one line. The format is stable and intentionally
 // compact:
 //
-//	[::limits] profile: ordinary; root iterations: 40; goal iterations: 20; subagent depth: 1; subagent children: 8; subagent parallel: 4; subagent iterations: 20; subagent timeout: 600s; tool parallel: 8; tool timeout: 60s; tool retry: true; preview budget: 160; idle hook: "my-hook" (source=env, timeout=5s)
+//	[::limits] profile: ordinary; root iterations: 40; goal iterations: 20; subagent depth: 1; subagent children: 8; subagent parallel: 4; subagent iterations: 20; subagent timeout: 600s; tool parallel: 8; tool timeout: 60s; tool retry: true; preview budget: 160; idle hook: "my-hook" (source=env, mode=detached, timeout=disabled)
 //
 // Field contract:
 //   - "[::limits] " is the fixed label; every remaining field is a
@@ -462,5 +462,13 @@ func formatIdleHookLimitsField(cfg config) string {
 	if command == "" || cfg.noIdleHook {
 		return "idle hook: disabled"
 	}
-	return fmt.Sprintf("idle hook: %q (source=%s, timeout=%ds)", command, idleHookSourceLabel(cfg.idleHookSource), cfg.idleHookTimeoutSec)
+	mode := cfg.idleHookMode
+	if mode == "" {
+		mode = idleHookModeDetached
+	}
+	timeoutLabel := fmt.Sprintf("%ds", cfg.idleHookTimeoutSec)
+	if mode == idleHookModeDetached {
+		timeoutLabel = "disabled"
+	}
+	return fmt.Sprintf("idle hook: %q (source=%s, mode=%s, timeout=%s)", command, idleHookSourceLabel(cfg.idleHookSource), mode, timeoutLabel)
 }

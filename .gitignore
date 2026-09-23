@@ -10,3 +10,4 @@ openspec
 graphify-out/
 .nca/*
 .scratch/*
+local-scripts/*

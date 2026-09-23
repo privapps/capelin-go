@@ -54,6 +54,7 @@ func (a *app) newServerExecutionApp(execution *server.ExecutionRequest) (*app, *
 	// side effects from the composing application.
 	serverCfg.idleHookCommand = ""
 	serverCfg.idleHookArgs = nil
+	serverCfg.idleHookMode = ""
 	serverCfg.allowedTools = cloneAllowedTools(execution.AllowedTools)
 	httpClient := serverHTTPClient
 	if a.client != nil && a.client.http != nil {

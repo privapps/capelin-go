@@ -168,7 +168,7 @@ completion offers `::agents`, `::limits`, `::session`, `::stats`, and `::todos`.
   one line, for example:
 
   ```text
-  [::limits] profile: ordinary; root iterations: 40; goal iterations: 20; subagent depth: 1; subagent children: 8; subagent parallel: 4; subagent iterations: 20; subagent timeout: 600s; tool parallel: 8; tool timeout: 60s; tool retry: true; preview budget: 160; idle hook: "my-hook" (source=env, timeout=5s)
+  [::limits] profile: ordinary; root iterations: 40; goal iterations: 20; subagent depth: 1; subagent children: 8; subagent parallel: 4; subagent iterations: 20; subagent timeout: 600s; tool parallel: 8; tool timeout: 60s; tool retry: true; preview budget: 160; idle hook: "my-hook" (source=env, mode=detached, timeout=disabled)
   ```
 
   `profile:` is `ordinary` or `goal` and reports `goal` only while an accepted
@@ -341,7 +341,8 @@ Common settings:
 | `TOOL_RETRY_ON_TIMEOUT` | Retry a tool once after a timeout | `true` |
 | `IDLE_HOOK_COMMAND` | Local program run when a task or turn goes idle | empty (disabled) |
 | `IDLE_HOOK_ARGS` | Fixed argument vector for the hook, as a JSON string array | empty |
-| `IDLE_HOOK_TIMEOUT` | Seconds allowed for one hook run | `5` |
+| `IDLE_HOOK_MODE` | Local hook lifetime: `detached` launches and returns; `wait` observes completion | `detached` |
+| `IDLE_HOOK_TIMEOUT` | Seconds allowed for one wait-mode hook run | `5` |
 | `AGENT_QUESTION_PREVIEW_MAX` | Rune budget for bounded status/question previews (positive integer; invalid values fall back to the default) | `160` |
 
 Set reasoning to `none` or `nil` to leave it out of the request.
@@ -359,6 +360,8 @@ If the endpoint path ends in `/responses`, Capelin uses the Responses request fo
 --max-iterations N                Set the main task tool-use limit
 --allow-tool NAME                 Enable one optional tool; repeat as needed
 --yolo                            Enable all optional tools and remove path limits
+--idle-hook COMMAND               Set a local idle hook for this run
+--no-idle-hook                    Disable the configured local idle hook
 --server-port PORT                Start HTTP server mode
 --help                            Show command help
 --version                         Show the executable version
@@ -429,5 +432,13 @@ by `internal/config` and wired into the rendering layer once at startup; the
 rendering package never reads the environment itself. Unset, non-numeric, or
 non-positive values keep the default of `160`.
 
-`IDLE_HOOK_TIMEOUT` bounds a single idle-hook run in seconds (default `5`);
-non-positive or non-numeric values keep the default.
+`IDLE_HOOK_MODE` follows the normal environment-over-saved-config precedence
+and accepts `detached` or `wait`. Existing configurations without the setting
+resolve to `detached`. Detached hooks are handed off after a successful direct
+launch, so `IDLE_HOOK_TIMEOUT` does not limit child lifetime. Set `wait` for a
+completion-sensitive hook; in that mode `IDLE_HOOK_TIMEOUT` bounds the run and
+reports completion failures. Invalid mode values fail startup with an
+actionable configuration error.
+
+`IDLE_HOOK_TIMEOUT` bounds a single wait-mode idle-hook run in seconds (default
+`5`); non-positive or non-numeric values keep the default.

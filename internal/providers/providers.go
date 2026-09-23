@@ -44,7 +44,29 @@ func IsResponsesEndpoint(endpoint string) bool {
 	return path == "/responses" || strings.HasSuffix(path, "/responses")
 }
 
+// IsOpenCodeZenEndpoint reports whether endpoint is the exact public OpenCode
+// Zen chat-completions URL. Zen-specific protocol behavior must not leak into
+// custom OpenAI-compatible endpoints, even when they use a similar path.
+func IsOpenCodeZenEndpoint(endpoint string) bool {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return false
+	}
+	return parsed.Scheme == "https" &&
+		strings.EqualFold(parsed.Hostname(), "opencode.ai") &&
+		parsed.Port() == "" &&
+		parsed.User == nil &&
+		parsed.RawPath == "" &&
+		parsed.RawQuery == "" &&
+		!parsed.ForceQuery &&
+		parsed.Fragment == "" &&
+		(parsed.Path == "/zen/v1/chat/completions" || parsed.Path == "/zen/v1/chat/completions/")
+}
+
 func New(cfg Config) contracts.Provider {
+	if IsOpenCodeZenEndpoint(cfg.Endpoint) {
+		return NewOpenCodeZen(cfg)
+	}
 	if IsResponsesEndpoint(cfg.Endpoint) {
 		return NewResponses(cfg)
 	}
@@ -129,6 +151,17 @@ func clientWithUserAgent(client *http.Client) *http.Client {
 	return &copy
 }
 
+func modelHTTPError(status int, statusText string, raw []byte) error {
+	message := fmt.Sprintf("model request failed: %s: %s", statusText, strings.TrimSpace(string(raw)))
+	if isOverflow400(status, string(raw)) {
+		return &contextOverflowError{message: message}
+	}
+	if isRetryableStatus(status) {
+		return &retryableHTTPError{status: status, message: message}
+	}
+	return errors.New(message)
+}
+
 func doJSON(ctx context.Context, cfg Config, body []byte) ([]byte, string, error) {
 	client := cfg.HTTP
 	if client == nil {
@@ -160,14 +193,7 @@ func doJSON(ctx context.Context, cfg Config, body []byte) ([]byte, string, error
 		return nil, "", &retryableTransportError{err: readErr}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		message := fmt.Sprintf("model request failed: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
-		if isOverflow400(resp.StatusCode, string(raw)) {
-			return nil, "", &contextOverflowError{message: message}
-		}
-		if isRetryableStatus(resp.StatusCode) {
-			return nil, "", &retryableHTTPError{status: resp.StatusCode, message: message}
-		}
-		return nil, "", errors.New(message)
+		return nil, "", modelHTTPError(resp.StatusCode, resp.Status, raw)
 	}
 	if cfg.Debug {
 		fmt.Fprintf(os.Stderr, "[capelin-go] <<< RESPONSE %s\n\n%s\n\n", resp.Status, raw)

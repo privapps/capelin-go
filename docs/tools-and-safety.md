@@ -194,26 +194,36 @@ executable and its fixed argument vector with `IDLE_HOOK_COMMAND` and
 ```ini
 IDLE_HOOK_COMMAND = ./bin/notify-idle
 IDLE_HOOK_ARGS = ["completed", "local"]
+IDLE_HOOK_MODE = detached
 ```
 
 Environment values override non-empty saved configuration values, following the
 normal precedence order: CLI flags, environment, saved config, then built-in
-defaults. A blank command disables the hook, as does `--no-idle-hook`. A
+defaults. `IDLE_HOOK_MODE` follows environment-over-saved precedence; the
+command-line override applies to the command itself. A blank command disables
+the hook, as does `--no-idle-hook`. A
 configured local hook is granted a dedicated `idle_hook` permission implicitly
 whenever the hook command is set (`--yolo` also grants it). It does **not**
 require `--allow-tool execute_program`, and the grant does not confer general
 program-execution permission: only the configured hook command and its fixed
-argument vector may run. The executable and arguments are passed directly
-without a shell, and the existing workspace, dangerous-command, output-limit,
-timeout, and process-cancellation safeguards remain in force.
+argument vector may run. `IDLE_HOOK_MODE` defaults to `detached`; detached mode
+uses direct executable invocation without a shell, starts the child, discards
+inherited Capelin output streams, reaps it asynchronously, and does not wait
+for completion. `wait` preserves bounded completion, timeout, and failure
+reporting for completion-sensitive hooks. `IDLE_HOOK_TIMEOUT` applies only to
+wait mode. Both modes retain workspace and dangerous-command validation.
 
-Hooks run once per eligible local terminal transition. Interactive hooks run in
-the background after state finalization and are serialized; local one-shot runs
-drain the hook before exiting. Hook failures are bounded diagnostics on stderr
-and never replace the original task or session result.
+Hooks run once per eligible local terminal transition. Interactive launches are
+serialized by launch order and may overlap in child lifetime; closing the
+session drains pending launches but never waits for detached children. A
+normally exiting parent does not cancel an already-started detached child; the
+operating system adopts and reaps it. Forced parent termination is
+platform-dependent and is not guaranteed to stop the child. Launch failures
+are bounded diagnostics on stderr and never replace the original task or
+session result.
 
 Server mode is explicitly local-hook-free. Synchronous and asynchronous HTTP
-requests ignore `IDLE_HOOK_COMMAND` and `IDLE_HOOK_ARGS`, including with
+requests ignore `IDLE_HOOK_COMMAND`, `IDLE_HOOK_ARGS`, and `IDLE_HOOK_MODE`, including with
 `--yolo` or program-execution permission. Remote requests cannot trigger the
 hook indirectly, and the server's restricted tool catalog and delivery behavior
 remain unchanged.

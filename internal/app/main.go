@@ -82,6 +82,7 @@ type config struct {
 	idleHookCommand     string
 	idleHookArgs        []string
 	idleHookTimeoutSec  int
+	idleHookMode        idleHookMode
 	idleHookSource      string
 	noIdleHook          bool
 	toolMaxParallel     int  // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
@@ -338,17 +339,27 @@ func newApp(cfg config) (*app, error) {
 		sessionStore: sessionStore,
 	}
 	if strings.TrimSpace(cfg.idleHookCommand) != "" && !cfg.noIdleHook {
-		instance.idleHooks = newIdleHookRunner(
+		mode := cfg.idleHookMode
+		if mode == "" {
+			mode = idleHookModeDetached
+		}
+		instance.idleHooks = newIdleHookRunnerWithMode(
+			mode,
 			cfg.idleHookCommand,
 			cfg.idleHookArgs,
 			cfg.workspaceRoot,
 			cfg.yolo,
 			defaultIdleHookExecutor,
+			defaultIdleHookLauncher,
 			os.Stderr,
 			cfg.idleHookTimeoutSec,
 		)
-		fmt.Fprintf(os.Stderr, "[capelin-go] idle hook enabled (command=%q source=%s timeout=%ds)\n",
-			cfg.idleHookCommand, idleHookSourceLabel(cfg.idleHookSource), cfg.idleHookTimeoutSec)
+		timeoutLabel := fmt.Sprintf("%ds", cfg.idleHookTimeoutSec)
+		if mode == idleHookModeDetached {
+			timeoutLabel = "disabled"
+		}
+		fmt.Fprintf(os.Stderr, "[capelin-go] idle hook enabled (command=%q source=%s mode=%s timeout=%s)\n",
+			cfg.idleHookCommand, idleHookSourceLabel(cfg.idleHookSource), mode, timeoutLabel)
 	}
 	subagentCfg := cfg.subagents
 	instance.subagents = newSubagentManager(subagentCfg, instance.runSubagentSession)
@@ -417,6 +428,7 @@ func loadConfig(args []string) (config, error) {
 		idleHookCommand:         parsed.IdleHookCommand,
 		idleHookArgs:            append([]string(nil), parsed.IdleHookArgs...),
 		idleHookTimeoutSec:      parsed.IdleHookTimeout,
+		idleHookMode:            idleHookMode(parsed.IdleHookMode),
 		idleHookSource:          parsed.IdleHookSource,
 		noIdleHook:              parsed.NoIdleHook,
 		toolMaxParallel:         parsed.ToolMaxParallel,
@@ -487,7 +499,7 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "  --final-only               one-shot mode: suppress intermediate tool output, show only the final answer")
 	fmt.Fprintln(w, "  --debug                    dump HTTP request and response to stderr")
 	fmt.Fprintln(w, "Env: ENDPOINT, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS, MAX_GOAL_ITERATIONS, MODEL_REQUEST_TIMEOUT_SECONDS, CONTEXT_WINDOW")
-	fmt.Fprintln(w, "     IDLE_HOOK_COMMAND, IDLE_HOOK_ARGS (JSON string array), IDLE_HOOK_TIMEOUT (seconds; local one-shot and interactive)")
+	fmt.Fprintln(w, "     IDLE_HOOK_COMMAND, IDLE_HOOK_ARGS (JSON string array), IDLE_HOOK_MODE (detached|wait), IDLE_HOOK_TIMEOUT (wait-mode seconds; local one-shot and interactive)")
 	fmt.Fprintln(w, "     Idle hook flags: --idle-hook COMMAND, --no-idle-hook; a configured hook implicitly grants the dedicated idle_hook permission (never execute_program)")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")

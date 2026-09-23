@@ -68,6 +68,12 @@ func RunEditFile(workspaceRoot string, yolo bool, args EditFileArgs) (string, er
 func RunExecuteProgram(ctx context.Context, workspaceRoot string, yolo bool, args ExecuteProgramArgs) (string, error) {
 	return runExecuteProgram(ctx, workspaceRoot, yolo, args)
 }
+func RunIdleHookProgram(ctx context.Context, workspaceRoot string, yolo bool, args ExecuteProgramArgs) (string, error) {
+	return runIdleHookProgram(ctx, workspaceRoot, yolo, args)
+}
+func RunDetachedProgram(ctx context.Context, workspaceRoot string, yolo bool, args ExecuteProgramArgs) error {
+	return runDetachedProgram(ctx, workspaceRoot, yolo, args)
+}
 func RunExecuteSkill(ctx context.Context, workspaceRoot string, yolo bool, loaded map[string]skills.Skill, args ExecuteSkillArgs) (string, error) {
 	return runExecuteSkill(ctx, workspaceRoot, yolo, loaded, args)
 }

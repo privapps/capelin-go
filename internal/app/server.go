@@ -52,6 +52,7 @@ func startServer(cfg config) error {
 	// of using config.Load's server-mode exclusion.
 	serverCfg.idleHookCommand = ""
 	serverCfg.idleHookArgs = nil
+	serverCfg.idleHookMode = ""
 	serverCfg.allowedTools = cloneAllowedTools(serverAllowedTools)
 	a := &app{
 		cfg:       serverCfg,

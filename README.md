@@ -491,20 +491,25 @@ A non-empty hook is granted a dedicated `idle_hook` permission implicitly when
 the hook command is configured (`--yolo` also grants it); it does not require
 `--allow-tool execute_program` and does not grant general program-execution
 permission. Use `--idle-hook COMMAND` to set it for one run and
-`--no-idle-hook` to disable it. The hook runs the
-executable directly without a shell, and retains the normal program safety,
-workspace, timeout, output, and cancellation safeguards. It runs once after a
-local one-shot terminal outcome or finalized interactive turn; interactive
-hooks are backgrounded and serialized, one-shot shutdown drains them, and
-failures are logged without changing the original result.
+`--no-idle-hook` to disable it. `IDLE_HOOK_MODE` accepts `detached` (the
+default) or `wait`. Detached mode starts the executable directly without a
+shell and returns once the operating system accepts it; Capelin does not wait
+for playback or apply the hook timeout to the child. Wait mode retains bounded
+completion and failure reporting for completion-sensitive hooks. Both modes
+retain the normal safety and workspace checks and fixed direct arguments. It
+runs once after a local one-shot terminal outcome or finalized interactive
+turn; interactive launches are serialized by launch order and may overlap in
+child lifetime, one-shot shutdown drains pending launches, and failures are
+logged without changing the original result.
 
 The hook is strictly local. Server-mode synchronous and asynchronous HTTP
 requests never invoke it, even when the server is started with YOLO or
 program-execution permission. Server tool restrictions and HTTP delivery
 contracts are unchanged.
 
-`IDLE_HOOK_TIMEOUT` bounds one hook run in seconds (default `5`); invalid or
-non-positive values keep the default. Separately, `AGENT_QUESTION_PREVIEW_MAX`
+`IDLE_HOOK_TIMEOUT` bounds one wait-mode hook run in seconds (default `5`);
+detached mode does not apply it after launch. Invalid or non-positive values
+keep the default. Separately, `AGENT_QUESTION_PREVIEW_MAX`
 (default `160`) sets the rune budget for bounded previews such as agent
 questions and the goal heartbeat `current todo` field; it is parsed by
 `internal/config` and wired into the output layer at startup.

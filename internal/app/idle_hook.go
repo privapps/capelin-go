@@ -19,15 +19,22 @@ const (
 	idleHookDefaultTimeoutSec = 5
 	// idleHookMaxTimeoutSec is the absolute ceiling for a configured hook timeout.
 	idleHookMaxTimeoutSec = 600
-	// idleHookExecTimeoutCap mirrors the execute_program timeout_seconds contract
-	// (runExecuteProgram rejects values above 120).
-	idleHookExecTimeoutCap = 120
+	// idleHookExecTimeoutCap mirrors the dedicated idle-hook wait adapter's
+	// timeout ceiling. Ordinary execute_program remains capped at 120 seconds.
+	idleHookExecTimeoutCap = idleHookMaxTimeoutSec
 	// idleHookLogCapBytes bounds a single failure diagnostic so a chatty or
 	// failing hook cannot flood stderr.
 	idleHookLogCapBytes = 1024
 )
 
 const idleHookLogTruncationMarker = "…[truncated]"
+
+type idleHookMode string
+
+const (
+	idleHookModeDetached idleHookMode = "detached"
+	idleHookModeWait     idleHookMode = "wait"
+)
 
 // idleHookRunner owns the one-shot hook queue. A queue rather than a single
 // asynchronous call makes repeated lifecycle events deterministic and lets
@@ -37,8 +44,10 @@ type idleHookRunner struct {
 	args       []string
 	workspace  string
 	yolo       bool
+	mode       idleHookMode
 	timeoutSec int
 	execute    idleHookExecutor
+	launch     idleHookLauncher
 	logger     io.Writer
 
 	mu      sync.Mutex
@@ -50,6 +59,7 @@ type idleHookRunner struct {
 }
 
 type idleHookExecutor func(context.Context, string, string, bool, []string) (string, error)
+type idleHookLauncher func(context.Context, string, string, bool, []string) error
 
 // newIdleHookRunner builds the serialized hook queue.
 //
@@ -57,13 +67,28 @@ type idleHookExecutor func(context.Context, string, string, bool, []string) (str
 // existing app-level wiring keeps compiling until it passes a configured value.
 // 0, negative, or omitted selects idleHookDefaultTimeoutSec (5s); values above
 // idleHookMaxTimeoutSec are clamped down. This deadline is owned by the runner
-// and is independent of the execute_program 60s default / 120s maximum.
+// and is independent of the ordinary execute_program timeout contract.
 func newIdleHookRunner(command string, args []string, workspace string, yolo bool, execute idleHookExecutor, logger io.Writer, timeoutSec ...int) *idleHookRunner {
+	return newIdleHookRunnerWithMode(idleHookModeWait, command, args, workspace, yolo, execute, nil, logger, timeoutSec...)
+}
+
+// newIdleHookRunnerWithMode creates the serialized lifecycle queue. Detached
+// mode waits only for the launch adapter to return; wait mode observes the
+// existing result envelope until completion or its configured deadline.
+func newIdleHookRunnerWithMode(mode idleHookMode, command string, args []string, workspace string, yolo bool, execute idleHookExecutor, launch idleHookLauncher, logger io.Writer, timeoutSec ...int) *idleHookRunner {
 	if strings.TrimSpace(command) == "" || execute == nil {
-		return nil
+		if mode != idleHookModeDetached || launch == nil || strings.TrimSpace(command) == "" {
+			return nil
+		}
 	}
 	if logger == nil {
 		logger = io.Discard
+	}
+	if mode != idleHookModeWait {
+		mode = idleHookModeDetached
+	}
+	if mode == idleHookModeDetached && launch == nil {
+		launch = defaultIdleHookLauncher
 	}
 	configuredTimeout := 0
 	if len(timeoutSec) > 0 {
@@ -74,8 +99,10 @@ func newIdleHookRunner(command string, args []string, workspace string, yolo boo
 		args:       append([]string(nil), args...),
 		workspace:  workspace,
 		yolo:       yolo,
+		mode:       mode,
 		timeoutSec: configuredTimeout,
 		execute:    execute,
+		launch:     launch,
 		logger:     logger,
 		worker:     make(chan struct{}),
 	}
@@ -122,6 +149,17 @@ func (r *idleHookRunner) effectiveTimeoutSec() int {
 }
 
 func (r *idleHookRunner) executeOne() {
+	if r.mode == idleHookModeDetached {
+		err := r.launch(context.Background(), r.command, r.workspace, r.yolo, r.args)
+		if err != nil {
+			r.logFailure(err)
+		}
+		return
+	}
+	r.executeOneWait()
+}
+
+func (r *idleHookRunner) executeOneWait() {
 	effTimeout := r.effectiveTimeoutSec()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(effTimeout)*time.Second)
 	defer cancel()
@@ -143,9 +181,13 @@ func (r *idleHookRunner) executeOne() {
 		}
 	}
 	if err != nil {
-		line := fmt.Sprintf("[capelin-go] idle hook failed (command %q args %q): %v", r.command, r.args, err)
-		fmt.Fprintln(r.logger, capHookLog(line))
+		r.logFailure(err)
 	}
+}
+
+func (r *idleHookRunner) logFailure(err error) {
+	line := fmt.Sprintf("[capelin-go] idle hook failed (command %q args %q): %v", r.command, r.args, err)
+	fmt.Fprintln(r.logger, capHookLog(line))
 }
 
 // capHookLog bounds a single diagnostic to idleHookLogCapBytes UTF-8 bytes,
@@ -227,17 +269,24 @@ func (a *app) triggerInteractiveIdleHook() {
 }
 
 func defaultIdleHookExecutor(ctx context.Context, command, workspace string, yolo bool, args []string) (string, error) {
-	return tools.RunExecuteProgram(ctx, workspace, yolo, tools.ExecuteProgramArgs{
+	return tools.RunIdleHookProgram(ctx, workspace, yolo, tools.ExecuteProgramArgs{
 		Command:        command,
 		Args:           append([]string(nil), args...),
 		TimeoutSeconds: idleHookExecTimeoutSeconds(ctx),
 	})
 }
 
-// idleHookExecTimeoutSeconds derives the execute_program timeout_seconds from the
-// runner-owned deadline, clamped to [1, min(tools.ToolTimeoutMax, 120)] because
-// runExecuteProgram rejects timeout_seconds above 120. The runner context remains
-// the authoritative bound; this only keeps the adapter from outliving it.
+func defaultIdleHookLauncher(ctx context.Context, command, workspace string, yolo bool, args []string) error {
+	return tools.RunDetachedProgram(ctx, workspace, yolo, tools.ExecuteProgramArgs{
+		Command: command,
+		Args:    append([]string(nil), args...),
+	})
+}
+
+// idleHookExecTimeoutSeconds derives the idle-hook wait timeout_seconds from the
+// runner-owned deadline, clamped to [1, min(tools.ToolTimeoutMax, 600)]. The
+// runner context remains the authoritative bound; this only keeps the adapter
+// from outliving it.
 func idleHookExecTimeoutSeconds(ctx context.Context) int {
 	upper := idleHookExecTimeoutCap
 	if tools.ToolTimeoutMax < upper {

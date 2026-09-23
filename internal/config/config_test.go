@@ -32,7 +32,7 @@ func isolateLoad(t *testing.T) string {
 	for _, key := range append([]string{
 		"ENDPOINT", "MODEL", "TOKEN", "REASONING_EFFORT", "SYSTEM_PROMPT",
 		"SUBAGENT_MODEL", "SUBAGENT_REASONING_EFFORT", "IDLE_HOOK_COMMAND", "IDLE_HOOK_ARGS",
-		"IDLE_HOOK_TIMEOUT", "AGENT_QUESTION_PREVIEW_MAX",
+		"IDLE_HOOK_TIMEOUT", "IDLE_HOOK_MODE", "AGENT_QUESTION_PREVIEW_MAX",
 	}, numericConfigKeys...) {
 		t.Setenv(key, "")
 	}
@@ -42,7 +42,7 @@ func isolateLoad(t *testing.T) string {
 func writeConfig(t *testing.T, path string, values map[string]string) {
 	t.Helper()
 	lines := make([]string, 0, len(values))
-	for _, key := range []string{"ENDPOINT", "MODEL", "TOKEN", "REASONING_EFFORT", "IDLE_HOOK_COMMAND", "IDLE_HOOK_ARGS"} {
+	for _, key := range []string{"ENDPOINT", "MODEL", "TOKEN", "REASONING_EFFORT", "IDLE_HOOK_COMMAND", "IDLE_HOOK_ARGS", "IDLE_HOOK_MODE"} {
 		if value, ok := values[key]; ok {
 			lines = append(lines, key+" = "+value)
 		}
@@ -89,6 +89,7 @@ func TestLoadFirstRunUsesProviderDefaultsAndGeneratesOrdinaryConfig(t *testing.T
 		"TOOL_TIMEOUT_SECONDS = 60",
 		"IDLE_HOOK_COMMAND =",
 		"IDLE_HOOK_ARGS = []",
+		"IDLE_HOOK_MODE = detached",
 	} {
 		if !strings.Contains(contents, want) {
 			t.Fatalf("generated config missing %q:\n%s", want, contents)
@@ -557,6 +558,55 @@ func TestIdleHookSettingsAreMigratedWithoutChangingExistingValues(t *testing.T) 
 	if _, ok := saved["IDLE_HOOK_ARGS"]; !ok {
 		t.Fatal("migration omitted IDLE_HOOK_ARGS")
 	}
+	if _, ok := saved["IDLE_HOOK_MODE"]; !ok {
+		t.Fatal("migration omitted IDLE_HOOK_MODE")
+	}
+}
+
+func TestIdleHookModeDefaultsToDetachedAndFollowsLocalPrecedence(t *testing.T) {
+	t.Run("default is detached", func(t *testing.T) {
+		isolateLoad(t)
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.IdleHookMode != DefaultIdleHookMode {
+			t.Fatalf("IdleHookMode = %q, want %q", cfg.IdleHookMode, DefaultIdleHookMode)
+		}
+	})
+
+	t.Run("saved wait is honored", func(t *testing.T) {
+		path := isolateLoad(t)
+		writeConfig(t, path, map[string]string{"IDLE_HOOK_COMMAND": "hook", "IDLE_HOOK_MODE": "wait"})
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.IdleHookMode != IdleHookModeWait {
+			t.Fatalf("saved IdleHookMode = %q, want %q", cfg.IdleHookMode, IdleHookModeWait)
+		}
+	})
+
+	t.Run("environment overrides saved mode", func(t *testing.T) {
+		path := isolateLoad(t)
+		writeConfig(t, path, map[string]string{"IDLE_HOOK_COMMAND": "hook", "IDLE_HOOK_MODE": "wait"})
+		t.Setenv("IDLE_HOOK_MODE", "detached")
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.IdleHookMode != IdleHookModeDetached {
+			t.Fatalf("environment IdleHookMode = %q, want %q", cfg.IdleHookMode, IdleHookModeDetached)
+		}
+	})
+}
+
+func TestIdleHookModeRejectsUnsupportedLocalValues(t *testing.T) {
+	isolateLoad(t)
+	t.Setenv("IDLE_HOOK_MODE", "sometimes")
+	if _, err := Load([]string{"task"}); err == nil || !strings.Contains(err.Error(), "IDLE_HOOK_MODE") {
+		t.Fatalf("unsupported idle-hook mode was accepted without an actionable error: %v", err)
+	}
 }
 
 func TestServerModeIgnoresLocalIdleHookConfiguration(t *testing.T) {
@@ -568,6 +618,7 @@ func TestServerModeIgnoresLocalIdleHookConfiguration(t *testing.T) {
 	})
 	t.Setenv("IDLE_HOOK_COMMAND", "environment-hook")
 	t.Setenv("IDLE_HOOK_ARGS", `not-json`)
+	t.Setenv("IDLE_HOOK_MODE", "unsupported")
 
 	cfg, err := Load([]string{"--server-port", "8899"})
 	if err != nil {
@@ -575,6 +626,9 @@ func TestServerModeIgnoresLocalIdleHookConfiguration(t *testing.T) {
 	}
 	if cfg.IdleHookCommand != "" || len(cfg.IdleHookArgs) != 0 {
 		t.Fatalf("server config retained local hook: command=%q args=%#v", cfg.IdleHookCommand, cfg.IdleHookArgs)
+	}
+	if cfg.IdleHookMode != "" {
+		t.Fatalf("server config retained local hook mode: %q", cfg.IdleHookMode)
 	}
 	if cfg.ServerPort != 8899 || !cfg.ServerSecurityEnabled {
 		t.Fatalf("server mode contract changed: port=%d security=%v", cfg.ServerPort, cfg.ServerSecurityEnabled)

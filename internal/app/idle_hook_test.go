@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -55,6 +56,273 @@ func TestIdleHookRunnerSerializesCallsAndDrains(t *testing.T) {
 	}
 	if len(calls) != 2 || !reflect.DeepEqual(calls[0], []string{"first", "second"}) || !reflect.DeepEqual(calls[1], []string{"first", "second"}) {
 		t.Fatalf("hook calls=%#v", calls)
+	}
+}
+
+func TestDetachedIdleHookDrainsLaunchesWithoutWaitingForChild(t *testing.T) {
+	started := make(chan struct{})
+	childDone := make(chan struct{}, 2)
+	var log bytes.Buffer
+	runner := newIdleHookRunnerWithMode(idleHookModeDetached, "hook", []string{"literal arg", "$(not shell)"}, t.TempDir(), false,
+		nil,
+		func(_ context.Context, command, workspace string, yolo bool, args []string) error {
+			if command != "hook" || workspace == "" || yolo || !reflect.DeepEqual(args, []string{"literal arg", "$(not shell)"}) {
+				t.Errorf("detached launch received command=%q workspace=%q yolo=%v args=%#v", command, workspace, yolo, args)
+			}
+			close(started)
+			go func() {
+				time.Sleep(1500 * time.Millisecond)
+				close(childDone)
+			}()
+			return nil
+		}, &log)
+	if runner == nil {
+		t.Fatal("configured detached hook did not create a runner")
+	}
+	runner.trigger()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("detached hook was not launched")
+	}
+
+	begin := time.Now()
+	runner.drainAndClose()
+	if elapsed := time.Since(begin); elapsed >= time.Second {
+		t.Fatalf("detached drain waited for child completion: %v", elapsed)
+	}
+	select {
+	case <-childDone:
+		t.Fatal("detached runner waited for child completion")
+	default:
+	}
+	if log.Len() != 0 {
+		t.Fatalf("successful detached launch wrote diagnostics: %q", log.String())
+	}
+}
+
+func TestDetachedIdleHookLaunchFailureIsBoundedAndIsolated(t *testing.T) {
+	var log bytes.Buffer
+	runner := newIdleHookRunnerWithMode(idleHookModeDetached, "missing-hook", nil, t.TempDir(), false,
+		nil,
+		func(context.Context, string, string, bool, []string) error {
+			return errors.New("executable not found")
+		}, &log)
+	runner.trigger()
+	runner.drainAndClose()
+	line := strings.TrimSpace(log.String())
+	if !strings.Contains(line, `command "missing-hook"`) || !strings.Contains(line, "executable not found") {
+		t.Fatalf("launch diagnostic = %q, want command and launch error", line)
+	}
+	if len(line) > idleHookLogCapBytes {
+		t.Fatalf("launch diagnostic exceeded cap: %d", len(line))
+	}
+}
+
+func TestDetachedOneShotReturnsAfterLaunchWithoutWaitingForChild(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"done"}}]}`)
+	}))
+	defer provider.Close()
+
+	started := make(chan struct{})
+	childDone := make(chan struct{})
+	stopChild := make(chan struct{})
+	runner := newIdleHookRunnerWithMode(idleHookModeDetached, "hook", nil, t.TempDir(), false, nil,
+		func(context.Context, string, string, bool, []string) error {
+			close(started)
+			go func() {
+				select {
+				case <-stopChild:
+				case <-time.After(2 * time.Second):
+				}
+				close(childDone)
+			}()
+			return nil
+		}, &bytes.Buffer{})
+	a := &app{
+		cfg:       config{systemPrompt: "test", maxIterations: 2},
+		client:    &client{endpoint: provider.URL + "/chat/completions", model: "test", http: provider.Client()},
+		sink:      &turnEventSink{},
+		idleHooks: runner,
+	}
+	begin := time.Now()
+	if err := a.runQuestion(context.Background(), "finish"); err != nil {
+		t.Fatalf("runQuestion: %v", err)
+	}
+	if elapsed := time.Since(begin); elapsed >= time.Second {
+		t.Fatalf("one-shot waited for detached child: %v", elapsed)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("one-shot did not launch detached hook")
+	}
+	select {
+	case <-childDone:
+		t.Fatal("one-shot returned only after detached child completion")
+	default:
+	}
+	close(stopChild)
+	select {
+	case <-childDone:
+	case <-time.After(time.Second):
+		t.Fatal("test detached child did not finish after release")
+	}
+}
+
+func TestDetachedLaunchFailureDoesNotReplaceOneShotResult(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"done"}}]}`)
+	}))
+	defer provider.Close()
+
+	var log bytes.Buffer
+	runner := newIdleHookRunnerWithMode(idleHookModeDetached, "missing-hook", nil, t.TempDir(), false, nil,
+		func(context.Context, string, string, bool, []string) error {
+			return errors.New("launch denied by operating system")
+		}, &log)
+	a := &app{
+		cfg:       config{systemPrompt: "test", maxIterations: 2},
+		client:    &client{endpoint: provider.URL + "/chat/completions", model: "test", http: provider.Client()},
+		sink:      &turnEventSink{},
+		idleHooks: runner,
+	}
+	if err := a.runQuestion(context.Background(), "finish"); err != nil {
+		t.Fatalf("detached launch failure replaced successful task result: %v", err)
+	}
+	if !strings.Contains(log.String(), `command "missing-hook"`) || !strings.Contains(log.String(), "launch denied") {
+		t.Fatalf("detached launch diagnostic = %q", log.String())
+	}
+}
+
+func TestDetachedInteractiveHookDoesNotBlockNextTurn(t *testing.T) {
+	started := make(chan struct{})
+	stopChild := make(chan struct{})
+	childDone := make(chan struct{}, 2)
+	var calls atomic.Int32
+	var activeChildren atomic.Int32
+	var maxActiveChildren atomic.Int32
+	runner := newIdleHookRunnerWithMode(idleHookModeDetached, "hook", nil, t.TempDir(), false, nil,
+		func(context.Context, string, string, bool, []string) error {
+			if calls.Add(1) == 1 {
+				close(started)
+			}
+			active := activeChildren.Add(1)
+			for {
+				maxActive := maxActiveChildren.Load()
+				if active <= maxActive || maxActiveChildren.CompareAndSwap(maxActive, active) {
+					break
+				}
+			}
+			go func() {
+				defer activeChildren.Add(-1)
+				select {
+				case <-stopChild:
+				case <-time.After(2 * time.Second):
+				}
+				childDone <- struct{}{}
+			}()
+			return nil
+		}, &bytes.Buffer{})
+	a := &app{idleHooks: runner}
+	session := &interactiveSession{}
+	var controller *interactiveTurnController
+	controller = newInteractiveTurnController(nil, nil, nil, func(outcome interactiveTurnOutcome) {
+		a.finishInteractiveTurn(controller, session, outcome)
+	}, a.triggerInteractiveIdleHook)
+	if !a.startInteractiveTurn(context.Background(), controller, session, func(_ context.Context, worker *interactiveSession) (bool, error) {
+		worker.lastResponse = "first"
+		return false, nil
+	}) {
+		t.Fatal("first interactive turn did not start")
+	}
+	controller.wait()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first detached hook did not launch")
+	}
+	if !a.startInteractiveTurn(context.Background(), controller, session, func(_ context.Context, worker *interactiveSession) (bool, error) {
+		worker.lastResponse = "second"
+		return false, nil
+	}) {
+		t.Fatal("next interactive turn was blocked by detached child")
+	}
+	controller.wait()
+	deadline := time.Now().Add(time.Second)
+	for calls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("interactive detached launch calls=%d, want 2", calls.Load())
+	}
+	if maxActiveChildren.Load() < 2 {
+		t.Fatalf("detached child lifetimes did not overlap: max active=%d", maxActiveChildren.Load())
+	}
+	close(stopChild)
+	runner.drainAndClose()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-childDone:
+		case <-time.After(time.Second):
+			t.Fatal("detached child did not finish after release")
+		}
+	}
+}
+
+func TestIdleHookModeIsWiredIntoApplicationRunner(t *testing.T) {
+	t.Setenv("IDLE_HOOK_MODE", "detached")
+	cfg, err := loadConfig([]string{"--idle-hook", "hook", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	instance, err := newApp(cfg)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	if instance.idleHooks == nil {
+		t.Fatal("configured idle hook did not create a runner")
+	}
+	if instance.idleHooks.mode != idleHookModeDetached {
+		t.Fatalf("idle hook mode = %q, want %q", instance.idleHooks.mode, idleHookModeDetached)
+	}
+	instance.idleHooks.drainAndClose()
+}
+
+func TestIdleHookModeAbsentDefaultsToDetachedInApplicationRunner(t *testing.T) {
+	t.Setenv("IDLE_HOOK_MODE", "")
+	cfg, err := loadConfig([]string{"--idle-hook", "hook", "task"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	instance, err := newApp(cfg)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	if instance.idleHooks == nil || instance.idleHooks.mode != idleHookModeDetached {
+		t.Fatalf("absent mode resolved to %v, want %q", instance.idleHooks, idleHookModeDetached)
+	}
+	instance.idleHooks.drainAndClose()
+}
+
+func TestIdleHookExplicitWaitModeKeepsBoundedCompletion(t *testing.T) {
+	var log bytes.Buffer
+	runner := newIdleHookRunnerWithMode(idleHookModeWait, "hook", nil, t.TempDir(), false,
+		func(ctx context.Context, _ string, _ string, _ bool, _ []string) (string, error) {
+			<-ctx.Done()
+			return `{"exit_code":0}`, nil
+		}, nil, &log, 1)
+	runner.trigger()
+	begin := time.Now()
+	runner.drainAndClose()
+	if elapsed := time.Since(begin); elapsed < 900*time.Millisecond || elapsed > 2500*time.Millisecond {
+		t.Fatalf("wait mode completion took %v, want approximately one second", elapsed)
+	}
+	if !strings.Contains(log.String(), "timeout") {
+		t.Fatalf("wait-mode timeout diagnostic missing: %q", log.String())
 	}
 }
 

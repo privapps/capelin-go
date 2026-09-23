@@ -174,22 +174,17 @@ For more cases, see the [Troubleshooting FAQ](troubleshooting.md).
 
 ## Local idle hooks and server mode
 
-`IDLE_HOOK_COMMAND` and `IDLE_HOOK_ARGS` configure a local-only idle hook. The
-command is run once after a local one-shot terminal outcome or after an
-interactive turn has been finalized and the prompt is idle. `IDLE_HOOK_ARGS`
-must be a JSON string array. Environment values override non-empty saved values
-using the normal CLI > environment > saved config > built-in defaults
-precedence. A blank command is disabled.
-
-A configured hook requires `--allow-tool execute_program` or `--yolo`. It uses
-direct executable invocation without a shell and retains the existing workspace,
-dangerous-command, bounded-output, timeout, and process-cancellation safeguards.
-Interactive hooks run in the background and are serialized; one-shot shutdown
-drains them. Hook failures are reported as bounded stderr diagnostics without
-changing the original task result.
+`IDLE_HOOK_COMMAND`, `IDLE_HOOK_ARGS`, and `IDLE_HOOK_MODE` configure a
+local-only idle hook. The mode defaults to `detached`, which starts the command
+directly and returns without waiting; `wait` retains bounded completion
+semantics for completion-sensitive hooks. The command is run once after a local
+one-shot terminal outcome or after an interactive turn has been finalized and
+the prompt is idle. `IDLE_HOOK_ARGS` must be a JSON string array. Environment
+values override non-empty saved values using the normal CLI > environment >
+saved config > built-in defaults precedence. A blank command is disabled.
 
 These settings never apply to this HTTP server. Both synchronous and
-asynchronous requests ignore a configured local hook, even with YOLO or
-program-execution permission. Server responses, async result delivery,
-admission limits, error handling, and the restricted server tool catalog are
-unchanged.
+asynchronous requests ignore `IDLE_HOOK_COMMAND`, `IDLE_HOOK_ARGS`, and
+`IDLE_HOOK_MODE`, including with YOLO or program-execution permission. Remote
+requests cannot trigger the hook indirectly, and the server's restricted tool
+catalog and delivery behavior remain unchanged.

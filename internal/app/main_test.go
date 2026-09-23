@@ -86,6 +86,7 @@ func TestPrintUsageDescribesProviderAndRuntimeProfileContract(t *testing.T) {
 		"--yolo enables permissions and path access only; it does not select goal budgets",
 		"stopping/completing a goal restores ordinary limits",
 		"IDLE_HOOK_COMMAND, IDLE_HOOK_ARGS",
+		"IDLE_HOOK_MODE",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("help missing %q:\n%s", want, text)

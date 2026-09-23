@@ -119,6 +119,7 @@ type Config struct {
 	IdleHookCommand           string
 	IdleHookArgs              []string
 	IdleHookTimeout           int
+	IdleHookMode              string // "detached" (default) or "wait"
 	NoIdleHook                bool
 	IdleHookSource            string // "" or "cli"/"env"/"saved"
 	ToolMaxParallel           int    // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
@@ -158,6 +159,12 @@ const (
 // outside this package (for example the ::limits status view) report the same
 // budget the runtime applies instead of duplicating the literal.
 const DefaultAgentQuestionPreviewMax = 160
+
+const (
+	IdleHookModeDetached = "detached"
+	IdleHookModeWait     = "wait"
+	DefaultIdleHookMode  = IdleHookModeDetached
+)
 
 type agentRole string
 
@@ -301,6 +308,7 @@ func Load(args []string) (Config, error) {
 	idleHookFlagSet := false
 	noIdleHook := false
 	idleHookTimeout := 5
+	idleHookMode := ""
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -677,6 +685,16 @@ func Load(args []string) (Config, error) {
 			idleHookArgs = nil
 			idleHookSource = ""
 		}
+		rawMode := strings.TrimSpace(readCfg("IDLE_HOOK_MODE", fileCfg, DefaultIdleHookMode))
+		if rawMode == "" {
+			rawMode = DefaultIdleHookMode
+		}
+		switch strings.ToLower(rawMode) {
+		case IdleHookModeDetached, IdleHookModeWait:
+			idleHookMode = strings.ToLower(rawMode)
+		default:
+			return Config{}, fmt.Errorf("IDLE_HOOK_MODE must be %q or %q, got %q", IdleHookModeDetached, IdleHookModeWait, rawMode)
+		}
 	}
 	// A real, enabled, local idle hook implicitly consumes the dedicated
 	// idle_hook opt-in permission. The grant is narrow by construction: it
@@ -820,6 +838,7 @@ func Load(args []string) (Config, error) {
 		IdleHookCommand:           idleHookCommand,
 		IdleHookArgs:              idleHookArgs,
 		IdleHookTimeout:           idleHookTimeout,
+		IdleHookMode:              idleHookMode,
 		NoIdleHook:                noIdleHook,
 		IdleHookSource:            idleHookSource,
 		ToolMaxParallel:           toolMaxParallel,
@@ -1091,10 +1110,12 @@ TOOL_MAX_PARALLEL = 8
 TOOL_TIMEOUT_SECONDS = 60
 TOOL_RETRY_ON_TIMEOUT = true
 
-# Local one-shot idle hook (requires --allow-tool execute_program or --yolo).
-# IDLE_HOOK_ARGS is a JSON string array and is executed without a shell.
+# Local idle hook. Detached mode launches the program and does not wait for it;
+# wait mode preserves bounded completion semantics. IDLE_HOOK_ARGS is a JSON
+# string array and is executed without a shell.
 IDLE_HOOK_COMMAND =
 IDLE_HOOK_ARGS = []
+IDLE_HOOK_MODE = detached
 
 # Context window budget (env: CONTEXT_WINDOW; also settable via --context-window)
 # Optional character budget for proactive compaction. When set, the conversation
