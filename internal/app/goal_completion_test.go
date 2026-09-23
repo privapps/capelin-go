@@ -138,6 +138,31 @@ func TestCompleteGoalConcurrentChecklistInvalidationIsSafe(t *testing.T) {
 	}
 }
 
+func TestGoalCompletionBatchOrdersControlToolsWithParallelism(t *testing.T) {
+	completed := goalTodosArguments("finished work", "completed")
+	testApp := newInteractiveTurnTestAppWithResponses(t,
+		chatTurnResponse("", "", []map[string]any{
+			goalToolCall("todo", toolUpdateTodos, completed),
+			goalToolCall("claim", toolCompleteGoal, `{"summary":"finished","evidence":["the final checklist was verified"]}`),
+		}),
+		chatTurnResponse("done", "", nil),
+	)
+	configureGoalTestApp(testApp, map[string]bool{toolUpdateTodos: true}, 1, 1)
+	testApp.app.cfg.toolMaxParallel = 2
+	testApp.app.toolset = buildAgentTools(testApp.app.cfg.allowedTools)
+
+	session, err := testApp.app.newInteractiveSession(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped := testApp.app.runGoal(context.Background(), session, "finish the work"); stopped {
+		t.Fatal("goal unexpectedly stopped after ordered control calls")
+	}
+	if !validGoalCompletion(session.activeGoal, session.todos) {
+		t.Fatalf("goal completion batch left invalid state: goal=%#v todos=%#v", session.activeGoal, session.todos)
+	}
+}
+
 func newInteractiveGoalCancellationHarness(t *testing.T) (*interactiveTurnTestApp, <-chan struct{}, <-chan struct{}) {
 	t.Helper()
 	pending := goalTodosArguments("unfinished work", "pending")

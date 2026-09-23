@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"capelin-go/internal/contracts"
@@ -55,6 +56,75 @@ func TestEngineCompactRejectsEmptyAndToolCompletions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestShrinkToBudgetDropsAssistantToolCallAndResultsTogether(t *testing.T) {
+	call := contracts.ToolCall{
+		ID:       "call-1",
+		Type:     "function",
+		Function: contracts.FunctionCall{Name: "read_file", Arguments: `{"path":"notes.txt"}`},
+	}
+	messages := []contracts.Message{
+		{Role: "system", Content: "instructions"},
+		{Role: "user", Content: "old request"},
+		{Role: "assistant", ToolCalls: []contracts.ToolCall{call}},
+		{Role: "tool", ToolCallID: call.ID, Content: strings.Repeat("large output ", 20)},
+		{Role: "user", Content: "latest request"},
+	}
+	groupSize := estimateMessageChars(messages[2]) + estimateMessageChars(messages[3])
+	shrunk := shrinkToBudget(messages, estimateMessagesChars(messages)-groupSize)
+
+	if hasToolCallMessage(shrunk, call.ID) || hasToolResult(shrunk, call.ID) {
+		t.Fatalf("compaction split or retained an incomplete tool pair: %#v", shrunk)
+	}
+	if len(shrunk) != 3 || shrunk[0].Role != "system" || shrunk[len(shrunk)-1].Content != "latest request" {
+		t.Fatalf("compaction removed protected history: %#v", shrunk)
+	}
+}
+
+func TestShrinkToBudgetDropsMultiCallGroupAtomically(t *testing.T) {
+	calls := []contracts.ToolCall{
+		{ID: "call-1", Type: "function", Function: contracts.FunctionCall{Name: "read_file", Arguments: `{}`}},
+		{ID: "call-2", Type: "function", Function: contracts.FunctionCall{Name: "list_files", Arguments: `{}`}},
+	}
+	messages := []contracts.Message{
+		{Role: "system", Content: "instructions"},
+		{Role: "assistant", ToolCalls: calls},
+		{Role: "tool", ToolCallID: calls[0].ID, Content: strings.Repeat("first ", 20)},
+		{Role: "tool", ToolCallID: calls[1].ID, Content: strings.Repeat("second ", 20)},
+		{Role: "user", Content: "latest request"},
+	}
+	groupSize := estimateMessageChars(messages[1]) + estimateMessageChars(messages[2]) + estimateMessageChars(messages[3])
+	shrunk := shrinkToBudget(messages, estimateMessagesChars(messages)-groupSize)
+
+	for _, call := range calls {
+		if hasToolCallMessage(shrunk, call.ID) || hasToolResult(shrunk, call.ID) {
+			t.Fatalf("multi-call group was split for %q: %#v", call.ID, shrunk)
+		}
+	}
+	if len(shrunk) != 2 {
+		t.Fatalf("unexpected retained history: %#v", shrunk)
+	}
+}
+
+func hasToolCallMessage(messages []contracts.Message, callID string) bool {
+	for _, message := range messages {
+		for _, call := range message.ToolCalls {
+			if call.ID == callID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasToolResult(messages []contracts.Message, callID string) bool {
+	for _, message := range messages {
+		if message.Role == "tool" && message.ToolCallID == callID {
+			return true
+		}
+	}
+	return false
 }
 
 type blockingCompactionProvider struct {

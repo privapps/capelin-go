@@ -59,11 +59,13 @@ results as well. Long-running one-shot requests still emit bounded progress
 diagnostics on standard error, while the final answer remains the only standard
 output.
 
-One-shot model work and each model HTTP request have a five-minute default
-timeout. Override it when a provider needs a different bound:
+One-shot model work, including shell-launched `/goal` workflows, and each model
+HTTP request have a five-minute default timeout. Override it when a provider
+needs a different bound:
 
 ```bash
 ./capelin-go --model-request-timeout-seconds 180 --final-only "answer a short test question"
+./capelin-go --yolo --model-request-timeout-seconds 180 '/goal inspect and verify this repository'
 ```
 
 The same `MODEL_REQUEST_TIMEOUT_SECONDS` key works in the environment or the

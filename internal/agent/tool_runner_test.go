@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"errors"
+	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -95,5 +97,53 @@ func TestConfiguredToolRunnerUsesApplicationErrorHook(t *testing.T) {
 	results := runner.Run(context.Background(), []contracts.ToolCall{call})
 	if handled.Load() != 1 || len(results) != 1 || results[0].Output != wantErr.Error() || !results[0].IsError {
 		t.Fatalf("handled=%d results=%#v", handled.Load(), results)
+	}
+}
+
+func TestConfiguredToolRunnerSerializesClassifiedCalls(t *testing.T) {
+	calls := []contracts.ToolCall{
+		{ID: "update", Function: contracts.FunctionCall{Name: "update_todos"}},
+		{ID: "work", Function: contracts.FunctionCall{Name: "read_file"}},
+		{ID: "work-2", Function: contracts.FunctionCall{Name: "list_files"}},
+		{ID: "complete", Function: contracts.FunctionCall{Name: "complete_goal"}},
+	}
+	var mu sync.Mutex
+	var controlOrder []string
+	var running atomic.Int32
+	var peak atomic.Int32
+	runner := NewToolRunner(ToolRunnerConfig{MaxParallel: 3, Timeout: time.Second}, func(_ context.Context, call contracts.ToolCall) (string, error) {
+		if call.Function.Name == "read_file" || call.Function.Name == "list_files" {
+			current := running.Add(1)
+			for {
+				previous := peak.Load()
+				if current <= previous || peak.CompareAndSwap(previous, current) {
+					break
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+			running.Add(-1)
+		} else {
+			mu.Lock()
+			controlOrder = append(controlOrder, call.Function.Name)
+			mu.Unlock()
+		}
+		return call.ID, nil
+	}, ToolRunnerHooks{
+		Serialize: func(call contracts.ToolCall) bool {
+			return call.Function.Name == "update_todos" || call.Function.Name == "complete_goal"
+		},
+	})
+
+	results := runner.Run(context.Background(), calls)
+	if got, want := controlOrder, []string{"update_todos", "complete_goal"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("serialized control order=%v, want %v", got, want)
+	}
+	if peak.Load() != 2 {
+		t.Fatalf("non-control peak=%d, want 2", peak.Load())
+	}
+	for i, result := range results {
+		if result.Call.ID != calls[i].ID || result.Output != calls[i].ID {
+			t.Fatalf("result[%d]=%#v, want call/output %q", i, result, calls[i].ID)
+		}
 	}
 }

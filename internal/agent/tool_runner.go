@@ -35,6 +35,9 @@ type ToolRunnerConfig struct {
 // errors or apply other application-specific policy.
 type ToolRunnerHooks struct {
 	ResolveTimeout func(call contracts.ToolCall, defaultTimeout time.Duration) time.Duration
+	// Serialize identifies calls that must execute in their original response
+	// order. Calls not selected by the hook retain bounded parallel execution.
+	Serialize func(call contracts.ToolCall) bool
 	// HandleResult lets the application preserve a successful dispatch's
 	// structured output while adding application-owned result classification.
 	// The agent package does not interpret the returned result.
@@ -62,47 +65,64 @@ func NewToolRunner(config ToolRunnerConfig, dispatcher ToolDispatcher, hooks Too
 
 func (r configuredToolRunner) Run(ctx context.Context, calls []contracts.ToolCall) []contracts.ToolResult {
 	results := make([]contracts.ToolResult, len(calls))
+	if r.config.MaxParallel == 0 {
+		return results
+	}
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.SetLimit(r.config.MaxParallel)
+	serialized := make([]bool, len(calls))
 
 	for index, call := range calls {
 		index, call := index, call
+		serialized[index] = r.hooks.Serialize != nil && r.hooks.Serialize(call)
+		if serialized[index] {
+			continue
+		}
 		group.Go(func() error {
-			timeout := r.config.Timeout
-			if r.hooks.ResolveTimeout != nil {
-				timeout = r.hooks.ResolveTimeout(call, timeout)
-			}
-			retried := false
-			for attempt := 0; attempt <= 1; attempt++ {
-				toolCtx, cancel := context.WithTimeout(groupCtx, timeout)
-				out, err := r.dispatch(toolCtx, call)
-				cancel()
-				if err != nil {
-					if attempt == 0 && r.config.RetryOnTimeout && errors.Is(err, context.DeadlineExceeded) {
-						retried = true
-						continue
-					}
-					result := r.errorResult(call, err)
-					result.Retried = retried
-					results[index] = result
-					return nil
-				}
-				result := contracts.ToolResult{Call: call, Output: out, Retried: retried}
-				if r.hooks.HandleResult != nil {
-					result = r.hooks.HandleResult(call, out)
-					if result.Call.ID == "" && result.Call.Function.Name == "" {
-						result.Call = call
-					}
-					result.Retried = result.Retried || retried
-				}
-				results[index] = result
-				return nil
-			}
+			results[index] = r.runCall(groupCtx, call)
 			return nil
 		})
 	}
+	for index, call := range calls {
+		if !serialized[index] {
+			continue
+		}
+		results[index] = r.runCall(groupCtx, call)
+	}
 	_ = group.Wait()
 	return results
+}
+
+func (r configuredToolRunner) runCall(groupCtx context.Context, call contracts.ToolCall) contracts.ToolResult {
+	timeout := r.config.Timeout
+	if r.hooks.ResolveTimeout != nil {
+		timeout = r.hooks.ResolveTimeout(call, timeout)
+	}
+	retried := false
+	for attempt := 0; attempt <= 1; attempt++ {
+		toolCtx, cancel := context.WithTimeout(groupCtx, timeout)
+		out, err := r.dispatch(toolCtx, call)
+		cancel()
+		if err != nil {
+			if attempt == 0 && r.config.RetryOnTimeout && errors.Is(err, context.DeadlineExceeded) {
+				retried = true
+				continue
+			}
+			result := r.errorResult(call, err)
+			result.Retried = retried
+			return result
+		}
+		result := contracts.ToolResult{Call: call, Output: out, Retried: retried}
+		if r.hooks.HandleResult != nil {
+			result = r.hooks.HandleResult(call, out)
+			if result.Call.ID == "" && result.Call.Function.Name == "" {
+				result.Call = call
+			}
+			result.Retried = result.Retried || retried
+		}
+		return result
+	}
+	return r.errorResult(call, errors.New("tool call exhausted without a result"))
 }
 
 func (r configuredToolRunner) dispatch(ctx context.Context, call contracts.ToolCall) (string, error) {

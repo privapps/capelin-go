@@ -186,3 +186,31 @@ func TestOrdinaryOneShotUsesConfiguredOverallTimeout(t *testing.T) {
 		t.Fatalf("one-shot timeout took %s, want less than one second", elapsed)
 	}
 }
+
+func TestOneShotGoalUsesConfiguredOverallTimeout(t *testing.T) {
+	testApp := newInteractiveTurnTestApp(t)
+	testApp.app.cfg.yolo = true
+	testApp.app.cfg.modelRequestTimeout = 20 * time.Millisecond
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		timer := time.NewTimer(500 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"late"}}]}`))
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	testApp.app.client.endpoint = server.URL
+	testApp.app.client.http = server.Client()
+
+	started := time.Now()
+	err := testApp.app.runQuestion(context.Background(), "/goal bounded goal")
+	if err == nil || !strings.Contains(err.Error(), "one-shot goal incomplete") {
+		t.Fatalf("one-shot goal timeout error = %v, want incomplete goal error", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("one-shot goal timeout took %s, want less than 250ms", elapsed)
+	}
+}

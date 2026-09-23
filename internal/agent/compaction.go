@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"capelin-go/internal/contracts"
@@ -84,27 +85,20 @@ func (e *Engine) CompactWithinBudget(ctx context.Context, options CompactOptions
 	return e.Compact(ctx, options)
 }
 
-// candidate is an index-size pair used by the compaction pre-shrink to
-// identify which messages to drop.
+// candidate is an atomic index-size pair used by the compaction pre-shrink to
+// identify which messages to drop. Assistant tool-call messages and their
+// matching tool results are represented by one candidate.
 type candidate struct {
-	idx  int
-	size int
+	indices []int
+	size    int
+	tool    bool
 }
 
 // estimateMessagesChars returns a rough character count for a message slice.
 func estimateMessagesChars(messages []contracts.Message) int {
 	total := 0
 	for _, m := range messages {
-		total += len(m.Content)
-		if m.ToolCallID != "" {
-			total += len(m.ToolCallID) + 20
-		}
-		for _, tc := range m.ToolCalls {
-			total += len(tc.Function.Name) + len(tc.Function.Arguments)
-		}
-		if m.ReasoningContent != nil {
-			total += len(*m.ReasoningContent)
-		}
+		total += estimateMessageChars(m)
 	}
 	return total
 }
@@ -126,23 +120,13 @@ func shrinkToBudget(messages []contracts.Message, maxChars int) []contracts.Mess
 		}
 	}
 
-	// Build index of droppable messages (all except system and the last message).
-	var droppable []candidate
-	for i, m := range messages {
-		if i == systemIdx {
-			continue
-		}
-		if i == len(messages)-1 {
-			// Always keep the most recent message.
-			continue
-		}
-		droppable = append(droppable, candidate{idx: i, size: estimateMessageChars(m)})
+	protected := make(map[int]bool, 2)
+	if systemIdx >= 0 {
+		protected[systemIdx] = true
 	}
-
-	// Sort: tool messages first (by size descending), then others by size
-	// descending. Tool messages are the primary targets because they carry
-	// large command output.
-	sortDroppable(droppable, messages)
+	// Always keep the most recent message.
+	protected[len(messages)-1] = true
+	droppable := compactionCandidates(messages, protected)
 
 	// Drop messages until we fit the budget.
 	dropped := make(map[int]bool)
@@ -151,7 +135,9 @@ func shrinkToBudget(messages []contracts.Message, maxChars int) []contracts.Mess
 		if kept <= maxChars {
 			break
 		}
-		dropped[c.idx] = true
+		for _, idx := range c.indices {
+			dropped[idx] = true
+		}
 		kept -= c.size
 	}
 
@@ -167,35 +153,93 @@ func shrinkToBudget(messages []contracts.Message, maxChars int) []contracts.Mess
 
 // estimateMessageChars returns a rough character count for a single message.
 func estimateMessageChars(m contracts.Message) int {
-	return len(m.Content) + len(m.ToolCallID) + 20
+	total := len(m.Content)
+	if m.ToolCallID != "" {
+		total += len(m.ToolCallID) + 20
+	}
+	for _, tc := range m.ToolCalls {
+		total += len(tc.Function.Name) + len(tc.Function.Arguments)
+	}
+	if m.ReasoningContent != nil {
+		total += len(*m.ReasoningContent)
+	}
+	return total
 }
 
-// sortDroppable sorts droppable in place so tool messages come first (largest
-// first), followed by non-tool messages (largest first).
-func sortDroppable(droppable []candidate, messages []contracts.Message) {
-	if len(droppable) <= 1 {
-		return
-	}
-	// Stable-ish partition: move tool messages to front, then sort each half.
-	toolEnd := 0
-	for i := 0; i < len(droppable); i++ {
-		if messages[droppable[i].idx].Role == "tool" {
-			droppable[toolEnd], droppable[i] = droppable[i], droppable[toolEnd]
-			toolEnd++
+// compactionCandidates builds deletion units while preserving provider-visible
+// assistant tool-call/result relationships.
+func compactionCandidates(messages []contracts.Message, protected map[int]bool) []candidate {
+	callOwners := make(map[string]int)
+	groups := make(map[int][]int)
+	assigned := make(map[int]bool)
+	for i, message := range messages {
+		if message.Role != "assistant" || len(message.ToolCalls) == 0 {
+			continue
+		}
+		groups[i] = []int{i}
+		assigned[i] = true
+		for _, call := range message.ToolCalls {
+			if call.ID != "" {
+				callOwners[call.ID] = i
+			}
 		}
 	}
-	// Sort tool half by size descending.
-	for i := 1; i < toolEnd; i++ {
-		for j := i; j > 0 && droppable[j].size > droppable[j-1].size; j-- {
-			droppable[j], droppable[j-1] = droppable[j-1], droppable[j]
+	for i, message := range messages {
+		if message.Role != "tool" {
+			continue
+		}
+		if owner, ok := callOwners[message.ToolCallID]; ok {
+			groups[owner] = append(groups[owner], i)
+			assigned[i] = true
 		}
 	}
-	// Sort non-tool half by size descending.
-	for i := toolEnd + 1; i < len(droppable); i++ {
-		for j := i; j > toolEnd && droppable[j].size > droppable[j-1].size; j-- {
-			droppable[j], droppable[j-1] = droppable[j-1], droppable[j]
+
+	var droppable []candidate
+	for i, message := range messages {
+		if group, ok := groups[i]; ok {
+			if anyProtected(group, protected) {
+				continue
+			}
+			droppable = append(droppable, candidate{
+				indices: group,
+				size:    estimateCandidateSize(messages, group),
+				tool:    true,
+			})
+			continue
+		}
+		if assigned[i] || protected[i] {
+			continue
+		}
+		droppable = append(droppable, candidate{
+			indices: []int{i},
+			size:    estimateMessageChars(message),
+			tool:    message.Role == "tool",
+		})
+	}
+	sort.SliceStable(droppable, func(i, j int) bool {
+		if droppable[i].tool != droppable[j].tool {
+			return droppable[i].tool
+		}
+		return droppable[i].size > droppable[j].size
+	})
+	return droppable
+}
+
+func anyProtected(indices []int, protected map[int]bool) bool {
+	for _, idx := range indices {
+		if protected[idx] {
+			return true
 		}
 	}
+	return false
+}
+
+func estimateCandidateSize(messages []contracts.Message, indices []int) int {
+	total := 0
+	for _, idx := range indices {
+		total += estimateMessageChars(messages[idx])
+	}
+	return total
 }
 
 // cloneAgentMessages returns a deep copy of a message slice suitable for

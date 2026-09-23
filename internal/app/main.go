@@ -541,12 +541,12 @@ func PrintUsage(w io.Writer, executable string) {
 
 func (a *app) runQuestion(ctx context.Context, question string) error {
 	defer a.finishOneShotIdleHook()
-	if objective, ok := leadingCommandArgument(question, "/goal"); ok {
-		return a.runOneShotGoal(ctx, objective)
-	}
 	var cancel context.CancelFunc
 	ctx, cancel = context.WithTimeout(ctx, modelRequestTimeout(a.cfg))
 	defer cancel()
+	if objective, ok := leadingCommandArgument(question, "/goal"); ok {
+		return a.runOneShotGoal(ctx, objective)
+	}
 	if !a.cfg.finalOnly {
 		fmt.Fprintf(os.Stderr, "[capelin-go] Task: %s\n\n", question)
 	}

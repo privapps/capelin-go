@@ -36,7 +36,8 @@ Run once with `--debug` to inspect the request and response details. Treat the d
 
 ## A one-shot request appears stuck
 
-Capelin bounds the overall one-shot model work and each model HTTP request with
+Capelin bounds the overall one-shot model work, including shell-launched
+`/goal` workflows, and each model HTTP request with
 `MODEL_REQUEST_TIMEOUT_SECONDS` (five minutes by default). This prevents a
 multi-iteration tool loop from multiplying the timeout. With
 `--final-only`, intermediate tool output is intentionally hidden from standard

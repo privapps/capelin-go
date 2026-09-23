@@ -98,6 +98,9 @@ func newAppToolCapability(toolset []contracts.Tool, a *app, runtime *agentRuntim
 						}
 						return defaultTimeout
 					},
+					Serialize: func(call contracts.ToolCall) bool {
+						return isGoalControlTool(call.Function.Name)
+					},
 					HandleResult: func(call contracts.ToolCall, output string) contracts.ToolResult {
 						result := contracts.ToolResult{Call: call, Output: output}
 						if commandFailed(call, output) {
