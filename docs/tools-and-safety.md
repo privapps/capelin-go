@@ -63,7 +63,11 @@ The assistant still operates inside the working-folder boundary. `edit_file` req
 
 ## Optional program execution
 
-`execute_program` is disabled by default. When enabled, it runs a named program with separate arguments and a chosen working folder. It does not run a command through a shell. Unsafe command patterns, shell launchers, and malformed command names are blocked unless you use `--yolo`.
+`execute_program` is disabled by default. When enabled, it runs a named
+program directly with a separate argument vector and a chosen working folder.
+It never invokes or parses a shell. Unsafe command patterns, shell launchers,
+and malformed command names are blocked unless you use `--yolo`; recover by
+putting only the executable in `command` and each argument in `args`.
 
 ```bash
 ./capelin-go --allow-tool execute_program \

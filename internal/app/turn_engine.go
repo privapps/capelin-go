@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -106,6 +107,7 @@ func newAppToolCapability(toolset []contracts.Tool, a *app, runtime *agentRuntim
 						if commandFailed(call, output) {
 							runtime.recordRecoverableToolError(fmt.Errorf("%s reported a command failure", call.Function.Name))
 							result.IsError = true
+							result.Recovery = correctedRetryRecovery(runtime, call)
 							return result
 						}
 						// A successful non-control tool result is the liveness
@@ -126,15 +128,83 @@ func newAppToolCapability(toolset []contracts.Tool, a *app, runtime *agentRuntim
 						} else {
 							runtime.recordRecoverableToolError(err)
 						}
-						return contracts.ToolResult{
+						result := contracts.ToolResult{
 							Call:    call,
 							Output:  fmt.Sprintf("Tool error: %v", err),
 							IsError: true,
 						}
+						if !fatalToolError(err) {
+							result.Recovery = correctedRetryRecovery(runtime, call)
+						}
+						return result
 					},
 				},
 			)},
 	}
+}
+
+func correctedRetryRecovery(runtime *agentRuntime, call contracts.ToolCall) *contracts.ToolRecovery {
+	recovery := &contracts.ToolRecovery{
+		Kind:                     contracts.RecoveryKindCorrectedRetry,
+		Phase:                    recoveryPhase(call.Function.Name),
+		Attempt:                  1,
+		MaxRetries:               1,
+		Retryable:                true,
+		RequiresExplicitDecision: true,
+		Guidance:                 recoveryGuidance(call.Function.Name),
+		PermissionScope:          recoveryPermissionScope(runtime, call),
+	}
+	return recovery
+}
+
+func recoveryPhase(toolName string) string {
+	switch toolName {
+	case toolCreateSubagent:
+		return contracts.RecoveryPhaseCapabilityAdmission
+	case toolExecuteProgram, toolExecuteSkill:
+		return contracts.RecoveryPhaseCommandExecution
+	default:
+		return contracts.RecoveryPhaseToolInvocation
+	}
+}
+
+func recoveryGuidance(toolName string) string {
+	switch toolName {
+	case toolCreateSubagent:
+		return "Retry once with a corrected allowed_tools subset from the visible scope; the rejected request created no worker and did not broaden permissions."
+	case toolExecuteProgram, toolExecuteSkill:
+		return "Retry once with a corrected executable and separate args; direct execution does not interpret shell syntax and does not change permissions."
+	default:
+		return "Retry once with corrected arguments; the failed call did not change permissions."
+	}
+}
+
+func recoveryPermissionScope(runtime *agentRuntime, call contracts.ToolCall) *contracts.ToolPermissionScope {
+	scope := &contracts.ToolPermissionScope{
+		AllowedTools: sortedEnabledTools(nil),
+		RestrictOnly: call.Function.Name == toolCreateSubagent,
+	}
+	if runtime != nil {
+		scope.AllowedTools = sortedEnabledTools(runtime.allowedTools)
+	}
+	if call.Function.Name == toolCreateSubagent {
+		var args createSubagentArgs
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err == nil {
+			scope.RequestedTools = filterNonEmpty(args.AllowedTools)
+		}
+	}
+	return scope
+}
+
+func sortedEnabledTools(enabled map[string]bool) []string {
+	out := make([]string, 0, len(enabled))
+	for name, allowed := range enabled {
+		if allowed && strings.TrimSpace(name) != "" {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // commandFailed recognizes the structured result emitted by execute_program

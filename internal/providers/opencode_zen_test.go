@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"capelin-go/internal/contracts"
+	"capelin-go/internal/tools"
 )
 
 func TestIsOpenCodeZenEndpointRequiresExactHTTPSEndpoint(t *testing.T) {
@@ -290,6 +291,21 @@ func TestZenToolNameMapsOpenCodeFileToolsWithoutChangingAppendSemantics(t *testi
 			t.Errorf("zenToolName(%q) = %q, want %q", input, got, want)
 		}
 	}
+}
+
+func TestZenFreeTierExecuteProgramDescriptionIsDirect(t *testing.T) {
+	for _, tool := range tools.FreeTierTools() {
+		if tool.Function.Name != "execute_program" {
+			continue
+		}
+		for _, want := range []string{"directly", "executable", "argument vector", "never invoke or parse a shell"} {
+			if !strings.Contains(tool.Function.Description, want) {
+				t.Fatalf("execute_program description %q does not contain %q", tool.Function.Description, want)
+			}
+		}
+		return
+	}
+	t.Fatal("Zen free-tier tools did not include execute_program")
 }
 
 func TestProviderFactoryPreservesNonZenChatJSONBehavior(t *testing.T) {

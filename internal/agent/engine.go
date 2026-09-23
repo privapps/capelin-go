@@ -164,6 +164,9 @@ func (e *Engine) Run(ctx context.Context, options RunOptions) (Result, error) {
 				if result.Retried {
 					sink.WriteSystem(agentID, "[tool] "+result.Call.Function.Name+" timed out, retrying…")
 				}
+				if result.Recovery != nil {
+					sink.WriteSystem(agentID, "[tool] "+result.Call.Function.Name+" "+recoverySummary(result.Recovery))
+				}
 				sink.WriteToolResult(agentID, result.Call.Function.Name, result.IsError, result.Output)
 			}
 		}
@@ -291,6 +294,35 @@ func truncate(value string, max int) string {
 		return value
 	}
 	return value[:max] + "..."
+}
+
+func recoverySummary(recovery *contracts.ToolRecovery) string {
+	if recovery == nil {
+		return ""
+	}
+	scope := ""
+	if recovery.PermissionScope != nil {
+		scope = " scope=allowed[" + boundedList(recovery.PermissionScope.AllowedTools) + "]"
+		if len(recovery.PermissionScope.RequestedTools) > 0 {
+			scope += " requested[" + boundedList(recovery.PermissionScope.RequestedTools) + "]"
+		}
+		if len(recovery.PermissionScope.EffectiveTools) > 0 {
+			scope += " effective[" + boundedList(recovery.PermissionScope.EffectiveTools) + "]"
+		}
+	}
+	return fmt.Sprintf(
+		"explicit corrected retry available (phase=%s, attempt=%d, max_retries=%d%s): %s",
+		recovery.Phase, recovery.Attempt, recovery.MaxRetries, scope, recovery.Guidance,
+	)
+}
+
+func boundedList(values []string) string {
+	const maxChars = 160
+	value := strings.Join(values, ",")
+	if len(value) <= maxChars {
+		return value
+	}
+	return value[:maxChars] + "…"
 }
 
 type discardSink struct{}

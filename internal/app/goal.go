@@ -1,15 +1,15 @@
 package app
 
 import (
+	"capelin-go/internal/tools"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 )
 
-const toolCompleteGoal = "complete_goal"
+const toolCompleteGoal = tools.CompleteGoal
 
 // goalState is the durable state for one objective generation. The
 // ChecklistFingerprint on a completion claim binds the model's declaration to
@@ -25,11 +25,6 @@ type goalCompletion struct {
 	Evidence             []string `json:"evidence"`
 	Generation           uint64   `json:"generation"`
 	ChecklistFingerprint string   `json:"checklistFingerprint"`
-}
-
-type completeGoalArgs struct {
-	Summary  string   `json:"summary"`
-	Evidence []string `json:"evidence"`
 }
 
 func cloneGoalState(state *goalState) *goalState {
@@ -52,37 +47,7 @@ func cloneGoalCompletion(completion *goalCompletion) *goalCompletion {
 	return &clone
 }
 
-func parseCompleteGoalArgs(arguments string) (completeGoalArgs, error) {
-	var args completeGoalArgs
-	decoder := json.NewDecoder(strings.NewReader(arguments))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&args); err != nil {
-		return completeGoalArgs{}, fmt.Errorf("invalid complete_goal arguments: %w", err)
-	}
-	if err := ensureJSONEOF(decoder); err != nil {
-		return completeGoalArgs{}, fmt.Errorf("invalid complete_goal arguments: %w", err)
-	}
-	args.Summary = strings.TrimSpace(args.Summary)
-	if args.Summary == "" {
-		return completeGoalArgs{}, errors.New("invalid complete_goal arguments: summary is required")
-	}
-	if len(args.Evidence) == 0 {
-		return completeGoalArgs{}, errors.New("invalid complete_goal arguments: evidence must contain at least one statement")
-	}
-	for i, evidence := range args.Evidence {
-		args.Evidence[i] = strings.TrimSpace(evidence)
-		if args.Evidence[i] == "" {
-			return completeGoalArgs{}, fmt.Errorf("invalid complete_goal arguments: evidence item %d is required", i)
-		}
-	}
-	return args, nil
-}
-
-func (a *app) completeGoalForRuntime(runtime *agentRuntime, raw []byte) (string, error) {
-	args, err := parseCompleteGoalArgs(string(raw))
-	if err != nil {
-		return "", err
-	}
+func (a *app) completeGoalForRuntime(runtime *agentRuntime, args tools.CompleteGoalArgs) (string, error) {
 	if runtime == nil || !runtime.goalIsEnabled() || !runtime.allowedTools[toolCompleteGoal] {
 		return "", errors.New("complete_goal is available only during an autonomous goal")
 	}

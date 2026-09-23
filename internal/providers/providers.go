@@ -240,7 +240,7 @@ func (p *ChatCompletions) ApplyResponse(state contracts.TurnState, response cont
 func (p *ChatCompletions) ApplyToolResults(state contracts.TurnState, results []contracts.ToolResult) {
 	s := state.(*chatState)
 	for _, result := range results {
-		s.messages = append(s.messages, contracts.Message{Role: "tool", ToolCallID: result.Call.ID, Content: truncateToolOutput(result.Output)})
+		s.messages = append(s.messages, contracts.Message{Role: "tool", ToolCallID: result.Call.ID, Content: truncateToolOutput(toolResultOutput(result))})
 	}
 }
 func (*ChatCompletions) AppendUserPrompt(state contracts.TurnState, content string) {
@@ -277,11 +277,11 @@ func (p *ChatCompletions) Complete(ctx context.Context, state contracts.TurnStat
 	}
 	var response struct {
 		Choices []struct {
-			Message contracts.CompletionMessage `json:"message"`
+			Message CompletionMessage `json:"message"`
 		} `json:"choices"`
 		Data *struct {
 			Choices []struct {
-				Message contracts.CompletionMessage `json:"message"`
+				Message CompletionMessage `json:"message"`
 			} `json:"choices"`
 		} `json:"data"`
 	}
@@ -400,7 +400,7 @@ func (p *Responses) ApplyResponse(state contracts.TurnState, response contracts.
 func (p *Responses) ApplyToolResults(state contracts.TurnState, results []contracts.ToolResult) {
 	s := state.(*responsesState)
 	for _, result := range results {
-		output := truncateToolOutput(result.Output)
+		output := truncateToolOutput(toolResultOutput(result))
 		s.input = append(s.input, marshal(map[string]any{"type": "function_call_output", "call_id": result.Call.ID, "output": output}))
 		s.messages = append(s.messages, contracts.Message{Role: "tool", ToolCallID: result.Call.ID, Content: output})
 	}
@@ -452,7 +452,7 @@ func (p *Responses) Complete(ctx context.Context, state contracts.TurnState, too
 // completionMessage carries raw Responses output items while exposing only the
 // normalized view to the engine.
 type completionMessage struct {
-	message     contracts.CompletionMessage
+	message     CompletionMessage
 	outputItems []json.RawMessage
 }
 
@@ -725,6 +725,20 @@ func truncateToolOutput(s string) string {
 		return s
 	}
 	return s[:toolOutputMaxChars] + fmt.Sprintf("[truncated: %d chars]", len(s)-toolOutputMaxChars)
+}
+
+func toolResultOutput(result contracts.ToolResult) string {
+	if result.Recovery == nil {
+		return result.Output
+	}
+	raw, err := json.Marshal(result.Recovery)
+	if err != nil {
+		return result.Output
+	}
+	if result.Output == "" {
+		return "[recovery] " + string(raw)
+	}
+	return result.Output + "\n\n[recovery] " + string(raw)
 }
 
 var _ contracts.Provider = (*ChatCompletions)(nil)

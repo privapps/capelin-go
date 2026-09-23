@@ -78,7 +78,11 @@ The file-reading tools have size and output limits. Ask for a smaller file, a sp
 
 ## Program execution is blocked or times out
 
-Safe mode rejects shell launchers and dangerous command patterns. Use a direct program name with separate arguments rather than a shell command. If execution is truly required, enable `execute_program` explicitly.
+Safe mode rejects shell launchers, shell-style command strings, and dangerous
+command patterns. `execute_program` uses direct program execution: put only the
+executable in `command` and pass each argument separately in `args`; it does
+not perform implicit shell parsing. If execution is truly required, enable
+`execute_program` explicitly.
 
 Programs have a time limit. Ask for a smaller operation or set a suitable task timeout, up to the allowed maximum. Avoid `--yolo` unless you accept the additional risk.
 

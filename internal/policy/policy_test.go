@@ -3,6 +3,7 @@ package policy
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -25,6 +26,24 @@ func TestContainsDangerousPattern(t *testing.T) {
 				t.Fatalf("ContainsDangerousPattern(%q, %q) = %v, want %v", tt.command, tt.args, got, tt.blocked)
 			}
 		})
+	}
+}
+
+func TestInheritChildToolsUnknownCapabilityExplainsRegisteredVocabulary(t *testing.T) {
+	_, err := InheritChildTools(DefaultAllowedTools(), []string{"go"}, 1, 2)
+	if err == nil {
+		t.Fatal("expected unknown capability to be rejected")
+	}
+	message := err.Error()
+	for _, want := range []string{
+		`unknown tool "go" in allowed_tools`,
+		"valid registered capability names are:",
+		"read_file",
+		"execute_program",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("error %q does not contain %q", message, want)
+		}
 	}
 }
 

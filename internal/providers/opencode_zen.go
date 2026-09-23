@@ -16,6 +16,7 @@ import (
 	"sync"
 
 	"capelin-go/internal/contracts"
+	toolpkg "capelin-go/internal/tools"
 )
 
 const (
@@ -295,7 +296,7 @@ func parseZenSSE(ctx context.Context, body io.Reader, responseTools map[string]s
 		return nil, errors.New("Zen SSE stream ended before completion")
 	}
 
-	message := contracts.CompletionMessage{Role: role}
+	message := CompletionMessage{Role: role}
 	if message.Role == "" {
 		message.Role = "assistant"
 	}
@@ -377,7 +378,7 @@ func zenTools(tools []contracts.Tool, requireFreeTierTools bool) ([]contracts.To
 		}
 	}
 	if requireFreeTierTools {
-		for _, tool := range zenFreeTierTools() {
+		for _, tool := range toolpkg.FreeTierTools() {
 			if _, ok := responseTools[zenToolName(tool.Function.Name)]; ok {
 				continue
 			}
@@ -387,27 +388,6 @@ func zenTools(tools []contracts.Tool, requireFreeTierTools bool) ([]contracts.To
 		}
 	}
 	return result, responseTools, nil
-}
-
-func zenFreeTierTools() []contracts.Tool {
-	return []contracts.Tool{
-		{
-			Type: "function",
-			Function: contracts.ToolSpec{
-				Name:        "read_file",
-				Description: "Read a file from the workspace.",
-				Parameters:  map[string]any{"type": "object"},
-			},
-		},
-		{
-			Type: "function",
-			Function: contracts.ToolSpec{
-				Name:        "execute_program",
-				Description: "Execute a local program.",
-				Parameters:  map[string]any{"type": "object"},
-			},
-		},
-	}
 }
 
 func zenReasoningEffort(reasoning string) string {
@@ -426,6 +406,8 @@ func zenToolName(name string) string {
 	case "edit_file":
 		return "edit"
 	case "execute_program":
+		// Zen's wire vocabulary calls this tool "bash"; its description and
+		// arguments still preserve Capelin's direct executable contract.
 		return "bash"
 	default:
 		return name

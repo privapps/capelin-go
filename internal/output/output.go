@@ -77,7 +77,7 @@ func (s *StdioSink) refreshOutput() {
 
 // FormatToolCallDisplay formats the compact diagnostic shown for a tool call.
 func FormatToolCallDisplay(toolName, args string) string {
-	line := "[tool] " + sanitizeDisplay(toolName)
+	line := "[tool] " + displayToolName(toolName)
 	if formatted := formatToolArguments(args); formatted != "" {
 		line += " " + formatted
 	}
@@ -86,7 +86,7 @@ func FormatToolCallDisplay(toolName, args string) string {
 
 // FormatToolResultDisplay formats a bounded completion or failure diagnostic.
 func FormatToolResultDisplay(toolName string, isError bool, detail string) string {
-	line := "[tool] " + sanitizeDisplay(toolName)
+	line := "[tool] " + displayToolName(toolName)
 	if isError {
 		line += " failed"
 	} else {
@@ -96,6 +96,14 @@ func FormatToolResultDisplay(toolName string, isError bool, detail string) strin
 		line += ": " + detail
 	}
 	return TruncateDisplay(line, toolDisplayMaxChars) + "\n"
+}
+
+func displayToolName(toolName string) string {
+	name := sanitizeDisplay(toolName)
+	if name == "execute_program" {
+		return name + " (direct program execution)"
+	}
+	return name
 }
 
 func formatToolArguments(args string) string {

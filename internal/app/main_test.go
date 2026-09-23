@@ -293,6 +293,27 @@ func TestRunExecuteProgram(t *testing.T) {
 	}
 }
 
+func TestRunExecuteProgramRejectsShellStyleCommandWithDirectRecovery(t *testing.T) {
+	_, err := runExecuteProgram(context.Background(), t.TempDir(), false, executeProgramArgs{
+		Command: "go test ./...",
+	})
+	if err == nil {
+		t.Fatal("expected shell-style command to be rejected")
+	}
+	message := err.Error()
+	for _, want := range []string{
+		`command "go test ./..."`,
+		"direct program execution",
+		`command "program"`,
+		"args",
+		"never invokes or parses a shell",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("diagnostic %q does not contain %q", message, want)
+		}
+	}
+}
+
 func TestRunExecuteProgramYoloBypassesDangerousPattern(t *testing.T) {
 	root := t.TempDir()
 	// bash is blocked by the dangerous-pattern policy when yolo=false.
@@ -2819,9 +2840,32 @@ func TestFormatToolCallDisplayUsesReadableKeyValueArguments(t *testing.T) {
 	}
 }
 
+func TestFormatToolCallDisplayLabelsExecuteProgramAsDirect(t *testing.T) {
+	got := formatToolCallDisplay("execute_program", `{"command":"go","args":["version"]}`)
+	if !strings.Contains(got, "[tool] execute_program (direct program execution)") {
+		t.Fatalf("execute_program display does not identify direct execution: %q", got)
+	}
+}
+
 func TestFormatToolResultDisplaySuccessWithDetail(t *testing.T) {
 	if got, want := formatToolResultDisplay("read_file", false, "123 lines"), "[tool] read_file ok: 123 lines\n"; got != want {
 		t.Fatalf("unexpected tool result display: got %q, want %q", got, want)
+	}
+}
+
+func TestFormatToolResultDisplayLabelsExecuteProgramAsDirect(t *testing.T) {
+	got := formatToolResultDisplay("execute_program", false, `{"exit_code":0}`)
+	if !strings.Contains(got, "[tool] execute_program (direct program execution) ok") {
+		t.Fatalf("execute_program result display does not identify direct execution: %q", got)
+	}
+}
+
+func TestExtractToolSummaryLabelsExecuteProgramAsDirect(t *testing.T) {
+	got := extractToolSummary("execute_program", `{"command":"go","args":["version"],"cwd":".","exit_code":0}`, false)
+	for _, want := range []string{"Direct program execution", `command="go"`, `args=["version"]`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("execute_program summary %q does not contain %q", got, want)
+		}
 	}
 }
 

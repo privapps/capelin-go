@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"capelin-go/internal/contracts"
@@ -76,6 +77,41 @@ func (r *testRunner) Run(_ context.Context, calls []contracts.ToolCall) []contra
 	return out
 }
 
+type recoveryRunner struct{}
+
+func (recoveryRunner) Run(_ context.Context, calls []contracts.ToolCall) []contracts.ToolResult {
+	return []contracts.ToolResult{{
+		Call:    calls[0],
+		Output:  `Tool error: invalid capability`,
+		IsError: true,
+		Recovery: &contracts.ToolRecovery{
+			Kind:                     contracts.RecoveryKindCorrectedRetry,
+			Phase:                    contracts.RecoveryPhaseCapabilityAdmission,
+			Attempt:                  1,
+			MaxRetries:               1,
+			Retryable:                true,
+			RequiresExplicitDecision: true,
+			Guidance:                 "retry with a corrected restricted scope",
+			PermissionScope: &contracts.ToolPermissionScope{
+				AllowedTools:   []string{"create_subagent", "read_file"},
+				RequestedTools: []string{"read_file", "write_file"},
+				RestrictOnly:   true,
+			},
+		},
+	}}
+}
+
+type recoverySink struct {
+	systems []string
+}
+
+func (s *recoverySink) WriteContent(string, string)                  {}
+func (s *recoverySink) WriteToolCall(string, string, string)         {}
+func (s *recoverySink) WriteToolResult(string, string, bool, string) {}
+func (s *recoverySink) WriteSystem(_ string, message string) {
+	s.systems = append(s.systems, message)
+}
+
 type testCapability struct {
 	tools  []contracts.Tool
 	runner testRunner
@@ -110,6 +146,40 @@ func TestEngineUsesOneProviderSeamForToolContinuation(t *testing.T) {
 	}
 	if provider.requests != 2 || provider.states != 1 {
 		t.Fatalf("provider requests=%d states=%d", provider.requests, provider.states)
+	}
+}
+
+func TestEngineReportsExplicitRecoveryAuditToOperator(t *testing.T) {
+	call := contracts.ToolCall{ID: "recover", Function: contracts.FunctionCall{Name: "create_subagent", Arguments: `{}`}}
+	provider := &testProvider{responses: []contracts.Completion{
+		testCompletion{calls: []contracts.ToolCall{call}},
+		testCompletion{content: "completed after operator-approved retry"},
+	}}
+	sink := &recoverySink{}
+	result, err := (&Engine{Provider: provider}).Run(context.Background(), RunOptions{
+		Question:          "recover",
+		MaxToolIterations: 2,
+		ToolRunner:        recoveryRunner{},
+		EmitOutput:        true,
+		Sink:              sink,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Answer != "completed after operator-approved retry" {
+		t.Fatalf("answer=%q", result.Answer)
+	}
+	joined := strings.Join(sink.systems, "\n")
+	for _, want := range []string{
+		"explicit corrected retry available",
+		"phase=capability_admission",
+		"max_retries=1",
+		"scope=allowed[create_subagent,read_file]",
+		"requested[read_file,write_file]",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("operator recovery audit missing %q: %s", want, joined)
+		}
 	}
 }
 

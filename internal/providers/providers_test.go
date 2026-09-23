@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,6 +39,7 @@ func TestChatCompletionsReplaysNativeReasoningForToolContinuation(t *testing.T) 
 		ID: "call-1", Type: "function",
 		Function: contracts.FunctionCall{Name: "lookup", Arguments: `{"key":"value"}`},
 	}
+
 	var requests []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request map[string]any
@@ -444,5 +446,49 @@ func TestProviderRetriesUseCapelinUserAgent(t *testing.T) {
 	}
 	if !reflect.DeepEqual(userAgents, []string{contracts.CapelinUserAgent, contracts.CapelinUserAgent}) {
 		t.Fatalf("retry user agents = %#v, want two Capelin-Go values", userAgents)
+	}
+}
+
+func TestToolContinuationIncludesBoundedRecoveryAudit(t *testing.T) {
+	provider := NewChatCompletions(Config{})
+	state := provider.Initialize(nil, "recover")
+	call := contracts.ToolCall{
+		ID: "call-recover", Type: "function",
+		Function: contracts.FunctionCall{Name: "create_subagent", Arguments: `{"allowed_tools":["read_file"]}`},
+	}
+	provider.ApplyToolResults(state, []contracts.ToolResult{{
+		Call:   call,
+		Output: `Tool error: tool "write_file" is not allowed by parent policy`,
+		Recovery: &contracts.ToolRecovery{
+			Kind:                     contracts.RecoveryKindCorrectedRetry,
+			Phase:                    contracts.RecoveryPhaseCapabilityAdmission,
+			Attempt:                  1,
+			MaxRetries:               1,
+			Retryable:                true,
+			RequiresExplicitDecision: true,
+			Guidance:                 "retry with an explicit restricted scope",
+			PermissionScope: &contracts.ToolPermissionScope{
+				AllowedTools:   []string{"create_subagent", "read_file"},
+				RequestedTools: []string{"read_file", "write_file"},
+				RestrictOnly:   true,
+			},
+		},
+	}})
+	messages := state.Messages()
+	if len(messages) != 2 {
+		t.Fatalf("messages=%d, want user plus tool result", len(messages))
+	}
+	content := messages[1].Content
+	for _, want := range []string{
+		`Tool error: tool "write_file" is not allowed by parent policy`,
+		`"kind":"corrected_retry"`,
+		`"max_retries":1`,
+		`"requires_explicit_decision":true`,
+		`"allowed_tools":["create_subagent","read_file"]`,
+		`"requested_tools":["read_file","write_file"]`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("tool continuation missing %q: %s", want, content)
+		}
 	}
 }

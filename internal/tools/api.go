@@ -117,19 +117,43 @@ func Build(enabled map[string]bool) []contracts.Tool {
 	return result
 }
 
+// FreeTierTools returns the small catalog that OpenCode Zen makes available
+// for its public tier. The provider chooses when to add these capabilities;
+// their names, descriptions, and schemas remain owned by the tools package.
+func FreeTierTools() []contracts.Tool {
+	return []contracts.Tool{
+		{
+			Type: "function",
+			Function: contracts.ToolSpec{
+				Name:        ReadFile,
+				Description: "Read a file from the workspace.",
+				Parameters:  map[string]any{"type": "object"},
+			},
+		},
+		{
+			Type: "function",
+			Function: contracts.ToolSpec{
+				Name:        ExecuteProgram,
+				Description: "Execute a local program directly with an explicit executable and argument vector; never invoke or parse a shell.",
+				Parameters:  map[string]any{"type": "object"},
+			},
+		},
+	}
+}
+
 // Hooks are the only application-facing part of the dispatcher. Concrete web,
 // filesystem, process, and skill execution remains owned by this package;
 // subagents and todo state are application workflows supplied as callbacks.
 type Hooks struct {
 	IsEnabled      func(runtime any, name string) bool
-	CreateSubagent func(context.Context, any, json.RawMessage) (any, error)
-	RunSubagent    func(context.Context, any, json.RawMessage) (any, error)
-	AwaitSubagent  func(context.Context, any, json.RawMessage) (any, error)
-	ListSubagents  func(any, json.RawMessage) (any, error)
-	ReadSubagent   func(any, json.RawMessage) (any, error)
-	CancelSubagent func(any, json.RawMessage) (any, error)
-	UpdateTodos    func(any, json.RawMessage) (string, error)
-	CompleteGoal   func(any, json.RawMessage) (string, error)
+	CreateSubagent func(context.Context, any, CreateSubagentArgs) (any, error)
+	RunSubagent    func(context.Context, any, RunSubagentArgs) (any, error)
+	AwaitSubagent  func(context.Context, any, AwaitSubagentArgs) (any, error)
+	ListSubagents  func(any, ListSubagentsArgs) (any, error)
+	ReadSubagent   func(any, ReadSubagentArgs) (any, error)
+	CancelSubagent func(any, CancelSubagentArgs) (any, error)
+	UpdateTodos    func(any, UpdateTodosArgs) (string, error)
+	CompleteGoal   func(any, CompleteGoalArgs) (string, error)
 	MarshalResult  func(any) (string, error)
 }
 
@@ -250,7 +274,10 @@ func (d Dispatcher) Run(ctx context.Context, runtime any, call contracts.ToolCal
 		if d.Hooks.CreateSubagent == nil {
 			return "", errors.New("subagent capability is unavailable")
 		}
-		var args json.RawMessage = append(json.RawMessage(nil), []byte(call.Function.Arguments)...)
+		var args CreateSubagentArgs
+		if err := decode(&args, name); err != nil {
+			return "", err
+		}
 		value, err := d.Hooks.CreateSubagent(ctx, runtime, args)
 		if err != nil {
 			return "", err
@@ -260,7 +287,11 @@ func (d Dispatcher) Run(ctx context.Context, runtime any, call contracts.ToolCal
 		if d.Hooks.RunSubagent == nil {
 			return "", errors.New("subagent capability is unavailable")
 		}
-		value, err := d.Hooks.RunSubagent(ctx, runtime, []byte(call.Function.Arguments))
+		var args RunSubagentArgs
+		if err := decode(&args, name); err != nil {
+			return "", err
+		}
+		value, err := d.Hooks.RunSubagent(ctx, runtime, args)
 		if err != nil {
 			return "", err
 		}
@@ -269,7 +300,11 @@ func (d Dispatcher) Run(ctx context.Context, runtime any, call contracts.ToolCal
 		if d.Hooks.AwaitSubagent == nil {
 			return "", errors.New("subagent capability is unavailable")
 		}
-		value, err := d.Hooks.AwaitSubagent(ctx, runtime, []byte(call.Function.Arguments))
+		var args AwaitSubagentArgs
+		if err := decode(&args, name); err != nil {
+			return "", err
+		}
+		value, err := d.Hooks.AwaitSubagent(ctx, runtime, args)
 		if err != nil {
 			return "", err
 		}
@@ -278,7 +313,11 @@ func (d Dispatcher) Run(ctx context.Context, runtime any, call contracts.ToolCal
 		if d.Hooks.ListSubagents == nil {
 			return "", errors.New("subagent capability is unavailable")
 		}
-		value, err := d.Hooks.ListSubagents(runtime, []byte(call.Function.Arguments))
+		var args ListSubagentsArgs
+		if err := decode(&args, name); err != nil {
+			return "", err
+		}
+		value, err := d.Hooks.ListSubagents(runtime, args)
 		if err != nil {
 			return "", err
 		}
@@ -287,7 +326,11 @@ func (d Dispatcher) Run(ctx context.Context, runtime any, call contracts.ToolCal
 		if d.Hooks.ReadSubagent == nil {
 			return "", errors.New("subagent capability is unavailable")
 		}
-		value, err := d.Hooks.ReadSubagent(runtime, []byte(call.Function.Arguments))
+		var args ReadSubagentArgs
+		if err := decode(&args, name); err != nil {
+			return "", err
+		}
+		value, err := d.Hooks.ReadSubagent(runtime, args)
 		if err != nil {
 			return "", err
 		}
@@ -296,7 +339,11 @@ func (d Dispatcher) Run(ctx context.Context, runtime any, call contracts.ToolCal
 		if d.Hooks.CancelSubagent == nil {
 			return "", errors.New("subagent capability is unavailable")
 		}
-		value, err := d.Hooks.CancelSubagent(runtime, []byte(call.Function.Arguments))
+		var args CancelSubagentArgs
+		if err := decode(&args, name); err != nil {
+			return "", err
+		}
+		value, err := d.Hooks.CancelSubagent(runtime, args)
 		if err != nil {
 			return "", err
 		}
@@ -305,12 +352,20 @@ func (d Dispatcher) Run(ctx context.Context, runtime any, call contracts.ToolCal
 		if d.Hooks.UpdateTodos == nil {
 			return "", errors.New("todo capability is unavailable")
 		}
-		return d.Hooks.UpdateTodos(runtime, []byte(call.Function.Arguments))
+		args, err := DecodeUpdateTodosArgs(call.Function.Arguments)
+		if err != nil {
+			return "", err
+		}
+		return d.Hooks.UpdateTodos(runtime, args)
 	case CompleteGoal:
 		if d.Hooks.CompleteGoal == nil {
 			return "", errors.New("goal completion capability is unavailable")
 		}
-		return d.Hooks.CompleteGoal(runtime, []byte(call.Function.Arguments))
+		args, err := DecodeCompleteGoalArgs(call.Function.Arguments)
+		if err != nil {
+			return "", err
+		}
+		return d.Hooks.CompleteGoal(runtime, args)
 	default:
 		return "", fmt.Errorf("unknown tool %q", name)
 	}
@@ -357,10 +412,7 @@ func readSkill(loaded map[string]skills.Skill, args readSkillArgs) (string, erro
 	if !ok {
 		return "", fmt.Errorf("skill %q not found", name)
 	}
-	if len(sk.Content) <= 100000 {
-		return sk.Content, nil
-	}
-	return truncateUTF8(sk.Content, 100000) + "\n\n[... skill content truncated ...]", nil
+	return skills.ReadContent(sk.Content), nil
 }
 
 func updateTodosSpec() contracts.Tool {
@@ -390,15 +442,4 @@ func completeGoalSpec() contracts.Tool {
 			"additionalProperties": false,
 		},
 	}}
-}
-
-func truncateUTF8(value string, maxBytes int) string {
-	if maxBytes <= 0 || len(value) <= maxBytes {
-		return value
-	}
-	cut := value[:maxBytes]
-	for len(cut) > 0 && (cut[len(cut)-1]&0xc0) == 0x80 {
-		cut = cut[:len(cut)-1]
-	}
-	return cut
 }

@@ -2,17 +2,20 @@
 // New capability modules should import internal/contracts directly.
 package types
 
-import "capelin-go/internal/contracts"
+import (
+	"capelin-go/internal/contracts"
+	"capelin-go/internal/providers"
+)
 
 type Message = contracts.Message
 type ToolCall = contracts.ToolCall
 type FunctionCall = contracts.FunctionCall
-type Request = contracts.Request
 type Tool = contracts.Tool
 type ToolSpec = contracts.ToolSpec
-type ResponseDataInner = contracts.ResponseDataInner
-type Response = contracts.Response
-type CompletionMessage = contracts.CompletionMessage
+type Request = providers.Request
+type ResponseDataInner = providers.ResponseDataInner
+type Response = providers.Response
+type CompletionMessage = providers.CompletionMessage
 type SubagentNode = contracts.SubagentNode
 type OutputSink = contracts.OutputSink
 type ContinuationState = contracts.ContinuationState

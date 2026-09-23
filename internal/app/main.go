@@ -36,24 +36,24 @@ const (
 )
 
 const (
-	toolWebSearch      = "web_search"
-	toolFetchPage      = "fetch_page"
-	toolListFiles      = "list_files"
-	toolReadFile       = "read_file"
-	toolWriteFile      = "write_file"
-	toolEditFile       = "edit_file"
-	toolAppendFile     = "append_file"
-	toolExecuteProgram = "execute_program"
-	toolExecuteSkill   = "execute_skill"
-	toolListSkills     = "list_skills"
-	toolReadSkill      = "read_skill"
-	toolCreateSubagent = "create_subagent"
-	toolRunSubagent    = "run_subagent"
-	toolAwaitSubagent  = "await_subagent"
-	toolListSubagents  = "list_subagents"
-	toolReadSubagent   = "read_subagent"
-	toolCancelSubagent = "cancel_subagent"
-	toolUpdateTodos    = "update_todos"
+	toolWebSearch      = tools.WebSearch
+	toolFetchPage      = tools.FetchPage
+	toolListFiles      = tools.ListFiles
+	toolReadFile       = tools.ReadFile
+	toolWriteFile      = tools.WriteFile
+	toolEditFile       = tools.EditFile
+	toolAppendFile     = tools.AppendFile
+	toolExecuteProgram = tools.ExecuteProgram
+	toolExecuteSkill   = tools.ExecuteSkill
+	toolListSkills     = tools.ListSkills
+	toolReadSkill      = tools.ReadSkill
+	toolCreateSubagent = tools.CreateSubagent
+	toolRunSubagent    = tools.RunSubagent
+	toolAwaitSubagent  = tools.AwaitSubagent
+	toolListSubagents  = tools.ListSubagents
+	toolReadSubagent   = tools.ReadSubagent
+	toolCancelSubagent = tools.CancelSubagent
+	toolUpdateTodos    = tools.UpdateTodos
 )
 
 type config struct {
@@ -1280,22 +1280,14 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 				r, ok := value.(*agentRuntime)
 				return ok && a.isToolEnabled(r, name)
 			},
-			CreateSubagent: func(callCtx context.Context, value any, raw json.RawMessage) (any, error) {
-				var args createSubagentArgs
-				if err := json.Unmarshal(raw, &args); err != nil {
-					return nil, fmt.Errorf("invalid create_subagent arguments: %w", err)
-				}
+			CreateSubagent: func(callCtx context.Context, value any, args tools.CreateSubagentArgs) (any, error) {
 				session, err := a.subagents.create(callCtx, value.(*agentRuntime), args)
 				if err != nil {
 					return nil, err
 				}
 				return a.subagents.snapshotLocked(session, false), nil
 			},
-			RunSubagent: func(callCtx context.Context, value any, raw json.RawMessage) (any, error) {
-				var args runSubagentArgs
-				if err := json.Unmarshal(raw, &args); err != nil {
-					return nil, fmt.Errorf("invalid run_subagent arguments: %w", err)
-				}
+			RunSubagent: func(callCtx context.Context, value any, args tools.RunSubagentArgs) (any, error) {
 				session, err := a.subagents.run(callCtx, value.(*agentRuntime), args)
 				if err != nil {
 					return nil, err
@@ -1304,11 +1296,7 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 				a.displayCompletedSubagent(value.(*agentRuntime), snapshot)
 				return snapshot, nil
 			},
-			AwaitSubagent: func(callCtx context.Context, value any, raw json.RawMessage) (any, error) {
-				var args awaitSubagentArgs
-				if err := json.Unmarshal(raw, &args); err != nil {
-					return nil, fmt.Errorf("invalid await_subagent arguments: %w", err)
-				}
+			AwaitSubagent: func(callCtx context.Context, value any, args tools.AwaitSubagentArgs) (any, error) {
 				session, err := a.subagents.await(callCtx, value.(*agentRuntime), args)
 				if err != nil {
 					return nil, err
@@ -1317,45 +1305,36 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 				a.displayCompletedSubagent(value.(*agentRuntime), snapshot)
 				return snapshot, nil
 			},
-			ListSubagents: func(value any, raw json.RawMessage) (any, error) {
-				var args listSubagentsArgs
-				if err := json.Unmarshal(raw, &args); err != nil {
-					return nil, fmt.Errorf("invalid list_subagents arguments: %w", err)
-				}
+			ListSubagents: func(value any, args tools.ListSubagentsArgs) (any, error) {
 				return a.subagents.list(value.(*agentRuntime), args)
 			},
-			ReadSubagent: func(value any, raw json.RawMessage) (any, error) {
-				var args readSubagentArgs
-				if err := json.Unmarshal(raw, &args); err != nil {
-					return nil, fmt.Errorf("invalid read_subagent arguments: %w", err)
-				}
+			ReadSubagent: func(value any, args tools.ReadSubagentArgs) (any, error) {
 				return a.subagents.read(value.(*agentRuntime), args)
 			},
-			CancelSubagent: func(value any, raw json.RawMessage) (any, error) {
-				var args cancelSubagentArgs
-				if err := json.Unmarshal(raw, &args); err != nil {
-					return nil, fmt.Errorf("invalid cancel_subagent arguments: %w", err)
-				}
+			CancelSubagent: func(value any, args tools.CancelSubagentArgs) (any, error) {
 				session, err := a.subagents.cancel(value.(*agentRuntime), args)
 				if err != nil {
 					return nil, err
 				}
 				return a.subagents.snapshotLocked(session, true), nil
 			},
-			UpdateTodos: func(value any, raw json.RawMessage) (string, error) {
-				todos, err := parseUpdateTodosArgs(string(raw))
-				if err != nil {
-					return "", err
+			UpdateTodos: func(value any, args tools.UpdateTodosArgs) (string, error) {
+				todos := make([]todoItem, len(args.Todos))
+				for i, item := range args.Todos {
+					todos[i] = todoItem{
+						ID: item.ID, Content: item.Content, Source: item.Source,
+						Status: todoStatus(item.Status),
+					}
 				}
 				value.(*agentRuntime).replaceTodos(todos)
 				return todoListResult(todos)
 			},
-			CompleteGoal: func(value any, raw json.RawMessage) (string, error) {
+			CompleteGoal: func(value any, args tools.CompleteGoalArgs) (string, error) {
 				runtime, ok := value.(*agentRuntime)
 				if !ok {
 					return "", errors.New("goal completion runtime is unavailable")
 				}
-				return a.completeGoalForRuntime(runtime, raw)
+				return a.completeGoalForRuntime(runtime, args)
 			},
 			MarshalResult: marshalToolResult,
 		},
@@ -1483,6 +1462,9 @@ func parseToolTimeout(call contracts.ToolCall) int {
 
 // extractToolSummary returns a concise summary of tool results for the reasoning trace.
 func extractToolSummary(toolName, output string, isError bool) string {
+	if toolName == toolExecuteProgram {
+		return extractExecuteProgramSummary(output, isError)
+	}
 	if isError {
 		return "Error: " + truncateStr(output, 200)
 	}
@@ -1494,6 +1476,46 @@ func extractToolSummary(toolName, output string, isError bool) string {
 	default:
 		return truncateStr(output, 200)
 	}
+}
+
+func extractExecuteProgramSummary(output string, isError bool) string {
+	const prefix = "Direct program execution"
+	var result struct {
+		Command  string   `json:"command"`
+		Args     []string `json:"args"`
+		Cwd      string   `json:"cwd"`
+		ExitCode int      `json:"exit_code"`
+		TimedOut bool     `json:"timed_out"`
+		Failed   bool     `json:"failed"`
+		Error    string   `json:"error"`
+		Stderr   string   `json:"stderr"`
+	}
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		if isError {
+			return "Error: " + prefix + ": " + truncateStr(output, 200)
+		}
+		return prefix + ": " + truncateStr(output, 200)
+	}
+
+	status := "completed"
+	switch {
+	case result.TimedOut:
+		status = "timed out"
+	case result.Failed && result.ExitCode >= 0:
+		status = fmt.Sprintf("exited with code %d", result.ExitCode)
+	case result.Failed:
+		status = "failed to launch"
+	}
+	summary := fmt.Sprintf("%s %s: command=%q args=%q cwd=%q", prefix, status, result.Command, result.Args, result.Cwd)
+	if detail := strings.TrimSpace(result.Error); detail != "" {
+		summary += "; " + detail
+	} else if detail := strings.TrimSpace(result.Stderr); detail != "" {
+		summary += "; stderr=" + detail
+	}
+	if isError {
+		summary = "Error: " + summary
+	}
+	return truncateStr(summary, 200)
 }
 
 // extractSearchSummary extracts the first few result titles from web_search output.

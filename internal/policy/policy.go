@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -52,6 +53,19 @@ func OptInTools() map[string]struct{} {
 	for name := range optIn {
 		result[name] = struct{}{}
 	}
+	return result
+}
+
+// RegisteredTools returns the complete, stable vocabulary accepted by
+// capability allowlists. The result is a fresh slice so callers can safely
+// include it in diagnostics without exposing policy-owned state.
+func RegisteredTools() []string {
+	result := make([]string, 0, len(alwaysEnabled)+len(optIn))
+	result = append(result, alwaysEnabled...)
+	for name := range optIn {
+		result = append(result, name)
+	}
+	sort.Strings(result)
 	return result
 }
 
@@ -134,7 +148,7 @@ func InheritChildTools(parent map[string]bool, requested []string, depth, maxDep
 				continue
 			}
 			if !IsKnownTool(name) {
-				return nil, fmt.Errorf("unknown tool %q in allowed_tools", name)
+				return nil, fmt.Errorf("unknown tool %q in allowed_tools; allowed_tools accepts registered capability names, not executable names; valid registered capability names are: %s", name, strings.Join(RegisteredTools(), ", "))
 			}
 			if !parent[name] {
 				return nil, fmt.Errorf("tool %q is not allowed by parent policy", name)

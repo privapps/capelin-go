@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
@@ -19,6 +20,73 @@ type Skill struct {
 	Content     string
 	Runs        string
 	Commands    []string
+}
+
+const (
+	// MaxContentBytes bounds content returned by read_skill.
+	MaxContentBytes = 100_000
+	// MaxInlineContentBytes bounds one explicitly selected skill in a prompt.
+	MaxInlineContentBytes = 24_000
+	// MaxInlineAggregateBytes bounds all explicitly selected skill content in
+	// one prompt.
+	MaxInlineAggregateBytes = 48_000
+
+	readContentTruncationMarker = "\n\n[... skill content truncated ...]"
+)
+
+type InlineSelection struct {
+	Content            string
+	Truncated          bool
+	AggregateTruncated bool
+	Used               int
+}
+
+func ReadContent(content string) string {
+	if len(content) <= MaxContentBytes {
+		return content
+	}
+	return TruncateUTF8(content, MaxContentBytes) + readContentTruncationMarker
+}
+
+func SelectInlineContent(content string, used int) InlineSelection {
+	remaining := MaxInlineAggregateBytes - used
+	if remaining <= 0 {
+		return InlineSelection{AggregateTruncated: true, Used: MaxInlineAggregateBytes}
+	}
+	limit := remaining
+	if limit > MaxInlineContentBytes {
+		limit = MaxInlineContentBytes
+	}
+	if len(content) <= limit {
+		return InlineSelection{Content: content, Used: used + len(content)}
+	}
+	return InlineSelection{
+		Content:            TruncateUTF8(content, limit),
+		Truncated:          true,
+		AggregateTruncated: remaining < MaxInlineContentBytes,
+		Used:               used + minInt(len(content), MaxInlineContentBytes),
+	}
+}
+
+func TruncateUTF8(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	end := maxBytes
+	for end > 0 && !utf8.ValidString(value[:end]) {
+		end--
+	}
+	return value[:end]
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 type skillFrontMatter struct {

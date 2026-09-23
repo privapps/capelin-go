@@ -16,7 +16,44 @@ type ToolResult struct {
 	Output  string
 	IsError bool
 	Retried bool
+	// Recovery describes a bounded, explicit recovery choice for a
+	// recoverable tool result. It is separate from Retried because corrected
+	// capability or command retries are chosen by the model/operator rather
+	// than performed by the runner.
+	Recovery *ToolRecovery
 }
+
+// ToolRecovery is the protocol-neutral audit record for one recoverable tool
+// failure. A result offers at most one corrected retry; it never changes the
+// worker's permission scope on its own.
+type ToolRecovery struct {
+	Kind                     string               `json:"kind"`
+	Phase                    string               `json:"phase"`
+	Attempt                  int                  `json:"attempt"`
+	MaxRetries               int                  `json:"max_retries"`
+	Retryable                bool                 `json:"retryable"`
+	RequiresExplicitDecision bool                 `json:"requires_explicit_decision"`
+	Guidance                 string               `json:"guidance"`
+	PermissionScope          *ToolPermissionScope `json:"permission_scope,omitempty"`
+}
+
+// ToolPermissionScope makes the policy boundary visible in recovery output.
+// RequestedTools is the attempted child scope; AllowedTools is the scope
+// available to the current runtime; EffectiveTools is populated only when a
+// request was admitted.
+type ToolPermissionScope struct {
+	AllowedTools   []string `json:"allowed_tools"`
+	RequestedTools []string `json:"requested_tools,omitempty"`
+	EffectiveTools []string `json:"effective_tools,omitempty"`
+	RestrictOnly   bool     `json:"restrict_only"`
+}
+
+const (
+	RecoveryKindCorrectedRetry       = "corrected_retry"
+	RecoveryPhaseCapabilityAdmission = "capability_admission"
+	RecoveryPhaseCommandExecution    = "command_execution"
+	RecoveryPhaseToolInvocation      = "tool_invocation"
+)
 
 // Completion is the normalized view of one provider response. Concrete
 // adapters may attach private wire data to their implementation for the next
