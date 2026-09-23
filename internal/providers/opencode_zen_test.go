@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"capelin-go/internal/contracts"
-	"capelin-go/internal/tools"
 )
 
 func TestIsOpenCodeZenEndpointRequiresExactHTTPSEndpoint(t *testing.T) {
@@ -71,10 +70,11 @@ func TestProviderFactoryRoutesExactZenEndpointToBufferedSSEAdapter(t *testing.T)
 	defer server.Close()
 
 	provider := New(Config{
-		Endpoint: "https://opencode.ai/zen/v1/chat/completions",
-		Token:    "public",
-		Model:    "zen-model",
-		HTTP:     zenTestClient(server.URL),
+		Endpoint:      "https://opencode.ai/zen/v1/chat/completions",
+		Token:         "public",
+		Model:         "zen-model",
+		HTTP:          zenTestClient(server.URL),
+		FreeTierTools: testFreeTierTools,
 	})
 	if _, ok := provider.(*OpenCodeZen); !ok {
 		t.Fatalf("factory provider = %T, want *OpenCodeZen", provider)
@@ -294,7 +294,7 @@ func TestZenToolNameMapsOpenCodeFileToolsWithoutChangingAppendSemantics(t *testi
 }
 
 func TestZenFreeTierExecuteProgramDescriptionIsDirect(t *testing.T) {
-	for _, tool := range tools.FreeTierTools() {
+	for _, tool := range testFreeTierTools() {
 		if tool.Function.Name != "execute_program" {
 			continue
 		}
@@ -306,6 +306,38 @@ func TestZenFreeTierExecuteProgramDescriptionIsDirect(t *testing.T) {
 		return
 	}
 	t.Fatal("Zen free-tier tools did not include execute_program")
+}
+
+func TestZenPublicTierRequiresFreeTierTools(t *testing.T) {
+	provider := New(Config{
+		Endpoint: "https://opencode.ai/zen/v1/chat/completions",
+		Token:    "public",
+	})
+	_, err := provider.Complete(context.Background(), provider.Initialize(nil, "hello"), nil, "model", "")
+	if err == nil || !strings.Contains(err.Error(), "free-tier tool catalog is unavailable") {
+		t.Fatalf("public Zen without catalog error = %v, want explicit catalog error", err)
+	}
+}
+
+func testFreeTierTools() []contracts.Tool {
+	return []contracts.Tool{
+		{
+			Type: "function",
+			Function: contracts.ToolSpec{
+				Name:        "read_file",
+				Description: "Read a file from the workspace.",
+				Parameters:  map[string]any{"type": "object"},
+			},
+		},
+		{
+			Type: "function",
+			Function: contracts.ToolSpec{
+				Name:        "execute_program",
+				Description: "Execute a local program directly with an explicit executable and argument vector; never invoke or parse a shell.",
+				Parameters:  map[string]any{"type": "object"},
+			},
+		},
+	}
 }
 
 func TestProviderFactoryPreservesNonZenChatJSONBehavior(t *testing.T) {

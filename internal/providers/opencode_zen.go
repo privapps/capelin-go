@@ -16,7 +16,6 @@ import (
 	"sync"
 
 	"capelin-go/internal/contracts"
-	toolpkg "capelin-go/internal/tools"
 )
 
 const (
@@ -86,7 +85,7 @@ func (p *OpenCodeZen) Complete(ctx context.Context, state contracts.TurnState, t
 		return nil, fmt.Errorf("create OpenCode Zen request ID: %w", err)
 	}
 
-	wireTools, responseTools, err := zenTools(tools, strings.EqualFold(strings.TrimSpace(p.cfg.Token), "public"))
+	wireTools, responseTools, err := zenTools(tools, strings.EqualFold(strings.TrimSpace(p.cfg.Token), "public"), p.cfg.FreeTierTools)
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +351,7 @@ func zenMessages(messages []contracts.Message, reasoning string) []chatMessage {
 	return result
 }
 
-func zenTools(tools []contracts.Tool, requireFreeTierTools bool) ([]contracts.Tool, map[string]string, error) {
+func zenTools(tools []contracts.Tool, requireFreeTierTools bool, freeTierTools func() []contracts.Tool) ([]contracts.Tool, map[string]string, error) {
 	result := make([]contracts.Tool, 0, len(tools)+2)
 	responseTools := make(map[string]string, len(tools)+2)
 	appendTool := func(tool contracts.Tool) error {
@@ -378,7 +377,10 @@ func zenTools(tools []contracts.Tool, requireFreeTierTools bool) ([]contracts.To
 		}
 	}
 	if requireFreeTierTools {
-		for _, tool := range toolpkg.FreeTierTools() {
+		if freeTierTools == nil {
+			return nil, nil, errors.New("OpenCode Zen free-tier tool catalog is unavailable")
+		}
+		for _, tool := range freeTierTools() {
 			if _, ok := responseTools[zenToolName(tool.Function.Name)]; ok {
 				continue
 			}

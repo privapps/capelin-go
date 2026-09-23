@@ -33,6 +33,9 @@ type Config struct {
 	Model    string
 	Debug    bool
 	HTTP     *http.Client
+	// FreeTierTools supplies the application-owned catalog required by the
+	// public OpenCode Zen tier.
+	FreeTierTools func() []contracts.Tool
 }
 
 func IsResponsesEndpoint(endpoint string) bool {

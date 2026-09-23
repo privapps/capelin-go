@@ -1,12 +1,12 @@
 package app
 
-import "capelin-go/internal/tools"
+import "capelin-go/internal/subagents"
 
-// These aliases preserve the application package's narrow compatibility seam
-// while tool schemas and argument decoding remain owned by internal/tools.
-type createSubagentArgs = tools.CreateSubagentArgs
-type runSubagentArgs = tools.RunSubagentArgs
-type awaitSubagentArgs = tools.AwaitSubagentArgs
-type listSubagentsArgs = tools.ListSubagentsArgs
-type readSubagentArgs = tools.ReadSubagentArgs
-type cancelSubagentArgs = tools.CancelSubagentArgs
+// These aliases keep application workflows on the subagent lifecycle seam;
+// JSON decoding remains owned by internal/tools.
+type createSubagentArgs = subagents.CreateArgs
+type runSubagentArgs = subagents.RunArgs
+type awaitSubagentArgs = subagents.AwaitArgs
+type listSubagentsArgs = subagents.ListArgs
+type readSubagentArgs = subagents.ReadArgs
+type cancelSubagentArgs = subagents.CancelArgs

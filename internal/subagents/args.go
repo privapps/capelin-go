@@ -1,10 +1,10 @@
 package subagents
 
-import "capelin-go/internal/tools"
+import "capelin-go/internal/contracts"
 
-type createSubagentArgs = tools.CreateSubagentArgs
-type runSubagentArgs = tools.RunSubagentArgs
-type awaitSubagentArgs = tools.AwaitSubagentArgs
-type listSubagentsArgs = tools.ListSubagentsArgs
-type readSubagentArgs = tools.ReadSubagentArgs
-type cancelSubagentArgs = tools.CancelSubagentArgs
+type createSubagentArgs = contracts.CreateSubagentArgs
+type runSubagentArgs = contracts.RunSubagentArgs
+type awaitSubagentArgs = contracts.AwaitSubagentArgs
+type listSubagentsArgs = contracts.ListSubagentsArgs
+type readSubagentArgs = contracts.ReadSubagentArgs
+type cancelSubagentArgs = contracts.CancelSubagentArgs

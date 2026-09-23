@@ -35,7 +35,7 @@ or subagent lifecycle implementations.
 | `internal/agent` | Protocol-neutral turns, model retry, iteration limits, continuation, output events, tool batch scheduling, deadlines, timeout retry, and result ordering | Provider payloads, HTTP, concrete tools, and safety implementation |
 | `internal/providers` | Chat Completions and Responses transport, wire DTOs, decoding, continuation state, and retry markers | Common turn policy and tool execution |
 | `internal/tools` | Tool catalog, schemas, argument decoding, web/filesystem/process/skill implementations, and dispatcher hooks | Turn policy, provider formats, output sinks, and subagent state |
-| `internal/subagents` | Child-agent lifecycle, visibility, limits, inherited permissions, scheduling, cancellation, timeouts, and result aggregation | Provider construction, tool schemas, and application workflows |
+| `internal/subagents` | Child-agent lifecycle argument contracts, visibility, limits, inherited permissions, scheduling, cancellation, timeouts, and result aggregation | Provider construction, tool schemas, and application workflows |
 | `internal/server` | HTTP intake, endpoint resolution, authorization, request limits, sync/async delivery, admission, cancellation, polling storage, panic recovery, response formatting, and CORS | Providers, agents, tools, or application composition |
 | `internal/sessions` | Durable snapshots, legacy decoding, selector resolution, validation, and atomic replacement | Interactive commands and provider state |
 | `internal/interactive` | Terminal input normalization, paste handling, and readline/fallback mechanics | Slash commands and model turns |
@@ -58,6 +58,8 @@ or subagent lifecycle implementations.
    provider, agent, or runtime.
 5. Keep `internal/subagents` delivery- and provider-neutral. Its runner receives
    a normalized runtime/session view; the application supplies the runner.
+   Shared child-lifecycle argument values belong in `internal/contracts`; the
+   tool dispatcher decodes them and the application passes them to subagents.
 6. Lower-level packages must not import `internal/app`, `internal/cli`, or a
    command entrypoint. Pass narrow values or callbacks instead.
 7. Keep persistence below workflows: snapshot serialization belongs in

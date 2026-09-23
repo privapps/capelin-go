@@ -249,11 +249,12 @@ func (c *client) agentProvider() agent.Provider {
 		return providers.New(providers.Config{})
 	}
 	return providers.New(providers.Config{
-		Endpoint: c.endpoint,
-		Token:    c.token,
-		Model:    c.model,
-		Debug:    c.debug,
-		HTTP:     c.http,
+		Endpoint:      c.endpoint,
+		Token:         c.token,
+		Model:         c.model,
+		Debug:         c.debug,
+		HTTP:          c.http,
+		FreeTierTools: tools.FreeTierTools,
 	})
 }
 
