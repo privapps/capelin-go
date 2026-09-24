@@ -4,8 +4,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"capelin-go/internal/policy"
 )
@@ -23,6 +25,8 @@ var numericConfigKeys = []string{
 	"SUBAGENT_MAX_ITERATIONS",
 	"TOOL_MAX_PARALLEL",
 	"TOOL_TIMEOUT_SECONDS",
+	"ASYNC_TIMEOUT_SECONDS",
+	"ASYNC_RESULT_TTL_SECONDS",
 }
 
 func isolateLoad(t *testing.T) string {
@@ -34,9 +38,30 @@ func isolateLoad(t *testing.T) string {
 		"SUBAGENT_MODEL", "SUBAGENT_REASONING_EFFORT", "IDLE_HOOK_COMMAND", "IDLE_HOOK_ARGS",
 		"IDLE_HOOK_TIMEOUT", "IDLE_HOOK_MODE", "AGENT_QUESTION_PREVIEW_MAX",
 	}, numericConfigKeys...) {
+		if key == "ASYNC_TIMEOUT_SECONDS" || key == "ASYNC_RESULT_TTL_SECONDS" {
+			continue
+		}
 		t.Setenv(key, "")
 	}
+	for _, key := range []string{"ASYNC_TIMEOUT_SECONDS", "ASYNC_RESULT_TTL_SECONDS"} {
+		unsetEnvForTest(t, key)
+	}
 	return path
+}
+
+func unsetEnvForTest(t *testing.T, key string) {
+	t.Helper()
+	previous, present := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("unset %s: %v", key, err)
+	}
+	t.Cleanup(func() {
+		if present {
+			_ = os.Setenv(key, previous)
+		} else {
+			_ = os.Unsetenv(key)
+		}
+	})
 }
 
 func writeConfig(t *testing.T, path string, values map[string]string) {
@@ -68,6 +93,9 @@ func TestLoadFirstRunUsesProviderDefaultsAndGeneratesOrdinaryConfig(t *testing.T
 		t.Fatalf("unexpected provider defaults: endpoint=%q model=%q token=%q reasoning=%q", cfg.Endpoint, cfg.Model, cfg.Token, cfg.Reasoning)
 	}
 	assertOrdinaryDefaults(t, cfg.OrdinaryProfile())
+	if cfg.AsyncTimeout != 15*time.Minute || cfg.AsyncResultTTL != time.Hour {
+		t.Fatalf("async lifetime defaults = timeout %s, result TTL %s; want 15m and 1h", cfg.AsyncTimeout, cfg.AsyncResultTTL)
+	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -87,6 +115,8 @@ func TestLoadFirstRunUsesProviderDefaultsAndGeneratesOrdinaryConfig(t *testing.T
 		"SUBAGENT_MAX_ITERATIONS = 20",
 		"TOOL_MAX_PARALLEL = 8",
 		"TOOL_TIMEOUT_SECONDS = 60",
+		"ASYNC_TIMEOUT_SECONDS = 900",
+		"ASYNC_RESULT_TTL_SECONDS = 3600",
 		"IDLE_HOOK_COMMAND =",
 		"IDLE_HOOK_ARGS = []",
 		"IDLE_HOOK_MODE = detached",
@@ -916,4 +946,208 @@ func TestAgentQuestionPreviewMaxPrecedenceAndFallback(t *testing.T) {
 			t.Fatalf("invalid saved value gave %d, want %d", cfg.AgentQuestionPreviewMax, DefaultAgentQuestionPreviewMax)
 		}
 	})
+}
+
+func TestLoadAsyncLifetimeSettingsUseIndependentPrecedence(t *testing.T) {
+	tests := []struct {
+		name          string
+		args          []string
+		env           map[string]string
+		saved         map[string]string
+		wantTimeout   time.Duration
+		wantResultTTL time.Duration
+	}{
+		{
+			name:          "CLI flags override environment and saved values in both forms",
+			args:          []string{"--async-timeout-seconds", "23", "--async-result-ttl-seconds=31", "task"},
+			env:           map[string]string{"ASYNC_TIMEOUT_SECONDS": "41", "ASYNC_RESULT_TTL_SECONDS": "43"},
+			saved:         map[string]string{"ASYNC_TIMEOUT_SECONDS": "47", "ASYNC_RESULT_TTL_SECONDS": "53"},
+			wantTimeout:   23 * time.Second,
+			wantResultTTL: 31 * time.Second,
+		},
+		{
+			name:          "environment overrides saved timeout independently of saved result TTL",
+			env:           map[string]string{"ASYNC_TIMEOUT_SECONDS": "59"},
+			saved:         map[string]string{"ASYNC_TIMEOUT_SECONDS": "61", "ASYNC_RESULT_TTL_SECONDS": "67"},
+			wantTimeout:   59 * time.Second,
+			wantResultTTL: 67 * time.Second,
+		},
+		{
+			name:          "saved values are used when higher-precedence sources are absent",
+			saved:         map[string]string{"ASYNC_TIMEOUT_SECONDS": "71", "ASYNC_RESULT_TTL_SECONDS": "73"},
+			wantTimeout:   71 * time.Second,
+			wantResultTTL: 73 * time.Second,
+		},
+		{
+			name:          "equals timeout flag and separate result TTL flag are accepted",
+			args:          []string{"--async-timeout-seconds=79", "--async-result-ttl-seconds", "83", "task"},
+			wantTimeout:   79 * time.Second,
+			wantResultTTL: 83 * time.Second,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := isolateLoad(t)
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+			if len(tc.saved) > 0 {
+				values := map[string]string{"ENDPOINT": defaultEndpoint}
+				for key, value := range tc.saved {
+					values[key] = value
+				}
+				writeConfig(t, path, values)
+			}
+			args := append([]string(nil), tc.args...)
+			if len(args) == 0 || args[len(args)-1] != "task" {
+				args = append(args, "task")
+			}
+			cfg, err := Load(args)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.AsyncTimeout != tc.wantTimeout || cfg.AsyncResultTTL != tc.wantResultTTL {
+				t.Fatalf("async lifetimes = timeout %s, result TTL %s; want %s and %s", cfg.AsyncTimeout, cfg.AsyncResultTTL, tc.wantTimeout, tc.wantResultTTL)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidAsyncLifetimeValuesFromEverySource(t *testing.T) {
+	settings := []struct {
+		key  string
+		flag string
+	}{
+		{key: "ASYNC_TIMEOUT_SECONDS", flag: "--async-timeout-seconds"},
+		{key: "ASYNC_RESULT_TTL_SECONDS", flag: "--async-result-ttl-seconds"},
+	}
+	for _, setting := range settings {
+		for _, raw := range []string{"", "not-seconds", "0", "-1"} {
+			for _, source := range []string{"CLI", "environment", "saved"} {
+				t.Run(source+"/"+setting.key+"/"+raw, func(t *testing.T) {
+					path := isolateLoad(t)
+					switch source {
+					case "CLI":
+						if _, err := Load([]string{setting.flag, raw, "task"}); err == nil || !strings.Contains(err.Error(), setting.flag) {
+							t.Fatalf("Load error = %v, want actionable error for %s", err, setting.flag)
+						}
+					case "environment":
+						t.Setenv(setting.key, raw)
+						if _, err := Load([]string{"task"}); err == nil || !strings.Contains(err.Error(), setting.key) {
+							t.Fatalf("Load error = %v, want actionable error for %s", err, setting.key)
+						}
+					case "saved":
+						writeConfig(t, path, map[string]string{"ENDPOINT": defaultEndpoint, setting.key: raw})
+						if _, err := Load([]string{"task"}); err == nil || !strings.Contains(err.Error(), setting.key) {
+							t.Fatalf("Load error = %v, want actionable error for %s", err, setting.key)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestLoadRejectsEmptyAsyncLifetimeValuesFromEverySource(t *testing.T) {
+	settings := []struct {
+		key string
+	}{
+		{key: "ASYNC_TIMEOUT_SECONDS"},
+		{key: "ASYNC_RESULT_TTL_SECONDS"},
+	}
+	for _, setting := range settings {
+		for _, source := range []string{"environment", "saved"} {
+			t.Run(source+"/"+setting.key, func(t *testing.T) {
+				path := isolateLoad(t)
+				switch source {
+				case "environment":
+					t.Setenv(setting.key, "")
+					if _, err := Load([]string{"task"}); err == nil || !strings.Contains(err.Error(), setting.key) {
+						t.Fatalf("Load error = %v, want actionable error for empty %s", err, setting.key)
+					}
+				case "saved":
+					writeConfig(t, path, map[string]string{"ENDPOINT": defaultEndpoint, setting.key: ""})
+					if _, err := Load([]string{"task"}); err == nil || !strings.Contains(err.Error(), setting.key) {
+						t.Fatalf("Load error = %v, want actionable error for empty %s", err, setting.key)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestAsyncLifetimeConfigMigrationPreservesExistingValues(t *testing.T) {
+	path := isolateLoad(t)
+	writeConfig(t, path, map[string]string{
+		"ASYNC_TIMEOUT_SECONDS":    "111",
+		"ASYNC_RESULT_TTL_SECONDS": "222",
+		"MODEL":                    "preserved-model",
+	})
+	cfg, err := Load([]string{"task"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AsyncTimeout != 111*time.Second || cfg.AsyncResultTTL != 222*time.Second {
+		t.Fatalf("loaded durations = %s, %s", cfg.AsyncTimeout, cfg.AsyncResultTTL)
+	}
+	saved, err := readConfigFile(path)
+	if err != nil {
+		t.Fatalf("read migrated config: %v", err)
+	}
+	if saved["ASYNC_TIMEOUT_SECONDS"] != "111" || saved["ASYNC_RESULT_TTL_SECONDS"] != "222" || saved["MODEL"] != "preserved-model" {
+		t.Fatalf("migration changed existing values: %#v", saved)
+	}
+}
+
+func TestLoadRejectsAsyncDurationOverflowFromEverySource(t *testing.T) {
+	settings := []struct {
+		key  string
+		flag string
+	}{
+		{key: "ASYNC_TIMEOUT_SECONDS", flag: "--async-timeout-seconds"},
+		{key: "ASYNC_RESULT_TTL_SECONDS", flag: "--async-result-ttl-seconds"},
+	}
+	for _, setting := range settings {
+		for _, source := range []string{"CLI", "environment", "saved"} {
+			t.Run(source+"/"+setting.key, func(t *testing.T) {
+				path := isolateLoad(t)
+				const tooLargeSeconds = "9223372037"
+				var err error
+				switch source {
+				case "CLI":
+					_, err = Load([]string{setting.flag, tooLargeSeconds, "task"})
+				case "environment":
+					t.Setenv(setting.key, tooLargeSeconds)
+					_, err = Load([]string{"task"})
+				case "saved":
+					writeConfig(t, path, map[string]string{"ENDPOINT": defaultEndpoint, setting.key: tooLargeSeconds})
+					_, err = Load([]string{"task"})
+				}
+				if err == nil {
+					t.Fatalf("Load accepted %s=%s, which exceeds time.Duration seconds", setting.key, tooLargeSeconds)
+				}
+				if !strings.Contains(err.Error(), setting.key) && !strings.Contains(err.Error(), setting.flag) {
+					t.Fatalf("Load error %q does not identify setting %s", err, setting.key)
+				}
+			})
+		}
+	}
+}
+
+func TestLoadAcceptsLargestAsyncDurationRepresentableByPlatform(t *testing.T) {
+	seconds := int64((1<<63 - 1) / int64(time.Second))
+	if strconv.IntSize == 32 {
+		seconds = int64(1<<31 - 1)
+	}
+	isolateLoad(t)
+	value := strconv.FormatInt(seconds, 10)
+	cfg, err := Load([]string{"--async-timeout-seconds=" + value, "--async-result-ttl-seconds=" + value, "task"})
+	if err != nil {
+		t.Fatalf("Load largest representable duration: %v", err)
+	}
+	want := time.Duration(seconds) * time.Second
+	if cfg.AsyncTimeout != want || cfg.AsyncResultTTL != want {
+		t.Fatalf("loaded durations = %s / %s, want %s", cfg.AsyncTimeout, cfg.AsyncResultTTL, want)
+	}
 }

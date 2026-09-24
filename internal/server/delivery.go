@@ -60,6 +60,7 @@ type HandlerConfig struct {
 	Reasoning         string
 	AllowedTools      map[string]bool
 	AsyncTimeout      time.Duration
+	AsyncResultTTL    time.Duration
 	Store             *DataStore
 	Executor          Executor
 	AsyncOverride     func(string, *ExecutionRequest)
@@ -330,11 +331,15 @@ func buildExecutionResultJSON(execution *ExecutionRequest, result ExecutionResul
 }
 
 func (d *Delivery) StoreAsyncResult(id, value string) {
-	if d.store.Put(id, value, AsyncResultTTL) {
+	ttl := AsyncResultTTL
+	if d.config.AsyncResultTTL > 0 {
+		ttl = d.config.AsyncResultTTL
+	}
+	if d.store.Put(id, value, ttl) {
 		return
 	}
 	const fallback = `{"error":{"message":"async result exceeded storage limits","type":"async_error"}}`
-	if d.store.Put(id, fallback, AsyncResultTTL) {
+	if d.store.Put(id, fallback, ttl) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "failed to store async result %q\n", id)

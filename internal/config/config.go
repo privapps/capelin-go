@@ -26,6 +26,8 @@ const (
 	defaultToolMaxParallel        = 8
 	defaultToolTimeoutSec         = 60
 	defaultToolRetryOnTimeout     = true
+	defaultAsyncTimeoutSeconds    = 15 * 60
+	defaultAsyncResultTTLSeconds  = 60 * 60
 )
 
 const (
@@ -113,7 +115,6 @@ type Config struct {
 	Subagents                 SubagentConfig
 	ServerPort                int
 	ServerAllowedOrigins      string
-	ServerAllowedTargets      string
 	ServerAllowPrivateTargets string
 	ServerSecurityEnabled     bool
 	IdleHookCommand           string
@@ -128,6 +129,7 @@ type Config struct {
 	ContextWindow             int    // optional conversation budget in characters; 0 = disabled (reactive-only recovery)
 	AgentQuestionPreviewMax   int    // rune budget for rendered question previews (env AGENT_QUESTION_PREVIEW_MAX; default 160)
 	AsyncTimeout              time.Duration
+	AsyncResultTTL            time.Duration
 	Debug                     bool
 	profileSources            profileSources
 }
@@ -295,6 +297,8 @@ func Load(args []string) (Config, error) {
 	maxIter := 0
 	maxGoalIter := 0
 	modelRequestTimeoutSec := 0
+	asyncTimeoutSeconds := 0
+	asyncResultTTLSeconds := 0
 	numericFlags := map[string]bool{}
 	resumeID := ""
 	resumeRequested := false
@@ -556,6 +560,42 @@ func Load(args []string) (Config, error) {
 			}
 			modelRequestTimeoutSec = value
 			numericFlags["MODEL_REQUEST_TIMEOUT_SECONDS"] = true
+		case arg == "--async-timeout-seconds":
+			if i+1 >= len(args) {
+				return Config{}, errors.New("--async-timeout-seconds requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--async-timeout-seconds")
+			if err != nil {
+				return Config{}, err
+			}
+			asyncTimeoutSeconds = value
+			numericFlags["ASYNC_TIMEOUT_SECONDS"] = true
+		case strings.HasPrefix(arg, "--async-timeout-seconds="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--async-timeout-seconds="), "--async-timeout-seconds")
+			if err != nil {
+				return Config{}, err
+			}
+			asyncTimeoutSeconds = value
+			numericFlags["ASYNC_TIMEOUT_SECONDS"] = true
+		case arg == "--async-result-ttl-seconds":
+			if i+1 >= len(args) {
+				return Config{}, errors.New("--async-result-ttl-seconds requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--async-result-ttl-seconds")
+			if err != nil {
+				return Config{}, err
+			}
+			asyncResultTTLSeconds = value
+			numericFlags["ASYNC_RESULT_TTL_SECONDS"] = true
+		case strings.HasPrefix(arg, "--async-result-ttl-seconds="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--async-result-ttl-seconds="), "--async-result-ttl-seconds")
+			if err != nil {
+				return Config{}, err
+			}
+			asyncResultTTLSeconds = value
+			numericFlags["ASYNC_RESULT_TTL_SECONDS"] = true
 		case arg == "--resume":
 			resumeRequested = true
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
@@ -794,6 +834,22 @@ func Load(args []string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	asyncTimeoutSeconds, _, err = resolveRequiredPositiveSetting("ASYNC_TIMEOUT_SECONDS", asyncTimeoutSeconds, numericFlags["ASYNC_TIMEOUT_SECONDS"], fileCfg, defaultAsyncTimeoutSeconds)
+	if err != nil {
+		return Config{}, err
+	}
+	asyncResultTTLSeconds, _, err = resolveRequiredPositiveSetting("ASYNC_RESULT_TTL_SECONDS", asyncResultTTLSeconds, numericFlags["ASYNC_RESULT_TTL_SECONDS"], fileCfg, defaultAsyncResultTTLSeconds)
+	if err != nil {
+		return Config{}, err
+	}
+	asyncTimeout, err := positiveSecondsDuration(asyncTimeoutSeconds, "ASYNC_TIMEOUT_SECONDS")
+	if err != nil {
+		return Config{}, err
+	}
+	asyncResultTTL, err := positiveSecondsDuration(asyncResultTTLSeconds, "ASYNC_RESULT_TTL_SECONDS")
+	if err != nil {
+		return Config{}, err
+	}
 	if toolRetryOnTimeout == -1 {
 		toolRetryOnTimeout = boolToInt(readBoolCfg("TOOL_RETRY_ON_TIMEOUT", fileCfg, defaultToolRetryOnTimeout))
 	}
@@ -829,10 +885,11 @@ func Load(args []string) (Config, error) {
 		MaxIterations:             maxIter,
 		MaxGoalIterations:         maxGoalIter,
 		ModelRequestTimeoutSec:    modelRequestTimeoutSec,
+		AsyncTimeout:              asyncTimeout,
+		AsyncResultTTL:            asyncResultTTL,
 		Subagents:                 subagentCfg,
 		ServerPort:                serverPort,
 		ServerAllowedOrigins:      readCfg("SERVER_ALLOWED_ORIGINS", fileCfg, ""),
-		ServerAllowedTargets:      readCfg("SERVER_ALLOWED_TARGETS", fileCfg, ""),
 		ServerAllowPrivateTargets: readCfg("SERVER_ALLOW_PRIVATE_TARGETS", fileCfg, "false"),
 		ServerSecurityEnabled:     serverMode,
 		IdleHookCommand:           idleHookCommand,
@@ -913,21 +970,44 @@ func goalSetting(value, ordinaryDefault, goalFallback int, origin settingOrigin)
 // positive-integer settings. Environment and saved-file values are parsed
 // here so explicit invalid values are rejected rather than silently replaced.
 func resolvePositiveSetting(key string, flagValue int, flagSet bool, fileCfg map[string]string, ordinary int) (int, settingOrigin, error) {
+	return resolvePositiveSettingWithEmptyPolicy(key, flagValue, flagSet, fileCfg, ordinary, false)
+}
+
+func resolveRequiredPositiveSetting(key string, flagValue int, flagSet bool, fileCfg map[string]string, ordinary int) (int, settingOrigin, error) {
+	return resolvePositiveSettingWithEmptyPolicy(key, flagValue, flagSet, fileCfg, ordinary, true)
+}
+
+func resolvePositiveSettingWithEmptyPolicy(key string, flagValue int, flagSet bool, fileCfg map[string]string, ordinary int, rejectEmpty bool) (int, settingOrigin, error) {
 	if flagSet {
 		return flagValue, settingOriginCLI, nil
 	}
-	if raw := strings.TrimSpace(os.Getenv(key)); raw != "" {
-		value, err := parsePositiveInt(raw, key)
-		return value, settingOriginEnvironment, err
-	}
-	if raw := strings.TrimSpace(fileCfg[key]); raw != "" {
-		value, err := parsePositiveInt(raw, key)
-		if err != nil {
-			return 0, settingOriginSaved, err
+	if raw, present := os.LookupEnv(key); present {
+		if rejectEmpty || strings.TrimSpace(raw) != "" {
+			value, err := parsePositiveInt(raw, key)
+			return value, settingOriginEnvironment, err
 		}
-		return value, settingOriginSaved, nil
+	}
+	if raw, present := fileCfg[key]; present {
+		if rejectEmpty || strings.TrimSpace(raw) != "" {
+			value, err := parsePositiveInt(raw, key)
+			if err != nil {
+				return 0, settingOriginSaved, err
+			}
+			return value, settingOriginSaved, nil
+		}
 	}
 	return ordinary, settingOriginBuiltIn, nil
+}
+
+const maxAsyncDurationSeconds int64 = (1<<63 - 1) / int64(time.Second)
+
+// positiveSecondsDuration converts a positive setting in seconds without allowing
+// time.Duration overflow to silently turn an explicit value into an unset value.
+func positiveSecondsDuration(seconds int, setting string) (time.Duration, error) {
+	if int64(seconds) > maxAsyncDurationSeconds {
+		return 0, fmt.Errorf("%s exceeds the maximum representable duration of %d seconds", setting, maxAsyncDurationSeconds)
+	}
+	return time.Duration(seconds) * time.Second, nil
 }
 
 func parsePositiveInt(raw, flagName string) (int, error) {
@@ -1086,6 +1166,10 @@ SYSTEM_PROMPT =
 MAX_ITERATIONS = 40
 MAX_GOAL_ITERATIONS = 20
 MODEL_REQUEST_TIMEOUT_SECONDS = 300
+# Process-wide async job execution deadline and result retention in positive seconds.
+# CLI: --async-timeout-seconds / --async-result-ttl-seconds; env vars use these key names.
+ASYNC_TIMEOUT_SECONDS = 900
+ASYNC_RESULT_TTL_SECONDS = 3600
 
 # Subagent orchestration limits (env vars: SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN,
 # SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS, SUBAGENT_MAX_RESULT_CHARS,
@@ -1123,7 +1207,6 @@ IDLE_HOOK_MODE = detached
 # budget. When unset (0), recovery is reactive-only (compact after overflow).
 # CONTEXT_WINDOW =
 SERVER_ALLOWED_ORIGINS =
-SERVER_ALLOWED_TARGETS =
 SERVER_ALLOW_PRIVATE_TARGETS = false
 `
 

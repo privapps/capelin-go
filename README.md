@@ -221,14 +221,13 @@ curl -X POST "http://localhost:8899/?endpoint=https://opencode.ai/zen/v1/chat/co
   -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"search for go http best practices"}]}'
 ```
 
-In server mode, browser access is disabled by default. Configure exact origins and outbound targets explicitly:
+In server mode, browser access is disabled by default. Configure exact browser origins when needed:
 
 ```bash
 SERVER_ALLOWED_ORIGINS=https://app.example.com,http://localhost:3000
-SERVER_ALLOWED_TARGETS=https://api.openai.com,https://opencode.ai
 ```
 
-Use `SERVER_ALLOWED_ORIGINS=*` or `SERVER_ALLOWED_TARGETS=*` only as an explicit compatibility escape hatch. Private/self-hosted targets additionally require `SERVER_ALLOW_PRIVATE_TARGETS=true` and an exact target entry. Requests without an `Origin` header remain supported for CLI/server-to-server use.
+Public HTTP and HTTPS upstream targets are allowed. Private or local targets remain blocked by default; enable `SERVER_ALLOW_PRIVATE_TARGETS=true` only when private access is intentional. Requests without an `Origin` header remain supported for CLI/server-to-server use.
 
 - Endpoint: full URL including `/chat/completions` or `/responses` — use a hex-encoded path (`~<hex>`) or `?endpoint=` query parameter. Literal or percent-encoded URL paths are not accepted.
 - API token: standard `Authorization: Bearer <token>` header

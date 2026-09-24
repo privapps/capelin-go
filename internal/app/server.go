@@ -104,7 +104,7 @@ func (a *app) serverExecutor() server.Executor {
 func serverHandlerConfig(a *app, allowed map[string]bool, executor server.Executor) server.HandlerConfig {
 	config := server.HandlerConfig{
 		Model: a.cfg.model, Reasoning: a.cfg.reasoning, AllowedTools: cloneAllowedTools(allowed),
-		AsyncTimeout: a.cfg.asyncTimeout, Store: a.dataStore.serverStore(), Executor: executor,
+		AsyncTimeout: a.cfg.asyncTimeout, AsyncResultTTL: a.cfg.asyncResultTTL, Store: a.dataStore.serverStore(), Executor: executor,
 	}
 	if a.cfg.securityEnabled {
 		config.AuthorizeOrigin = a.cfg.securityPolicy.authorizeOrigin

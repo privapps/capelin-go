@@ -194,3 +194,39 @@ func TestHandlerRejectsUnsupportedResponsesCombinations(t *testing.T) {
 		})
 	}
 }
+
+func TestRunAsyncUsesLegacyTimeoutWhenUnset(t *testing.T) {
+	started := time.Now()
+	var deadline time.Time
+	delivery := NewDelivery(HandlerConfig{
+		Store: NewDataStore(),
+		Executor: ExecutorFunc(func(ctx context.Context, _ *ExecutionRequest) (ExecutionResult, error) {
+			var ok bool
+			deadline, ok = ctx.Deadline()
+			if !ok {
+				t.Fatal("executor context has no timeout deadline")
+			}
+			return ExecutionResult{Content: "done"}, nil
+		}),
+	})
+	delivery.RunAsync("legacy-timeout", &ExecutionRequest{})
+	remaining := deadline.Sub(started)
+	if remaining > defaultAsyncTimeout+time.Second || remaining < defaultAsyncTimeout-time.Second {
+		t.Fatalf("unset async timeout deadline has %s remaining; want approximately %s", remaining, defaultAsyncTimeout)
+	}
+}
+
+func TestStoreAsyncResultUsesLegacyRetentionWhenUnset(t *testing.T) {
+	store := NewDataStore()
+	delivery := NewDelivery(HandlerConfig{Store: store})
+	started := time.Now()
+	delivery.StoreAsyncResult("legacy-retention", "result")
+	expiresAt, ok := store.Expiry("legacy-retention")
+	if !ok {
+		t.Fatal("result was not stored")
+	}
+	remaining := expiresAt.Sub(started)
+	if remaining > AsyncResultTTL+time.Second || remaining < AsyncResultTTL-time.Second {
+		t.Fatalf("unset result TTL = %s; want approximately %s", remaining, AsyncResultTTL)
+	}
+}

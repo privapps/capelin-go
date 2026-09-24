@@ -379,6 +379,38 @@ ordinary defaults are treated as generated baselines for goal fallback. Goal
 profile resolution is in memory only. `--yolo` remains the permission and
 safety gate and does not select these budgets by itself.
 
+## Server mode
+
+Start the HTTP server with `--server-port PORT`. These settings control async
+execution and result retention:
+
+| Flag | Environment / `config.ini` key | Purpose | Default |
+| --- | --- | --- | --- |
+| `--async-timeout-seconds N` | `ASYNC_TIMEOUT_SECONDS` | Maximum async executor lifetime | `900` seconds |
+| `--async-result-ttl-seconds N` | `ASYNC_RESULT_TTL_SECONDS` | How long a stored async result is retained | `3600` seconds |
+
+Both values must be positive integer seconds. Put the same uppercase keys in
+`config.ini` to save them. New configurations include both keys; an upgrade
+appends missing keys without replacing values already present. Settings resolve in this order: CLI flag, environment,
+saved config, then built-in default. They are process-wide startup settings, not
+per-request overrides; restart the server to change them.
+
+The async timeout caps the executor's total lifetime. It is distinct from the
+10-minute provider HTTP request timeout, which bounds an individual outbound
+provider request. Result retention begins when the result is stored and applies
+to both successful and error results. It is also separate from the generic
+`/data` request TTL: `/data` keeps its caller-supplied `ttl=` semantics, with an
+8-hour default and a 7-day maximum.
+
+For example, start a server with a 20-minute async lifetime and retain results
+for two hours:
+
+```bash
+./capelin-go --server-port 8080 \
+  --async-timeout-seconds 1200 \
+  --async-result-ttl-seconds 7200
+```
+
 ## Worker assistants
 
 For a large task, ask Capelin to divide the work:

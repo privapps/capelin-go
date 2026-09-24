@@ -16,8 +16,6 @@ var allowPrivateFetch = false
 type serverSecurityPolicy struct {
 	AllowedOrigins      map[string]bool
 	AllowAllOrigins     bool
-	AllowedTargets      map[string]bool
-	AllowAllTargets     bool
 	AllowPrivateTargets bool
 }
 
@@ -28,12 +26,8 @@ type parsedTarget struct {
 	Private  bool
 }
 
-func loadServerSecurityPolicy(rawOrigins, rawTargets, rawPrivate string) (serverSecurityPolicy, error) {
-	origins, allOrigins, err := parseAllowlist(rawOrigins, true)
-	if err != nil {
-		return serverSecurityPolicy{}, err
-	}
-	targets, allTargets, err := parseAllowlist(rawTargets, false)
+func loadServerSecurityPolicy(rawOrigins, rawPrivate string) (serverSecurityPolicy, error) {
+	origins, allOrigins, err := parseAllowlist(rawOrigins)
 	if err != nil {
 		return serverSecurityPolicy{}, err
 	}
@@ -43,7 +37,6 @@ func loadServerSecurityPolicy(rawOrigins, rawTargets, rawPrivate string) (server
 	}
 	return serverSecurityPolicy{
 		AllowedOrigins: origins, AllowAllOrigins: allOrigins,
-		AllowedTargets: targets, AllowAllTargets: allTargets,
 		AllowPrivateTargets: allowPrivate,
 	}, nil
 }
@@ -95,7 +88,7 @@ func parseHTTPOrigin(raw string) (string, error) {
 	return canonicalOrigin(u), nil
 }
 
-func parseAllowlist(raw string, origin bool) (map[string]bool, bool, error) {
+func parseAllowlist(raw string) (map[string]bool, bool, error) {
 	out := map[string]bool{}
 	all := false
 	if strings.TrimSpace(raw) == "" {
@@ -110,19 +103,11 @@ func parseAllowlist(raw string, origin bool) (map[string]bool, bool, error) {
 			all = true
 			continue
 		}
-		if origin {
-			value, err := parseHTTPOrigin(item)
-			if err != nil {
-				return nil, false, fmt.Errorf("invalid allowlist entry")
-			}
-			out[value] = true
-			continue
-		}
-		target, err := parseAbsoluteTarget(item)
-		if err != nil || target.URL.Path != "" && target.URL.Path != "/" || target.URL.RawQuery != "" || target.URL.Fragment != "" {
+		value, err := parseHTTPOrigin(item)
+		if err != nil {
 			return nil, false, fmt.Errorf("invalid allowlist entry")
 		}
-		out[target.Origin] = true
+		out[value] = true
 	}
 	return out, all, nil
 }
@@ -137,16 +122,7 @@ func (p serverSecurityPolicy) authorizeURL(u *url.URL) error {
 
 func (p serverSecurityPolicy) secureHTTPClient() *http.Client {
 	private := func(host string) bool {
-		if !p.AllowPrivateTargets {
-			return false
-		}
-		for origin := range p.AllowedTargets {
-			u, err := url.Parse(origin)
-			if err == nil && strings.EqualFold(u.Hostname(), host) {
-				return true
-			}
-		}
-		return false
+		return p.AllowPrivateTargets
 	}
 	return NewSecureHTTPClient(&secureDialPolicy{AllowPrivate: private}, p.authorizeURL, 5)
 }
@@ -191,10 +167,7 @@ func (p serverSecurityPolicy) authorizeTarget(raw string) (parsedTarget, error) 
 	if err != nil {
 		return parsedTarget{}, err
 	}
-	if !p.AllowAllTargets && !p.AllowedTargets[target.Origin] {
-		return parsedTarget{}, fmt.Errorf("target not allowed")
-	}
-	if target.Private && (!p.AllowPrivateTargets || !p.AllowedTargets[target.Origin]) {
+	if target.Private && !p.AllowPrivateTargets {
 		return parsedTarget{}, fmt.Errorf("target not allowed")
 	}
 	return target, nil
@@ -205,10 +178,7 @@ func (p serverSecurityPolicy) rejectedTargetReason(raw string) string {
 	if err != nil {
 		return "invalid"
 	}
-	if !p.AllowAllTargets && !p.AllowedTargets[target.Origin] {
-		return "not_allowlisted"
-	}
-	if target.Private && (!p.AllowPrivateTargets || !p.AllowedTargets[target.Origin]) {
+	if target.Private && !p.AllowPrivateTargets {
 		return "private_target"
 	}
 	return "invalid"

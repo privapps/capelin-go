@@ -33,6 +33,21 @@ func isolateConfigFile(t *testing.T) {
 	t.Setenv("CAPELIN_CONFIG_FILE", filepath.Join(t.TempDir(), "config.ini"))
 }
 
+func unsetEnvForTest(t *testing.T, key string) {
+	t.Helper()
+	previous, present := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("unset %s: %v", key, err)
+	}
+	t.Cleanup(func() {
+		if present {
+			_ = os.Setenv(key, previous)
+		} else {
+			_ = os.Unsetenv(key)
+		}
+	})
+}
+
 func TestLoadConfigDefaults(t *testing.T) {
 	isolateConfigFile(t)
 	t.Setenv("ENDPOINT", "")
@@ -78,6 +93,12 @@ func TestPrintUsageDescribesProviderAndRuntimeProfileContract(t *testing.T) {
 		"TOKEN=public",
 		"REASONING_EFFORT=high",
 		"MODEL_REQUEST_TIMEOUT_SECONDS",
+		"ASYNC_TIMEOUT_SECONDS",
+		"ASYNC_RESULT_TTL_SECONDS",
+		"--async-timeout-seconds",
+		"--async-result-ttl-seconds",
+		"default 900 seconds",
+		"default 3600 seconds",
 		"--model-request-timeout-seconds",
 		"CLI flags > environment > saved config > built-in defaults",
 		"Ordinary limits:",
@@ -2436,20 +2457,13 @@ type proxyUnreadableBody struct{}
 func (proxyUnreadableBody) Read([]byte) (int, error) { return 0, errors.New("body unavailable") }
 func (proxyUnreadableBody) Close() error             { return nil }
 
-func TestProxyHandlerRejectsDisallowedTargetAndOversizedBody(t *testing.T) {
+func TestProxyHandlerRejectsInvalidTargetAndOversizedBody(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
 
 	handler := newComposedProxyHandler(upstream.URL, nil)
-	rejected := httptest.NewRequest(http.MethodGet, "/-/?endpoint="+url.QueryEscape("https://not-allowlisted.example/"), nil)
-	rejectedResponse := httptest.NewRecorder()
-	handler.ServeHTTP(rejectedResponse, rejected)
-	if rejectedResponse.Code != http.StatusForbidden {
-		t.Fatalf("disallowed target status = %d, body = %s", rejectedResponse.Code, rejectedResponse.Body.String())
-	}
-
 	missing := httptest.NewRequest(http.MethodGet, "/-/", nil)
 	missingResponse := httptest.NewRecorder()
 	handler.ServeHTTP(missingResponse, missing)
@@ -2491,16 +2505,11 @@ func TestProxyHandlerAppliesOriginAuthorizationAtCompositionBoundary(t *testing.
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
-	parsed, err := parseAbsoluteTarget(upstream.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
 	a := &app{
 		cfg: config{
 			securityEnabled: true,
 			securityPolicy: serverSecurityPolicy{
 				AllowedOrigins:      map[string]bool{"https://allowed.example": true},
-				AllowedTargets:      map[string]bool{parsed.Origin: true},
 				AllowPrivateTargets: true,
 			},
 		},
@@ -2515,6 +2524,14 @@ func TestProxyHandlerAppliesOriginAuthorizationAtCompositionBoundary(t *testing.
 		t.Fatalf("origin rejection = %d, body = %s", response.Code, response.Body.String())
 	}
 }
+
+func TestServerSecurityPolicyAllowsUnlistedPublicTargets(t *testing.T) {
+	policy := serverSecurityPolicy{}
+	if _, err := policy.authorizeTarget("https://huggingface.co/meta-llama"); err != nil {
+		t.Fatalf("public target was rejected without an allowlist: %v", err)
+	}
+}
+
 func TestProxyHandlerBlocksPrivateTargetsByDefault(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -2522,13 +2539,9 @@ func TestProxyHandlerBlocksPrivateTargetsByDefault(t *testing.T) {
 	defer upstream.Close()
 
 	// The configured policy must refuse to dial loopback/private targets by
-	// default, even when the target is otherwise allowlisted.
-	parsed, err := parseAbsoluteTarget(upstream.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// default.
 	a := &app{
-		cfg:       config{securityEnabled: true, securityPolicy: serverSecurityPolicy{AllowedTargets: map[string]bool{parsed.Origin: true}}},
+		cfg:       config{securityEnabled: true, securityPolicy: serverSecurityPolicy{}},
 		dataStore: newDataStore(),
 	}
 	handler := newServerHandlerWithExecutor(a, nil, nil)
@@ -3482,7 +3495,11 @@ func TestDataEndpointPUTOverwrites(t *testing.T) {
 }
 
 func TestDataEndpointTTLValidation(t *testing.T) {
-	a := &app{cfg: config{workspaceRoot: t.TempDir()}, dataStore: newDataStore()}
+	a := &app{cfg: config{
+		workspaceRoot:  t.TempDir(),
+		asyncTimeout:   17 * time.Second,
+		asyncResultTTL: 23 * time.Second,
+	}, dataStore: newDataStore()}
 
 	// TTL > max should be capped
 	req := httptest.NewRequest(http.MethodPut, "/data?key=ttl1&ttl=99999", strings.NewReader("val"))
@@ -4548,16 +4565,22 @@ func TestServerAsyncTimeoutAndPanicRecoveryThroughHandler(t *testing.T) {
 	isolateConfigFile(t)
 	allowed := serverParityAllowedTools()
 	t.Run("timeout", func(t *testing.T) {
+		unsetEnvForTest(t, "ASYNC_TIMEOUT_SECONDS")
+		parsed, err := loadConfig([]string{"--async-timeout-seconds=1"})
+		if err != nil {
+			t.Fatalf("load async timeout config: %v", err)
+		}
 		a := newServerParityApp(t, "http://remote.example", "model", "reasoning")
-		a.client.http = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			<-r.Context().Done()
-			return nil, r.Context().Err()
-		})}
-		a.cfg.asyncTimeout = 20 * time.Millisecond
+		a.cfg.asyncTimeout = parsed.asyncTimeout
+		executor := server.ExecutorFunc(func(ctx context.Context, _ *server.ExecutionRequest) (server.ExecutionResult, error) {
+			<-ctx.Done()
+			return server.ExecutionResult{}, ctx.Err()
+		})
+		handler := newServerHandlerWithExecutor(a, allowed, executor)
 		req := httptest.NewRequest(http.MethodPost, "/async/?endpoint=http%3A%2F%2Fremote.example", strings.NewReader(serverParityBody()))
 		req.Header.Set("Authorization", "Bearer sk-test")
 		w := httptest.NewRecorder()
-		a.handleAsyncChatCompletion(w, req, allowed)
+		handler.ServeHTTP(w, req)
 		if w.Code != http.StatusAccepted {
 			t.Fatalf("async status = %d: %s", w.Code, w.Body.String())
 		}
@@ -4700,4 +4723,306 @@ func pollServerData(t *testing.T, a *app, key string) string {
 	}
 	t.Fatalf("timed out polling async result %q", key)
 	return ""
+}
+
+func TestAsyncLifetimeStartupConfigurationReachesServerDelivery(t *testing.T) {
+	tests := []struct {
+		name         string
+		savedTimeout int
+		savedTTL     int
+		envTimeout   string
+		envTTL       string
+		args         []string
+		wantTimeout  time.Duration
+		wantTTL      time.Duration
+	}{
+		{
+			name:         "CLI overrides environment and saved config",
+			savedTimeout: 71,
+			savedTTL:     73,
+			envTimeout:   "79",
+			envTTL:       "83",
+			args:         []string{"--async-timeout-seconds=89", "--async-result-ttl-seconds=97"},
+			wantTimeout:  89 * time.Second,
+			wantTTL:      97 * time.Second,
+		},
+		{
+			name:         "environment overrides saved config",
+			savedTimeout: 101,
+			savedTTL:     103,
+			envTimeout:   "107",
+			envTTL:       "109",
+			wantTimeout:  107 * time.Second,
+			wantTTL:      109 * time.Second,
+		},
+		{
+			name:         "saved config only",
+			savedTimeout: 113,
+			savedTTL:     127,
+			wantTimeout:  113 * time.Second,
+			wantTTL:      127 * time.Second,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.ini")
+			t.Setenv("CAPELIN_CONFIG_FILE", configPath)
+			if tc.envTimeout == "" {
+				unsetEnvForTest(t, "ASYNC_TIMEOUT_SECONDS")
+			} else {
+				t.Setenv("ASYNC_TIMEOUT_SECONDS", tc.envTimeout)
+			}
+			if tc.envTTL == "" {
+				unsetEnvForTest(t, "ASYNC_RESULT_TTL_SECONDS")
+			} else {
+				t.Setenv("ASYNC_RESULT_TTL_SECONDS", tc.envTTL)
+			}
+			configFile := fmt.Sprintf("ASYNC_TIMEOUT_SECONDS = %d\nASYNC_RESULT_TTL_SECONDS = %d\n", tc.savedTimeout, tc.savedTTL)
+			if err := os.WriteFile(configPath, []byte(configFile), 0o644); err != nil {
+				t.Fatalf("write temporary config: %v", err)
+			}
+
+			cfg, err := loadConfig(tc.args)
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			if cfg.asyncTimeout != tc.wantTimeout || cfg.asyncResultTTL != tc.wantTTL {
+				t.Fatalf("loaded lifetimes = %s and %s; want %s and %s", cfg.asyncTimeout, cfg.asyncResultTTL, tc.wantTimeout, tc.wantTTL)
+			}
+
+			application := &app{cfg: cfg, dataStore: newDataStore()}
+			executorTimeout := make(chan time.Duration, 1)
+			executor := server.ExecutorFunc(func(ctx context.Context, _ *server.ExecutionRequest) (server.ExecutionResult, error) {
+				deadline, ok := ctx.Deadline()
+				if !ok {
+					executorTimeout <- 0
+				} else {
+					executorTimeout <- time.Until(deadline)
+				}
+				return server.ExecutionResult{Content: "async config delivery"}, nil
+			})
+			handlerConfig := serverHandlerConfig(application, nil, executor)
+			if handlerConfig.AsyncTimeout != tc.wantTimeout || handlerConfig.AsyncResultTTL != tc.wantTTL {
+				t.Fatalf("server handler lifetimes = %s and %s; want %s and %s", handlerConfig.AsyncTimeout, handlerConfig.AsyncResultTTL, tc.wantTimeout, tc.wantTTL)
+			}
+
+			// Exercise the production handler composition and its async delivery path,
+			// using the app's real in-memory store and an injected executor.
+			handler := newServerHandlerWithExecutor(application, nil, executor)
+			httpServer := httptest.NewServer(handler)
+			defer httpServer.Close()
+
+			requestURL := httpServer.URL + "/async/?endpoint=" + url.QueryEscape("https://remote.example/v1/chat/completions")
+			request, err := http.NewRequest(http.MethodPost, requestURL, strings.NewReader(`{"messages":[{"role":"user","content":"hello"}]}`))
+			if err != nil {
+				t.Fatalf("create async request: %v", err)
+			}
+			request.Header.Set("Authorization", "Bearer test-token")
+			response, err := httpServer.Client().Do(request)
+			if err != nil {
+				t.Fatalf("send async request: %v", err)
+			}
+			acceptanceBody, readErr := io.ReadAll(response.Body)
+			response.Body.Close()
+			if readErr != nil {
+				t.Fatalf("read async acceptance: %v", readErr)
+			}
+			if response.StatusCode != http.StatusAccepted {
+				t.Fatalf("async acceptance = %d: %s", response.StatusCode, acceptanceBody)
+			}
+			var accepted map[string]string
+			if err := json.Unmarshal(acceptanceBody, &accepted); err != nil {
+				t.Fatalf("decode async acceptance: %v", err)
+			}
+			if accepted["id"] == "" {
+				t.Fatalf("async acceptance has no result id: %s", acceptanceBody)
+			}
+
+			select {
+			case remaining := <-executorTimeout:
+				if remaining <= 0 || remaining > tc.wantTimeout || tc.wantTimeout-remaining > time.Second {
+					t.Fatalf("executor deadline has %s remaining; want approximately %s", remaining, tc.wantTimeout)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("async executor did not start")
+			}
+
+			var result string
+			pollDeadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(pollDeadline) {
+				pollURL := httpServer.URL + "/data?key=" + url.QueryEscape(accepted["id"])
+				pollResponse, err := httpServer.Client().Get(pollURL)
+				if err != nil {
+					t.Fatalf("poll async result: %v", err)
+				}
+				pollBody, readErr := io.ReadAll(pollResponse.Body)
+				pollResponse.Body.Close()
+				if readErr != nil {
+					t.Fatalf("read async result: %v", readErr)
+				}
+				if pollResponse.StatusCode == http.StatusOK {
+					result = string(pollBody)
+					break
+				}
+				if pollResponse.StatusCode != http.StatusNotFound {
+					t.Fatalf("async poll = %d: %s", pollResponse.StatusCode, pollBody)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if !strings.Contains(result, "async config delivery") {
+				t.Fatalf("async result = %q; expected injected executor output", result)
+			}
+
+			expiresAt, ok := application.dataStore.Expiry(accepted["id"])
+			if !ok {
+				t.Fatal("async result was not stored in the app's in-memory store")
+			}
+			remainingTTL := time.Until(expiresAt)
+			if remainingTTL > tc.wantTTL+time.Second || remainingTTL < tc.wantTTL-2*time.Second {
+				t.Fatalf("stored result has %s of retention remaining; want approximately %s", remainingTTL, tc.wantTTL)
+			}
+		})
+	}
+}
+func TestAsyncTimeoutDoesNotChangeProviderHTTPTimeout(t *testing.T) {
+	isolateConfigFile(t)
+	unsetEnvForTest(t, "ASYNC_TIMEOUT_SECONDS")
+	cfg, err := loadConfig([]string{"--async-timeout-seconds=1"})
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.asyncTimeout != time.Second {
+		t.Fatalf("configured async timeout = %s, want 1s", cfg.asyncTimeout)
+	}
+	if requestTimeout != 10*time.Minute || serverHTTPClient.Timeout != 10*time.Minute {
+		t.Fatalf("provider HTTP request timeout changed: constant=%s client=%s", requestTimeout, serverHTTPClient.Timeout)
+	}
+	if got := cfg.securityPolicy.secureHTTPClient().Timeout; got != 10*time.Minute {
+		t.Fatalf("secure provider HTTP timeout = %s, want 10m", got)
+	}
+}
+
+func TestConfiguredAsyncResultTTLForEveryStoredOutcome(t *testing.T) {
+	isolateConfigFile(t)
+	const retention = 2 * time.Minute
+	started := make(chan struct{})
+	release := make(chan struct{})
+	tests := []struct {
+		name         string
+		executor     server.Executor
+		expected     string
+		timeout      time.Duration
+		waitForStart bool
+	}{
+		{
+			name: "delayed success starts retention when stored",
+			executor: server.ExecutorFunc(func(context.Context, *server.ExecutionRequest) (server.ExecutionResult, error) {
+				close(started)
+				<-release
+				return server.ExecutionResult{Content: "delayed success"}, nil
+			}),
+			expected:     "delayed success",
+			waitForStart: true,
+		},
+		{
+			name: "executor failure",
+			executor: server.ExecutorFunc(func(context.Context, *server.ExecutionRequest) (server.ExecutionResult, error) {
+				return server.ExecutionResult{}, errors.New("executor failed")
+			}),
+			expected: "executor failed",
+		},
+		{
+			name: "timeout",
+			executor: server.ExecutorFunc(func(ctx context.Context, _ *server.ExecutionRequest) (server.ExecutionResult, error) {
+				<-ctx.Done()
+				return server.ExecutionResult{}, ctx.Err()
+			}),
+			expected: "deadline",
+			timeout:  40 * time.Millisecond,
+		},
+		{
+			name: "panic recovery",
+			executor: server.ExecutorFunc(func(context.Context, *server.ExecutionRequest) (server.ExecutionResult, error) {
+				panic("executor panic")
+			}),
+			expected: "executor panic",
+		},
+		{
+			name: "storage capacity fallback",
+			executor: server.ExecutorFunc(func(context.Context, *server.ExecutionRequest) (server.ExecutionResult, error) {
+				return server.ExecutionResult{Content: strings.Repeat("x", maxDataValueSize+1)}, nil
+			}),
+			expected: asyncResultStorageError,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newServerParityApp(t, "http://example.com", "model", "reasoning")
+			a.cfg.asyncResultTTL = retention
+			a.cfg.asyncTimeout = tc.timeout
+			handler := newServerHandlerWithExecutor(a, serverParityAllowedTools(), tc.executor)
+			acceptedAt := time.Now()
+			req := httptest.NewRequest(http.MethodPost, "/async/?endpoint=http%3A%2F%2Fexample.com", strings.NewReader(serverParityBody()))
+			req.Header.Set("Authorization", "Bearer test-token")
+			accepted := httptest.NewRecorder()
+			handler.ServeHTTP(accepted, req)
+			if accepted.Code != http.StatusAccepted {
+				t.Fatalf("async acceptance = %d: %s", accepted.Code, accepted.Body.String())
+			}
+			var body map[string]string
+			if err := json.Unmarshal(accepted.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode acceptance: %v", err)
+			}
+			if tc.waitForStart {
+				select {
+				case <-started:
+				case <-time.After(time.Second):
+					t.Fatal("executor did not start")
+				}
+				pending := httptest.NewRecorder()
+				handler.ServeHTTP(pending, httptest.NewRequest(http.MethodGet, "/data?key="+url.QueryEscape(body["id"]), nil))
+				if pending.Code != http.StatusNotFound {
+					t.Fatalf("pending poll status = %d: %s", pending.Code, pending.Body.String())
+				}
+				time.Sleep(200 * time.Millisecond)
+				close(release)
+			}
+
+			deadline := time.Now().Add(5 * time.Second)
+			var result string
+			var observedAt time.Time
+			for time.Now().Before(deadline) {
+				poll := httptest.NewRecorder()
+				handler.ServeHTTP(poll, httptest.NewRequest(http.MethodGet, "/data?key="+url.QueryEscape(body["id"]), nil))
+				if poll.Code == http.StatusOK {
+					result = poll.Body.String()
+					observedAt = time.Now()
+					break
+				}
+				if poll.Code != http.StatusNotFound {
+					t.Fatalf("poll status = %d: %s", poll.Code, poll.Body.String())
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if observedAt.IsZero() {
+				t.Fatal("timed out waiting for async result")
+			}
+			if !strings.Contains(result, tc.expected) {
+				t.Fatalf("async result %q does not contain %q", result, tc.expected)
+			}
+			expiresAt, ok := a.dataStore.Expiry(body["id"])
+			if !ok {
+				t.Fatal("stored result has no expiry")
+			}
+			remaining := expiresAt.Sub(observedAt)
+			if remaining > retention || remaining < retention-time.Second {
+				t.Fatalf("result retention remaining = %s; want approximately %s", remaining, retention)
+			}
+			if tc.waitForStart && !expiresAt.After(acceptedAt.Add(retention+100*time.Millisecond)) {
+				t.Fatalf("retention appears to start at acceptance, not storage: accepted=%s expiry=%s", acceptedAt, expiresAt)
+			}
+		})
+	}
 }

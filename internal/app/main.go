@@ -96,6 +96,7 @@ type config struct {
 	goalProfile             configpkg.RuntimeProfile
 	profilesResolved        bool
 	asyncTimeout            time.Duration
+	asyncResultTTL          time.Duration
 	debug                   bool
 }
 
@@ -388,7 +389,7 @@ func loadConfig(args []string) (config, error) {
 		}
 		return config{}, err
 	}
-	securityPolicy, err := loadServerSecurityPolicy(parsed.ServerAllowedOrigins, parsed.ServerAllowedTargets, parsed.ServerAllowPrivateTargets)
+	securityPolicy, err := loadServerSecurityPolicy(parsed.ServerAllowedOrigins, parsed.ServerAllowPrivateTargets)
 	if err != nil {
 		return config{}, err
 	}
@@ -441,6 +442,7 @@ func loadConfig(args []string) (config, error) {
 		goalProfile:             parsed.GoalProfile(),
 		profilesResolved:        true,
 		asyncTimeout:            parsed.AsyncTimeout,
+		asyncResultTTL:          parsed.AsyncResultTTL,
 		debug:                   parsed.Debug,
 	}, nil
 }
@@ -499,7 +501,7 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "  --resume [ID|PREFIX]       resume the newest, exact, or unique-prefix interactive session")
 	fmt.Fprintln(w, "  --final-only               one-shot mode: suppress intermediate tool output, show only the final answer")
 	fmt.Fprintln(w, "  --debug                    dump HTTP request and response to stderr")
-	fmt.Fprintln(w, "Env: ENDPOINT, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS, MAX_GOAL_ITERATIONS, MODEL_REQUEST_TIMEOUT_SECONDS, CONTEXT_WINDOW")
+	fmt.Fprintln(w, "Env: ENDPOINT, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS, MAX_GOAL_ITERATIONS, MODEL_REQUEST_TIMEOUT_SECONDS, ASYNC_TIMEOUT_SECONDS, ASYNC_RESULT_TTL_SECONDS, CONTEXT_WINDOW")
 	fmt.Fprintln(w, "     IDLE_HOOK_COMMAND, IDLE_HOOK_ARGS (JSON string array), IDLE_HOOK_MODE (detached|wait), IDLE_HOOK_TIMEOUT (wait-mode seconds; local one-shot and interactive)")
 	fmt.Fprintln(w, "     Idle hook flags: --idle-hook COMMAND, --no-idle-hook; a configured hook implicitly grants the dedicated idle_hook permission (never execute_program)")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
@@ -514,6 +516,8 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "Saved numeric values equal to ordinary defaults are baseline values for goal fallback; custom saved, environment, and CLI values remain explicit (subagent iterations are raised to at least 32 for an accepted goal)")
 	fmt.Fprintln(w, "--yolo enables permissions and path access only; it does not select goal budgets. /goal still requires --yolo, and stopping/completing a goal restores ordinary limits")
 	fmt.Fprintln(w, "Request timeout: --model-request-timeout-seconds N (env MODEL_REQUEST_TIMEOUT_SECONDS; default 300; bounds one-shot model work and each HTTP request)")
+	fmt.Fprintln(w, "Async execution timeout: --async-timeout-seconds N (env ASYNC_TIMEOUT_SECONDS; default 900 seconds; process-wide, restart required)")
+	fmt.Fprintln(w, "Async result retention: --async-result-ttl-seconds N (env ASYNC_RESULT_TTL_SECONDS; default 3600 seconds; process-wide, restart required)")
 	fmt.Fprintln(w, "Iteration limit: --max-iterations N (ordinary default 40; goal-run default 256; env MAX_ITERATIONS; always wraps up gracefully on limit)")
 	fmt.Fprintln(w, "Goal loop limit: --max-goal-iterations N (ordinary baseline 20; goal-run default 64; env MAX_GOAL_ITERATIONS; accepted /goal only)")
 	fmt.Fprintln(w, "Interactive goal: /goal <objective> starts a fresh objective generation and checklist; bare /goal or a clear request such as 'finish the goal' resumes the current incomplete objective and its persisted checklist (requires --yolo)")

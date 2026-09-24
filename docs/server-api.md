@@ -179,7 +179,23 @@ curl 'http://localhost:8899/data?key=550e8400-e29b-41d4-a716-446655440000'
 
 While the job is running, the poll returns `404`. When it finishes, the value is the same response shape as a synchronous request. A failed or timed-out job returns an error object instead.
 
-Async results remain available for one hour. Up to 16 async jobs can run at once; when that capacity is full, a new request receives HTTP `429`.
+Async results remain available for one hour by default. Up to 16 async jobs can run at once; when that capacity is full, a new request receives HTTP `429`.
+
+## Configure asynchronous lifetimes
+
+Async execution and result retention are independent, process-wide startup settings. Both accept positive whole seconds:
+
+```bash
+./capelin-go --server-port 8899 \
+  --async-timeout-seconds 1800 \
+  --async-result-ttl-seconds 7200
+```
+
+The timeout limits the executor lifetime of each admitted async job; when it expires, Capelin cancels the execution and makes the existing `async_error` result available through `/data`. It defaults to 900 seconds (15 minutes). The result TTL defaults to 3600 seconds (one hour) and starts when the result is stored, not when the request is accepted. It applies equally to successful results and error results.
+
+Set `ASYNC_TIMEOUT_SECONDS` and `ASYNC_RESULT_TTL_SECONDS` in the environment, or use the same keys in the saved `config.ini`. New configurations include both keys; upgrading appends missing keys without changing values already saved. Each setting resolves independently using this precedence: CLI flag, environment variable, saved configuration, then built-in default. Values must be positive integers in seconds. These settings are loaded at server startup: changing them requires a restart, and request bodies or query parameters cannot override them.
+
+The async execution timeout is separate from the provider HTTP request timeout, which remains 10 minutes per request. A longer async job timeout does not extend that provider request limit. Async result retention is also separate from the generic `/data` store controls below: a caller's `ttl=` applies only to values it stores through `/data`; the generic store keeps its existing eight-hour default and seven-day maximum.
 
 ## Use the temporary data store
 
