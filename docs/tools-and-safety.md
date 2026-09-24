@@ -6,7 +6,15 @@ Capelin gives the assistant tools so it can do useful work instead of only writi
 
 ### Search the public web
 
-Ask for current information, sources, or comparisons. Capelin searches DuckDuckGo first and uses Bing if the first service fails. Search results include titles, links, and short descriptions.
+Ask for current information, sources, or comparisons. Capelin searches DuckDuckGo first and uses the configured hosted MCP provider (Parallel by default, or Exa) if the first service fails. Search results include titles, links, and short descriptions.
+
+The hosted fallback is best-effort and may be rate-limited or withdrawn by its
+provider. It works without a search key when the provider permits credentialless
+access; configure `SEARCH_PROVIDER=parallel` or `SEARCH_PROVIDER=exa` to select
+the fallback, and use `PARALLEL_API_KEY` or `EXA_API_KEY` only for an explicitly
+configured provider credential. Credentials and upstream response details are
+never included in tool output. Hosted access is not promised to be anonymous,
+unlimited, free, or uninterrupted.
 
 Example:
 

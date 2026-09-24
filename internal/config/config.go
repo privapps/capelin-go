@@ -117,6 +117,9 @@ type Config struct {
 	ServerAllowedOrigins      string
 	ServerAllowPrivateTargets string
 	ServerSecurityEnabled     bool
+	SearchProvider            string
+	ParallelAPIKey            string
+	ExaAPIKey                 string
 	IdleHookCommand           string
 	IdleHookArgs              []string
 	IdleHookTimeout           int
@@ -303,6 +306,8 @@ func Load(args []string) (Config, error) {
 	resumeID := ""
 	resumeRequested := false
 	serverPort := 0
+	searchProviderFlag := ""
+	searchProviderFlagSet := false
 	subagentCfg := SubagentConfig{} // zero = "not set by flag"; env/file/normalize fills gaps
 	toolMaxParallel := 0            // zero = "not set by flag"
 	toolTimeoutSec := 0             // zero = "not set by flag"
@@ -506,6 +511,16 @@ func Load(args []string) (Config, error) {
 				return Config{}, err
 			}
 			serverPort = value
+		case arg == "--search-provider":
+			if i+1 >= len(args) {
+				return Config{}, errors.New("--search-provider requires a value")
+			}
+			i++
+			searchProviderFlag = strings.TrimSpace(args[i])
+			searchProviderFlagSet = true
+		case strings.HasPrefix(arg, "--search-provider="):
+			searchProviderFlag = strings.TrimSpace(strings.TrimPrefix(arg, "--search-provider="))
+			searchProviderFlagSet = true
 		case arg == "--max-iterations":
 			if i+1 >= len(args) {
 				return Config{}, errors.New("--max-iterations requires a value")
@@ -853,6 +868,31 @@ func Load(args []string) (Config, error) {
 	if toolRetryOnTimeout == -1 {
 		toolRetryOnTimeout = boolToInt(readBoolCfg("TOOL_RETRY_ON_TIMEOUT", fileCfg, defaultToolRetryOnTimeout))
 	}
+	searchProvider := ""
+	if searchProviderFlagSet {
+		searchProvider = searchProviderFlag
+	} else {
+		searchProvider = readCfg("SEARCH_PROVIDER", fileCfg, "")
+		if searchProvider == "" {
+			searchProvider = readCfg("WEB_SEARCH_PROVIDER", fileCfg, "")
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(searchProvider)) {
+	case "", "parallel":
+		searchProvider = "parallel"
+	case "exa":
+		searchProvider = "exa"
+	default:
+		return Config{}, fmt.Errorf("SEARCH_PROVIDER must be parallel or exa, got %q", strings.TrimSpace(searchProvider))
+	}
+	parallelAPIKey := readCfg("PARALLEL_API_KEY", fileCfg, "")
+	if parallelAPIKey == "" {
+		parallelAPIKey = readCfg("PARALLEL_SEARCH_API_KEY", fileCfg, "")
+	}
+	exaAPIKey := readCfg("EXA_API_KEY", fileCfg, "")
+	if exaAPIKey == "" {
+		exaAPIKey = readCfg("EXA_SEARCH_API_KEY", fileCfg, "")
+	}
 	contextWindow, _, err = resolvePositiveSetting("CONTEXT_WINDOW", contextWindow, numericFlags["CONTEXT_WINDOW"], fileCfg, 0)
 	if err != nil {
 		return Config{}, err
@@ -892,6 +932,9 @@ func Load(args []string) (Config, error) {
 		ServerAllowedOrigins:      readCfg("SERVER_ALLOWED_ORIGINS", fileCfg, ""),
 		ServerAllowPrivateTargets: readCfg("SERVER_ALLOW_PRIVATE_TARGETS", fileCfg, "false"),
 		ServerSecurityEnabled:     serverMode,
+		SearchProvider:            searchProvider,
+		ParallelAPIKey:            parallelAPIKey,
+		ExaAPIKey:                 exaAPIKey,
 		IdleHookCommand:           idleHookCommand,
 		IdleHookArgs:              idleHookArgs,
 		IdleHookTimeout:           idleHookTimeout,
@@ -1208,6 +1251,12 @@ IDLE_HOOK_MODE = detached
 # CONTEXT_WINDOW =
 SERVER_ALLOWED_ORIGINS =
 SERVER_ALLOW_PRIVATE_TARGETS = false
+
+# Web search fallback. DuckDuckGo remains primary; select the hosted MCP
+# fallback with SEARCH_PROVIDER=parallel|exa. Hosted access is best-effort.
+SEARCH_PROVIDER = parallel
+PARALLEL_API_KEY =
+EXA_API_KEY =
 `
 
 // ensureConfigFile creates the config file with defaults if it does not exist,

@@ -154,7 +154,9 @@ func NewSecureHTTPClient(policy *secureDialPolicy, authorize func(*url.URL) erro
 				return fmt.Errorf("redirect has no URL")
 			}
 			if authorize != nil {
-				return authorize(req.URL)
+				if err := authorize(req.URL); err != nil {
+					return fmt.Errorf("redirect rejected by server URL policy: %w", err)
+				}
 			}
 			return nil
 		},

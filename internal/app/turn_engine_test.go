@@ -160,7 +160,7 @@ func TestTurnEngineTransientRetryParity(t *testing.T) {
 	}
 }
 
-func TestTurnEngineTimeoutRetryParity(t *testing.T) {
+func TestTurnEngineFetchTimeoutDoesNotRetrySameURL(t *testing.T) {
 	originalPrivateFetch := allowPrivateFetch
 	allowPrivateFetch = true
 	defer func() { allowPrivateFetch = originalPrivateFetch }()
@@ -175,11 +175,11 @@ func TestTurnEngineTimeoutRetryParity(t *testing.T) {
 		if result.err != nil || result.result != "finished" {
 			t.Fatalf("timeout retry failed: result=%q err=%v", result.result, result.err)
 		}
-		if !strings.Contains(strings.Join(result.sink.snapshot(), "\n"), "timed out, retrying") {
-			t.Fatalf("timeout retry event missing: %v", result.sink.snapshot())
+		if strings.Contains(strings.Join(result.sink.snapshot(), "\n"), "timed out, retrying") {
+			t.Fatalf("fetch timeout triggered automatic retry: %v", result.sink.snapshot())
 		}
-		if result.toolRequests != 2 {
-			t.Fatalf("expected one tool retry, got %d tool requests", result.toolRequests)
+		if result.toolRequests != 1 {
+			t.Fatalf("fetch timeout repeated the same URL %d times", result.toolRequests)
 		}
 	}
 }

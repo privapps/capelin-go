@@ -79,6 +79,7 @@ type config struct {
 	serverPort          int
 	securityPolicy      serverSecurityPolicy
 	securityEnabled     bool
+	searchConfig        tools.SearchProviderConfig
 	idleHookCommand     string
 	idleHookArgs        []string
 	idleHookTimeoutSec  int
@@ -424,9 +425,14 @@ func loadConfig(args []string) (config, error) {
 			Model:             parsed.Subagents.Model,
 			ReasoningEffort:   parsed.Subagents.ReasoningEffort,
 		},
-		serverPort:              parsed.ServerPort,
-		securityPolicy:          securityPolicy,
-		securityEnabled:         parsed.ServerSecurityEnabled,
+		serverPort:      parsed.ServerPort,
+		securityPolicy:  securityPolicy,
+		securityEnabled: parsed.ServerSecurityEnabled,
+		searchConfig: tools.SearchProviderConfig{
+			Provider:       parsed.SearchProvider,
+			ParallelAPIKey: parsed.ParallelAPIKey,
+			ExaAPIKey:      parsed.ExaAPIKey,
+		},
 		idleHookCommand:         parsed.IdleHookCommand,
 		idleHookArgs:            append([]string(nil), parsed.IdleHookArgs...),
 		idleHookTimeoutSec:      parsed.IdleHookTimeout,
@@ -501,7 +507,7 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "  --resume [ID|PREFIX]       resume the newest, exact, or unique-prefix interactive session")
 	fmt.Fprintln(w, "  --final-only               one-shot mode: suppress intermediate tool output, show only the final answer")
 	fmt.Fprintln(w, "  --debug                    dump HTTP request and response to stderr")
-	fmt.Fprintln(w, "Env: ENDPOINT, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), MAX_ITERATIONS, MAX_GOAL_ITERATIONS, MODEL_REQUEST_TIMEOUT_SECONDS, ASYNC_TIMEOUT_SECONDS, ASYNC_RESULT_TTL_SECONDS, CONTEXT_WINDOW")
+	fmt.Fprintln(w, "Env: ENDPOINT, MODEL, TOKEN, REASONING_EFFORT, SYSTEM_PROMPT (or systemPrompt), SEARCH_PROVIDER (parallel|exa), PARALLEL_API_KEY, EXA_API_KEY, MAX_ITERATIONS, MAX_GOAL_ITERATIONS, MODEL_REQUEST_TIMEOUT_SECONDS, ASYNC_TIMEOUT_SECONDS, ASYNC_RESULT_TTL_SECONDS, CONTEXT_WINDOW")
 	fmt.Fprintln(w, "     IDLE_HOOK_COMMAND, IDLE_HOOK_ARGS (JSON string array), IDLE_HOOK_MODE (detached|wait), IDLE_HOOK_TIMEOUT (wait-mode seconds; local one-shot and interactive)")
 	fmt.Fprintln(w, "     Idle hook flags: --idle-hook COMMAND, --no-idle-hook; a configured hook implicitly grants the dedicated idle_hook permission (never execute_program)")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
@@ -745,6 +751,7 @@ func (a *app) runTurnLoop(ctx context.Context, messages []contracts.Message, que
 }
 
 func (a *app) runTurnLoopWithState(ctx context.Context, messages []contracts.Message, question string, runtime *agentRuntime, toolset []contracts.Tool, emitOutput bool, continuation *contracts.ContinuationState) ([]contracts.Message, string, string, *contracts.ContinuationState, error) {
+	ctx = withSearchTask(ctx, nil)
 	model, reasoning := "", ""
 	if a.client != nil {
 		model, reasoning = a.client.model, a.client.reasoning
@@ -1069,6 +1076,7 @@ func (a *app) runInteractiveTurnResult(ctx context.Context, session *interactive
 	if session == nil {
 		return false, errors.New("interactive session is nil")
 	}
+	ctx = withSearchTask(ctx, nil)
 	if session.runtime == nil {
 		session.runtime = a.rootRuntime()
 		a.attachInteractiveRuntime(session)
@@ -1273,6 +1281,11 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 	if runtime == nil {
 		runtime = a.rootRuntime()
 	}
+	searchTask := searchTaskFromContext(ctx)
+	if searchTask == nil {
+		searchTask = tools.NewSearchTask()
+	}
+	searchBatch, searchOrder, _ := searchBatchFromContext(ctx, call.ID)
 	dispatcher := tools.Dispatcher{
 		WorkspaceRoot:     a.cfg.workspaceRoot,
 		Yolo:              a.cfg.yolo,
@@ -1280,6 +1293,10 @@ func (a *app) runToolForRuntime(ctx context.Context, runtime *agentRuntime, call
 		AllowPrivateFetch: a.cfg.allowPrivateFetch || (a.cfg.securityEnabled && a.cfg.securityPolicy.AllowPrivateTargets),
 		HTTPClient:        a.clientHTTPClient(),
 		FetchHTTPClient:   a.fetchHTTPClient(),
+		SearchConfig:      a.cfg.searchConfig,
+		SearchTask:        searchTask,
+		SearchBatch:       searchBatch,
+		SearchOrder:       searchOrder,
 		Hooks: tools.Hooks{
 			IsEnabled: func(value any, name string) bool {
 				r, ok := value.(*agentRuntime)
@@ -1481,6 +1498,36 @@ func extractToolSummary(toolName, output string, isError bool) string {
 	default:
 		return truncateStr(output, 200)
 	}
+}
+
+// conciseToolDisplay separates bounded human-facing recovery text from the
+// structured result retained in the provider continuation. In particular,
+// fetch_page source failures include category and guidance for the model, but
+// interactive users should not have to read the JSON envelope.
+func conciseToolDisplay(toolName, output string) string {
+	if toolName != toolFetchPage {
+		return ""
+	}
+	var failure struct {
+		Status     string `json:"status"`
+		Category   string `json:"category"`
+		HTTPStatus int    `json:"http_status,omitempty"`
+		Guidance   string `json:"guidance"`
+	}
+	if err := json.Unmarshal([]byte(output), &failure); err != nil ||
+		(failure.Status != "fetch_failed" && failure.Status != "fetch_blocked") {
+		return ""
+	}
+	label := "source unavailable"
+	if failure.Status == "fetch_blocked" || failure.Category == "policy_blocked" {
+		label = "source blocked by safe-network policy"
+	} else if failure.HTTPStatus > 0 {
+		label = fmt.Sprintf("source unavailable (HTTP %d)", failure.HTTPStatus)
+	}
+	if guidance := strings.TrimSpace(failure.Guidance); guidance != "" {
+		return label + "; " + guidance
+	}
+	return label
 }
 
 func extractExecuteProgramSummary(output string, isError bool) string {

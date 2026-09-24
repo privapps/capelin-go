@@ -122,7 +122,7 @@ func TestGoalContinuationCanIssueAnotherToolAfterRecovery(t *testing.T) {
 	}
 }
 
-func TestGoalToolTimeoutRetriesOnceThenRecoversAsToolError(t *testing.T) {
+func TestGoalFetchTimeoutIsReportedOnceWithoutAutomaticRetry(t *testing.T) {
 	var requests atomic.Int32
 	toolServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
@@ -154,11 +154,18 @@ func TestGoalToolTimeoutRetriesOnceThenRecoversAsToolError(t *testing.T) {
 	if stopped := testApp.app.runGoal(context.Background(), session, "retry the slow tool"); stopped {
 		t.Fatal("timeout recovery goal unexpectedly stopped the REPL")
 	}
-	if !todosComplete(session.todos) || requests.Load() != 2 {
-		t.Fatalf("timeout retry/continuation mismatch: todos=%#v requests=%d", session.todos, requests.Load())
+	if !todosComplete(session.todos) || requests.Load() != 1 {
+		t.Fatalf("timeout handling repeated the same source or failed to continue: todos=%#v requests=%d", session.todos, requests.Load())
 	}
-	if !containsEvent(systemEvents, "timed out, retrying") {
-		t.Fatalf("timeout retry event missing: %v", systemEvents)
+	var toolOutputs strings.Builder
+	for _, message := range session.messages {
+		toolOutputs.WriteString(message.Content)
+	}
+	if !strings.Contains(toolOutputs.String(), `"category":"timeout"`) {
+		t.Fatalf("bounded timeout guidance missing from conversation: %#v", session.messages)
+	}
+	if containsEvent(systemEvents, "timed out, retrying") {
+		t.Fatalf("fetch timeout received an automatic-retry diagnostic: %v", systemEvents)
 	}
 }
 

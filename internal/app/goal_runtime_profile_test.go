@@ -104,8 +104,8 @@ func TestGoalProfileReachesActualToolRunnerParallelism(t *testing.T) {
 		profilesResolved:  true,
 	}, client: &client{http: server.Client()}, sink: &spySink{}}
 	calls := []contracts.ToolCall{
-		{ID: "one", Function: contracts.FunctionCall{Name: toolFetchPage, Arguments: `{"url":"` + server.URL + `"}`}},
-		{ID: "two", Function: contracts.FunctionCall{Name: toolFetchPage, Arguments: `{"url":"` + server.URL + `"}`}},
+		{ID: "one", Function: contracts.FunctionCall{Name: toolFetchPage, Arguments: `{"url":"` + server.URL + `/one"}`}},
+		{ID: "two", Function: contracts.FunctionCall{Name: toolFetchPage, Arguments: `{"url":"` + server.URL + `/two"}`}},
 	}
 
 	phase.Store(1)

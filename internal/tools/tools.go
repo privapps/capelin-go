@@ -7,7 +7,6 @@ import (
 	"capelin-go/internal/skills"
 	"context"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -64,7 +63,6 @@ const (
 )
 
 var ddgSearchURL = "https://html.duckduckgo.com/html"
-var bingSearchURL = "https://www.bing.com/search"
 var allowPrivateFetch = false
 
 var errListLimitReached = errors.New("list limit reached")
@@ -138,7 +136,7 @@ func checkFetchRedirect(req *http.Request, via []*http.Request) error {
 		return fmt.Errorf("fetch page: redirect has no URL")
 	}
 	if _, err := validateFetchURLWithPrivate(req.Context(), req.URL.String(), privateFetchAllowed(req.Context())); err != nil {
-		return err
+		return fmt.Errorf("fetch page redirect rejected by safety policy: %w", err)
 	}
 	req.Header.Set("User-Agent", contracts.CapelinUserAgent)
 	return nil
@@ -219,19 +217,12 @@ type searchResult struct {
 	Abstract string
 }
 
-type searchProvider string
-
-const (
-	searchProviderDuckDuckGo searchProvider = "DuckDuckGo"
-	searchProviderBing       searchProvider = "Bing"
-)
-
 func specWebSearch() contracts.Tool {
 	return contracts.Tool{
 		Type: "function",
 		Function: contracts.ToolSpec{
 			Name:        WebSearch,
-			Description: "Search the web with quality-gated DuckDuckGo results and Bing fallback; return the selected provider, result titles, URLs, and abstracts.",
+			Description: "Search the web with quality-gated DuckDuckGo results and a hosted MCP fallback; return the selected provider, result titles, URLs, and abstracts.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -249,7 +240,7 @@ func specFetchPage() contracts.Tool {
 		Type: "function",
 		Function: contracts.ToolSpec{
 			Name:        FetchPage,
-			Description: "Fetch a URL and return content as markdown-like text.",
+			Description: "Fetch a public URL and return content as markdown-like text. Prefer URLs returned by web_search when available; valid public URLs supplied directly by the user are also allowed.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -600,39 +591,9 @@ func specCancelSubagent() contracts.Tool {
 	}
 }
 
-func runWebSearch(ctx context.Context, query string) (string, error) {
-	return runWebSearchWithClient(ctx, query, toolHTTPClient)
-}
-
-func runWebSearchWithClient(ctx context.Context, query string, client *http.Client) (string, error) {
-	if client == nil {
-		client = toolHTTPClient
-	}
-	primaryResults, primaryErr := runDuckDuckGoSearchWithClient(ctx, query, client)
-	primaryResults = qualityGateSearchResults(query, primaryResults)
-	if primaryErr == nil && len(primaryResults) > 0 {
-		return formatSearchResponse(searchProviderDuckDuckGo, false, "", primaryResults), nil
-	}
-
-	fallbackReason := searchAttemptReason(searchProviderDuckDuckGo, primaryErr)
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	fallbackResults, fallbackErr := runBingSearchWithClient(ctx, query, client)
-	fallbackResults = qualityGateSearchResults(query, fallbackResults)
-	if fallbackErr == nil && len(fallbackResults) > 0 {
-		return formatSearchResponse(searchProviderBing, true, fallbackReason, fallbackResults), nil
-	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-
-	return formatNoTrustworthyResults(fallbackReason, searchAttemptReason(searchProviderBing, fallbackErr)), nil
-}
-
 var errNoSearchResults = errors.New("no search results")
 
-func searchAttemptReason(provider searchProvider, providerErr error) string {
+func searchAttemptReason(provider searchProviderName, providerErr error) string {
 	if providerErr != nil {
 		if errors.Is(providerErr, errNoSearchResults) {
 			return fmt.Sprintf("%s returned no results", provider)
@@ -645,7 +606,7 @@ func searchAttemptReason(provider searchProvider, providerErr error) string {
 	return fmt.Sprintf("%s returned no trustworthy results", provider)
 }
 
-func formatSearchResponse(provider searchProvider, fallback bool, fallbackReason string, results []searchResult) string {
+func formatSearchResponse(provider searchProviderName, fallback bool, fallbackReason string, results []searchResult) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Search provider: %s\n", provider)
 	if fallback {
@@ -756,38 +717,121 @@ func normalizeSearchURL(raw string) (string, error) {
 }
 
 func isRelevantSearchResult(query string, result searchResult) bool {
-	queryTerms := meaningfulSearchTerms(query)
+	queryTerms := uniqueSearchTerms(meaningfulSearchTerms(query))
 	if len(queryTerms) == 0 {
 		// A query made only of stop words provides no reliable relevance
 		// signal. Treating every provider record as relevant would let an
 		// otherwise successful response bypass the quality gate.
 		return false
 	}
-	resultTerms := make(map[string]struct{})
-	for _, term := range searchTokens(result.Title + " " + result.Abstract) {
-		resultTerms[term] = struct{}{}
-	}
-	for _, term := range technicalSearchTokens(result.Title + " " + result.Abstract) {
-		resultTerms[term] = struct{}{}
-	}
-	matches := 0
-	for _, term := range queryTerms {
-		for resultTerm := range resultTerms {
-			if searchTermsMatch(term, resultTerm) {
-				matches++
-				break
-			}
+
+	anchorTerms := searchAnchorTerms(queryTerms)
+	titleTerms := searchTermSet(result.Title)
+	abstractTerms := searchTermSet(result.Abstract)
+	titleMatches, abstractMatches, anchorMatches := 0, 0, 0
+	for _, term := range anchorTerms {
+		inTitle := searchTermSetContains(term, titleTerms)
+		inAbstract := searchTermSetContains(term, abstractTerms)
+		if inTitle {
+			titleMatches++
+		}
+		if inAbstract {
+			abstractMatches++
+		}
+		if inTitle || inAbstract {
+			anchorMatches++
 		}
 	}
-	// Require nearly all content-bearing query terms. This keeps a result
-	// containing one incidental word from passing a multi-term relevance check,
-	// while allowing a long query to omit one term when a provider shortens a
-	// title or abstract.
-	requiredMatches := len(queryTerms)
-	if requiredMatches > 3 {
-		requiredMatches--
+
+	requiredMatches := (len(anchorTerms) + 1) / 2
+	if len(anchorTerms) > 1 && requiredMatches < 2 {
+		requiredMatches = 2
 	}
-	return matches >= requiredMatches
+	if len(anchorTerms) >= 3 && requiredMatches < 3 {
+		requiredMatches = 3
+	}
+	// A title match is stronger evidence than a match buried in an excerpt.
+	// The combined score also prevents several scattered abstract matches
+	// from passing without any indication in the result title.
+	score := 2*titleMatches + abstractMatches
+	return anchorMatches >= requiredMatches && titleMatches > 0 && score >= requiredMatches+1
+}
+
+func uniqueSearchTerms(terms []string) []string {
+	unique := make([]string, 0, len(terms))
+	seen := make(map[string]struct{}, len(terms))
+	for _, term := range terms {
+		if _, ok := seen[term]; ok {
+			continue
+		}
+		seen[term] = struct{}{}
+		unique = append(unique, term)
+	}
+	return unique
+}
+
+func searchAnchorTerms(queryTerms []string) []string {
+	anchors := make([]string, 0, len(queryTerms))
+	for _, term := range queryTerms {
+		if isSearchDateTerm(term) {
+			continue
+		}
+		if _, optional := optionalSearchFacetTerms[term]; optional {
+			continue
+		}
+		anchors = append(anchors, term)
+	}
+	if len(anchors) == 0 {
+		return queryTerms
+	}
+	return anchors
+}
+
+func isSearchDateTerm(term string) bool {
+	if _, err := strconv.Atoi(term); err == nil {
+		return true
+	}
+	_, ok := searchDateTerms[term]
+	return ok
+}
+
+func searchTermSet(text string) map[string]struct{} {
+	terms := make(map[string]struct{})
+	for _, term := range searchTokens(text) {
+		terms[term] = struct{}{}
+	}
+	for _, term := range technicalSearchTokens(text) {
+		terms[term] = struct{}{}
+	}
+	return terms
+}
+
+func searchTermSetContains(queryTerm string, resultTerms map[string]struct{}) bool {
+	for resultTerm := range resultTerms {
+		if searchTermsMatch(queryTerm, resultTerm) {
+			return true
+		}
+	}
+	return false
+}
+
+var searchDateTerms = map[string]struct{}{
+	"january": {}, "february": {}, "march": {}, "april": {}, "may": {}, "june": {},
+	"july": {}, "august": {}, "september": {}, "october": {}, "november": {}, "december": {},
+	"jan": {}, "feb": {}, "mar": {}, "apr": {}, "jun": {}, "jul": {}, "aug": {},
+	"sep": {}, "sept": {}, "oct": {}, "nov": {}, "dec": {},
+}
+
+var optionalSearchFacetTerms = map[string]struct{}{
+	"date": {}, "dates": {}, "day": {}, "days": {}, "year": {}, "years": {},
+	"schedule": {}, "schedules": {}, "timetable": {}, "timetables": {},
+	"venue": {}, "venues": {}, "location": {}, "locations": {},
+	"result": {}, "results": {}, "score": {}, "scores": {},
+	"medal": {}, "medals": {}, "winner": {}, "winners": {},
+	"final": {}, "finals": {}, "event": {}, "events": {},
+	"broadcast": {}, "broadcasts": {}, "timezone": {}, "timezones": {},
+	"live": {}, "latest": {}, "current": {}, "official": {}, "today": {},
+	"men": {}, "mens": {}, "women": {}, "womens": {}, "male": {}, "female": {},
 }
 
 func searchTermsMatch(queryTerm, resultTerm string) bool {
@@ -961,50 +1005,6 @@ func runDuckDuckGoSearchWithClient(ctx context.Context, query string, client *ht
 	return results, nil
 }
 
-func runBingSearch(ctx context.Context, query string) ([]searchResult, error) {
-	return runBingSearchWithClient(ctx, query, toolHTTPClient)
-}
-
-func runBingSearchWithClient(ctx context.Context, query string, client *http.Client) ([]searchResult, error) {
-	endpoint, err := url.Parse(bingSearchURL)
-	if err != nil {
-		return nil, fmt.Errorf("bing search: %w", err)
-	}
-	params := endpoint.Query()
-	params.Set("q", query)
-	params.Set("setlang", "en-US")
-	params.Set("mkt", "en-US")
-	params.Set("format", "rss")
-	params.Set("adlt", "strict")
-	endpoint.RawQuery = params.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("bing search: %w", err)
-	}
-	req.Header.Set("User-Agent", contracts.CapelinUserAgent)
-
-	resp, err := clientWithUserAgent(client).Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("bing search: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("bing search returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	results, err := parseBingRSSResults(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if len(results) == 0 {
-		return nil, errNoSearchResults
-	}
-	return results, nil
-}
-
 func formatSearchResults(results []searchResult) string {
 	var b strings.Builder
 	for i, r := range results {
@@ -1062,38 +1062,6 @@ func hasHTMLClass(classAttribute, wanted string) bool {
 	return false
 }
 
-type bingRSSFeed struct {
-	Channel struct {
-		Items []bingRSSItem `xml:"item"`
-	} `xml:"channel"`
-}
-
-type bingRSSItem struct {
-	Title       string `xml:"title"`
-	Link        string `xml:"link"`
-	Description string `xml:"description"`
-}
-
-func parseBingRSSResults(r io.Reader) ([]searchResult, error) {
-	var feed bingRSSFeed
-	if err := xml.NewDecoder(r).Decode(&feed); err != nil {
-		return nil, fmt.Errorf("parsing bing rss: %w", err)
-	}
-
-	results := make([]searchResult, 0, len(feed.Channel.Items))
-	for _, item := range feed.Channel.Items {
-		if strings.TrimSpace(item.Title) == "" && strings.TrimSpace(item.Link) == "" {
-			continue
-		}
-		results = append(results, searchResult{
-			Title:    strings.TrimSpace(item.Title),
-			URL:      strings.TrimSpace(item.Link),
-			Abstract: strings.TrimSpace(item.Description),
-		})
-	}
-	return results, nil
-}
-
 func extractDDGResult(n *html.Node) *searchResult {
 	var r searchResult
 	var walk func(*html.Node)
@@ -1149,12 +1117,15 @@ func runFetchPage(ctx context.Context, targetURL string) (string, error) {
 func runFetchPageWithClient(ctx context.Context, targetURL string, client *http.Client) (string, error) {
 	parsed, err := validateFetchURLWithPrivate(ctx, targetURL, privateFetchAllowed(ctx))
 	if err != nil {
-		return "", err
+		if strings.Contains(err.Error(), "refusing private or local") {
+			return "", &fetchFailure{category: "policy_blocked", policyBlocked: true}
+		}
+		return "", &fetchArgumentError{}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
-		return "", fmt.Errorf("fetch page: %w", err)
+		return "", &fetchArgumentError{}
 	}
 	req.Header.Set("User-Agent", contracts.CapelinUserAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,*/*")
@@ -1164,12 +1135,12 @@ func runFetchPageWithClient(ctx context.Context, targetURL string, client *http.
 	}
 	resp, err := clientWithUserAgent(client).Do(req)
 	if err != nil {
-		return "", fmt.Errorf("fetch page: %w", err)
+		return "", fetchFailureForTransport(ctx, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("fetch page returned HTTP %d for %s", resp.StatusCode, parsed.String())
+		return "", fetchFailureForStatus(resp.StatusCode)
 	}
 
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
@@ -1178,7 +1149,7 @@ func runFetchPageWithClient(ctx context.Context, targetURL string, client *http.
 	if strings.Contains(ct, "text/html") || ct == "" || strings.HasSuffix(strings.Split(ct, ";")[0], "html") {
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 		if err != nil {
-			return "", fmt.Errorf("read page: %w", err)
+			return "", fetchFailureForTransport(ctx, err)
 		}
 		doc, err := html.Parse(bytes.NewReader(body))
 		if err != nil {
@@ -1188,7 +1159,7 @@ func runFetchPageWithClient(ctx context.Context, targetURL string, client *http.
 	} else {
 		raw, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 		if err != nil {
-			return "", fmt.Errorf("read page: %w", err)
+			return "", fetchFailureForTransport(ctx, err)
 		}
 		content = string(raw)
 	}
@@ -1218,6 +1189,9 @@ func validateFetchURLWithPrivate(ctx context.Context, raw string, allowPrivate b
 	host := parsed.Hostname()
 	if host == "" {
 		return nil, fmt.Errorf("fetch page: missing host in %q", raw)
+	}
+	if parsed.User != nil {
+		return nil, errors.New("fetch page: credentials in URL are not allowed")
 	}
 	if allowPrivate {
 		return parsed, nil

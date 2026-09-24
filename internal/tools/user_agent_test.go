@@ -11,9 +11,9 @@ import (
 )
 
 func TestCapelinUserAgentOnSearchAndFetchRedirects(t *testing.T) {
-	oldClient, oldDDG, oldBing := toolHTTPClient, ddgSearchURL, bingSearchURL
+	oldClient, oldDDG, oldMCP := toolHTTPClient, ddgSearchURL, mcpSearchURL
 	defer func() {
-		toolHTTPClient, ddgSearchURL, bingSearchURL = oldClient, oldDDG, oldBing
+		toolHTTPClient, ddgSearchURL, mcpSearchURL = oldClient, oldDDG, oldMCP
 	}()
 
 	var paths []string
@@ -27,12 +27,9 @@ func TestCapelinUserAgentOnSearchAndFetchRedirects(t *testing.T) {
 			w.WriteHeader(http.StatusFound)
 		case "/ddg-results":
 			_, _ = w.Write([]byte(`<div class="result web-result"><a class="result__a" href="https://example.com">Example</a><div class="result__snippet">A result</div></div>`))
-		case "/bing":
-			w.Header().Set("Location", "/bing-results")
-			w.WriteHeader(http.StatusFound)
-		case "/bing-results":
-			w.Header().Set("Content-Type", "application/rss+xml")
-			_, _ = w.Write([]byte(`<rss><channel><item><title>Example</title><link>https://example.com</link><description>A result</description></item></channel></rss>`))
+		case "/mcp":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"results\":[{\"title\":\"Example\",\"url\":\"https://example.com\",\"snippet\":\"A result\"}]}"}]}}`))
 		case "/fetch":
 			w.Header().Set("Location", "/fetch-results")
 			w.WriteHeader(http.StatusFound)
@@ -46,18 +43,22 @@ func TestCapelinUserAgentOnSearchAndFetchRedirects(t *testing.T) {
 	defer server.Close()
 
 	client := &http.Client{}
-	SetNetworkOverrides(true, client, server.URL+"/ddg", server.URL+"/bing")
+	SetNetworkOverrides(true, client, server.URL+"/ddg", server.URL+"/mcp")
 	if _, err := runDuckDuckGoSearch(context.Background(), "query"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runBingSearch(context.Background(), "query"); err != nil {
+	provider, err := configuredMCPProvider(SearchProviderConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Search(context.Background(), "query", client); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runFetchPageWithClient(withPrivateFetchOverride(context.Background(), true), server.URL+"/fetch", client); err != nil {
 		t.Fatal(err)
 	}
 
-	wantPaths := []string{"/ddg", "/ddg-results", "/bing", "/bing-results", "/fetch", "/fetch-results"}
+	wantPaths := []string{"/ddg", "/ddg-results", "/mcp", "/fetch", "/fetch-results"}
 	if !reflect.DeepEqual(paths, wantPaths) {
 		t.Fatalf("request paths = %#v, want %#v", paths, wantPaths)
 	}

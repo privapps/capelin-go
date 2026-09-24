@@ -9,10 +9,10 @@ import (
 
 var toolHTTPClient = tools.DefaultHTTPClient()
 var ddgSearchURL = tools.DefaultDuckDuckGoURL()
-var bingSearchURL = tools.DefaultBingURL()
+var mcpSearchURL = tools.DefaultMCPURL()
 
 func syncToolTestOverrides() {
-	tools.SetNetworkOverrides(allowPrivateFetch, toolHTTPClient, ddgSearchURL, bingSearchURL)
+	tools.SetNetworkOverrides(allowPrivateFetch, toolHTTPClient, ddgSearchURL, mcpSearchURL)
 }
 
 type webSearchArgs = tools.WebSearchArgs

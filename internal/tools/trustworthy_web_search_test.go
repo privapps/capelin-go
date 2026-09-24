@@ -96,16 +96,16 @@ func TestParseDDGResultsSkipsResultWrappers(t *testing.T) {
 }
 
 func TestRunWebSearchUsesDuckDuckGoAndStrictSafeSearch(t *testing.T) {
-	oldClient, oldDDG, oldBing := toolHTTPClient, ddgSearchURL, bingSearchURL
+	oldClient, oldDDG, oldMCP := toolHTTPClient, ddgSearchURL, mcpSearchURL
 	t.Cleanup(func() {
-		toolHTTPClient, ddgSearchURL, bingSearchURL = oldClient, oldDDG, oldBing
+		toolHTTPClient, ddgSearchURL, mcpSearchURL = oldClient, oldDDG, oldMCP
 	})
 
-	bingCalled := false
+	mcpCalled := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/bing" {
-			bingCalled = true
-			t.Fatal("Bing was called after a trustworthy DuckDuckGo response")
+		if r.URL.Path == "/mcp" {
+			mcpCalled = true
+			t.Fatal("MCP fallback was called after a trustworthy DuckDuckGo response")
 		}
 		if r.Method != http.MethodPost {
 			t.Fatalf("DuckDuckGo method = %s, want POST", r.Method)
@@ -123,13 +123,13 @@ func TestRunWebSearchUsesDuckDuckGoAndStrictSafeSearch(t *testing.T) {
 
 	toolHTTPClient = &http.Client{}
 	ddgSearchURL = server.URL + "/ddg"
-	bingSearchURL = server.URL + "/bing"
+	mcpSearchURL = server.URL + "/mcp"
 	got, err := runWebSearch(context.Background(), "trusted search")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bingCalled {
-		t.Fatal("Bing was called unexpectedly")
+	if mcpCalled {
+		t.Fatal("MCP fallback was called unexpectedly")
 	}
 	for _, want := range []string{"Search provider: DuckDuckGo", "Fallback: no", "Trusted Search", "https://example.com/docs"} {
 		if !strings.Contains(got, want) {
@@ -139,9 +139,9 @@ func TestRunWebSearchUsesDuckDuckGoAndStrictSafeSearch(t *testing.T) {
 }
 
 func TestRunWebSearchFallsBackAfterQualityRejection(t *testing.T) {
-	oldClient, oldDDG, oldBing := toolHTTPClient, ddgSearchURL, bingSearchURL
+	oldClient, oldDDG, oldMCP := toolHTTPClient, ddgSearchURL, mcpSearchURL
 	t.Cleanup(func() {
-		toolHTTPClient, ddgSearchURL, bingSearchURL = oldClient, oldDDG, oldBing
+		toolHTTPClient, ddgSearchURL, mcpSearchURL = oldClient, oldDDG, oldMCP
 	})
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -149,12 +149,12 @@ func TestRunWebSearchFallsBackAfterQualityRejection(t *testing.T) {
 		case "/ddg":
 			w.Header().Set("Content-Type", "text/html")
 			_, _ = w.Write([]byte(`<div class="result web-result"><a class="result__a" href="https://unsafe.example/porn">Trusted porn result</a><div class="result__snippet">trusted search</div></div><div class="result web-result"><a class="result__a" href="javascript:bad">Trusted malformed result</a><div class="result__snippet">trusted search</div></div>`))
-		case "/bing":
-			if r.URL.Query().Get("adlt") != "strict" {
-				t.Fatalf("Bing adlt = %q, want strict", r.URL.Query().Get("adlt"))
+		case "/mcp":
+			if r.Method != http.MethodPost || r.Header.Get("Accept") != "application/json, text/event-stream" {
+				t.Fatalf("unexpected MCP request: method=%s accept=%q", r.Method, r.Header.Get("Accept"))
 			}
-			w.Header().Set("Content-Type", "application/rss+xml")
-			_, _ = w.Write([]byte(`<rss><channel><item><title>Trusted Search Result</title><link>https://trusted.example/result</link><description>Useful trusted search evidence</description></item></channel></rss>`))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"results\":[{\"title\":\"Trusted Search Result\",\"url\":\"https://trusted.example/result\",\"snippet\":\"Useful trusted search evidence\"}]}"}]}}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -163,12 +163,12 @@ func TestRunWebSearchFallsBackAfterQualityRejection(t *testing.T) {
 
 	toolHTTPClient = &http.Client{}
 	ddgSearchURL = server.URL + "/ddg"
-	bingSearchURL = server.URL + "/bing"
+	mcpSearchURL = server.URL + "/mcp"
 	got, err := runWebSearch(context.Background(), "trusted search")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Search provider: Bing", "Fallback: yes", "Fallback reason: DuckDuckGo returned no trustworthy results", "Trusted Search Result"} {
+	for _, want := range []string{"Search provider: Parallel", "Fallback: yes", "Fallback reason: DuckDuckGo returned no trustworthy results", "Trusted Search Result"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("search output %q does not contain %q", got, want)
 		}
@@ -181,9 +181,9 @@ func TestRunWebSearchFallsBackAfterQualityRejection(t *testing.T) {
 }
 
 func TestRunWebSearchReturnsExplicitNoTrustworthyResults(t *testing.T) {
-	oldClient, oldDDG, oldBing := toolHTTPClient, ddgSearchURL, bingSearchURL
+	oldClient, oldDDG, oldMCP := toolHTTPClient, ddgSearchURL, mcpSearchURL
 	t.Cleanup(func() {
-		toolHTTPClient, ddgSearchURL, bingSearchURL = oldClient, oldDDG, oldBing
+		toolHTTPClient, ddgSearchURL, mcpSearchURL = oldClient, oldDDG, oldMCP
 	})
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -192,19 +192,19 @@ func TestRunWebSearchReturnsExplicitNoTrustworthyResults(t *testing.T) {
 			_, _ = w.Write([]byte(`<div class="result web-result"><a class="result__a" href="https://unsafe.example/porn">Polluted porn result</a><div class="result__snippet">trusted search</div></div>`))
 			return
 		}
-		w.Header().Set("Content-Type", "application/rss+xml")
-		_, _ = w.Write([]byte(`<rss><channel><item><title>Unrelated spam result</title><link>https://spam.example/buy-now</link><description>nothing relevant</description></item></channel></rss>`))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"results\":[{\"title\":\"Unrelated spam result\",\"url\":\"https://spam.example/buy-now\",\"snippet\":\"nothing relevant\"}]}"}]}}`))
 	}))
 	defer server.Close()
 
 	toolHTTPClient = &http.Client{}
 	ddgSearchURL = server.URL + "/ddg"
-	bingSearchURL = server.URL + "/bing"
+	mcpSearchURL = server.URL + "/mcp"
 	got, err := runWebSearch(context.Background(), "trusted search")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Search provider: none", "Search status: no trustworthy results", "Rejected results are omitted.", "DuckDuckGo returned no trustworthy results", "Bing returned no trustworthy results"} {
+	for _, want := range []string{"Search provider: none", "Search status: no trustworthy results", "Rejected results are omitted.", "DuckDuckGo returned no trustworthy results", "Parallel returned no trustworthy results"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("no-results output %q does not contain %q", got, want)
 		}
@@ -224,5 +224,17 @@ func TestNormalizeSearchURLRejectsUnsupportedURLs(t *testing.T) {
 	}
 	if got, err := normalizeSearchURL("HTTP://Example.com:080/path/./child/../#fragment"); err != nil || got != "http://example.com/path/" {
 		t.Errorf("normalizeSearchURL canonical result = %q, err = %v", got, err)
+	}
+}
+
+func TestQualityGateLongQueryRequiresEnoughAnchorEvidence(t *testing.T) {
+	query := "2026 Asian Games men's football final venue schedule medal results October broadcast timezone"
+	results := qualityGateSearchResults(query, []searchResult{{
+		Title:    "Asian Games schedule",
+		URL:      "https://example.com/medal-schedule",
+		Abstract: "Official medal results for the October 2026 final broadcast.",
+	}})
+	if len(results) != 0 {
+		t.Fatalf("result matching only broad and optional query terms was accepted: %#v", results)
 	}
 }

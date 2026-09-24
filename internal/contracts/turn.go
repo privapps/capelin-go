@@ -16,6 +16,10 @@ type ToolResult struct {
 	Output  string
 	IsError bool
 	Retried bool
+	// DisplayOutput is an optional concise, human-facing rendering of Output.
+	// Output remains the authoritative structured value sent to the model; this
+	// field is consumed only by interactive output sinks.
+	DisplayOutput string `json:"-"`
 	// Recovery describes a bounded, explicit recovery choice for a
 	// recoverable tool result. It is separate from Retried because corrected
 	// capability or command retries are chosen by the model/operator rather

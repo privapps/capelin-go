@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 type fetchRoundTripper func(*http.Request) (*http.Response, error)
@@ -134,5 +137,50 @@ func TestDispatcherUsesFetchClientInsteadOfProviderClient(t *testing.T) {
 	}
 	if providerUsed {
 		t.Fatal("ordinary provider client handled fetch_page")
+	}
+}
+
+func TestSearchTaskFetchWaiterTimeoutReturnsBoundedResultWithoutSecondRequest(t *testing.T) {
+	requests := make(chan struct{}, 4)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- struct{}{}
+		<-release
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, "<html><body><p>completed source</p></body></html>")
+	}))
+	defer server.Close()
+	defer releaseOnce.Do(func() { close(release) })
+
+	task := NewSearchTask()
+	client := &http.Client{}
+	ownerResult := make(chan string, 1)
+	ownerErr := make(chan error, 1)
+	go func() {
+		result, err := task.fetch(withPrivateFetchOverride(context.Background(), true), server.URL+"/source", client)
+		ownerResult <- result
+		ownerErr <- err
+	}()
+	<-requests
+
+	waitCtx, cancel := context.WithTimeout(withPrivateFetchOverride(context.Background(), true), 10*time.Millisecond)
+	waiterResult, waiterErr := task.fetch(waitCtx, server.URL+"/source#same-resource", client)
+	cancel()
+	if waiterErr != nil || !strings.Contains(waiterResult, `"category":"timeout"`) {
+		t.Fatalf("timed-out waiter result = %q, err=%v; want bounded timeout output and nil error", waiterResult, waiterErr)
+	}
+	select {
+	case <-requests:
+		t.Fatal("duplicate waiter made a second network request")
+	default:
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	if err := <-ownerErr; err != nil {
+		t.Fatalf("owner fetch failed: %v", err)
+	}
+	if result := <-ownerResult; !strings.Contains(result, "completed source") {
+		t.Fatalf("owner fetch result = %q, want completed page", result)
 	}
 }

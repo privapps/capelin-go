@@ -37,6 +37,7 @@ func isolateLoad(t *testing.T) string {
 		"ENDPOINT", "MODEL", "TOKEN", "REASONING_EFFORT", "SYSTEM_PROMPT",
 		"SUBAGENT_MODEL", "SUBAGENT_REASONING_EFFORT", "IDLE_HOOK_COMMAND", "IDLE_HOOK_ARGS",
 		"IDLE_HOOK_TIMEOUT", "IDLE_HOOK_MODE", "AGENT_QUESTION_PREVIEW_MAX",
+		"SEARCH_PROVIDER", "WEB_SEARCH_PROVIDER", "PARALLEL_API_KEY", "PARALLEL_SEARCH_API_KEY", "EXA_API_KEY", "EXA_SEARCH_API_KEY",
 	}, numericConfigKeys...) {
 		if key == "ASYNC_TIMEOUT_SECONDS" || key == "ASYNC_RESULT_TTL_SECONDS" {
 			continue
@@ -47,6 +48,32 @@ func isolateLoad(t *testing.T) string {
 		unsetEnvForTest(t, key)
 	}
 	return path
+}
+
+func TestLoadSearchProviderSelectionAndCredentials(t *testing.T) {
+	isolateLoad(t)
+	t.Setenv("SEARCH_PROVIDER", "exa")
+	t.Setenv("EXA_API_KEY", "exa-secret")
+	t.Setenv("PARALLEL_API_KEY", "parallel-secret")
+	cfg, err := Load([]string{"task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SearchProvider != "exa" || cfg.ExaAPIKey != "exa-secret" || cfg.ParallelAPIKey != "parallel-secret" {
+		t.Fatalf("search configuration = provider=%q parallel=%q exa=%q", cfg.SearchProvider, cfg.ParallelAPIKey, cfg.ExaAPIKey)
+	}
+
+	cfg, err = Load([]string{"--search-provider", "parallel", "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SearchProvider != "parallel" {
+		t.Fatalf("CLI provider = %q, want parallel", cfg.SearchProvider)
+	}
+	t.Setenv("SEARCH_PROVIDER", "unsupported")
+	if _, err := Load([]string{"task"}); err == nil {
+		t.Fatal("unsupported search provider was accepted")
+	}
 }
 
 func unsetEnvForTest(t *testing.T, key string) {

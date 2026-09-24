@@ -424,6 +424,9 @@ Enable everything (all tools + unrestricted paths):
 - `TOKEN` — API token (default: `public`)
 - `REASONING_EFFORT` — passed through to the model backend (default: `high`); set to `none` or `nil` to omit the field entirely from the request
 - `SYSTEM_PROMPT` (or `systemPrompt`) — prompt override
+- `SEARCH_PROVIDER` (or `--search-provider`) — hosted MCP fallback provider: `parallel` (default) or `exa`; DuckDuckGo remains the primary provider
+- `PARALLEL_API_KEY` — optional Parallel credential for higher hosted-search limits
+- `EXA_API_KEY` — optional Exa credential for authenticated hosted-search limits
 - `MAX_ITERATIONS` — root agent tool-call iteration cap (ordinary default: 40; goal profile default: 256; overridden by `--max-iterations`)
 - `MAX_GOAL_ITERATIONS` — outer `/goal` iteration cap (ordinary default: 20; goal profile default: 64; overridden by `--max-goal-iterations`); applies only to accepted interactive goals
 - `SUBAGENT_MAX_DEPTH` — maximum subagent nesting depth (ordinary default: 1; goal profile default: 2; overridden by `--subagent-max-depth`)

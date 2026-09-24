@@ -167,7 +167,11 @@ func (e *Engine) Run(ctx context.Context, options RunOptions) (Result, error) {
 				if result.Recovery != nil {
 					sink.WriteSystem(agentID, "[tool] "+result.Call.Function.Name+" "+recoverySummary(result.Recovery))
 				}
-				sink.WriteToolResult(agentID, result.Call.Function.Name, result.IsError, result.Output)
+				display := result.Output
+				if result.DisplayOutput != "" {
+					display = result.DisplayOutput
+				}
+				sink.WriteToolResult(agentID, result.Call.Function.Name, result.IsError, display)
 			}
 		}
 		e.Provider.ApplyToolResults(state, results)

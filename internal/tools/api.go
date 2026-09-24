@@ -27,7 +27,7 @@ type ExecuteSkillArgs = executeSkillArgs
 
 // SetNetworkOverrides is intended for controlled application tests. Production
 // callers use the package's hardened client and fixed search endpoints.
-func SetNetworkOverrides(allowPrivate bool, client *http.Client, duckDuckGo, bing string) {
+func SetNetworkOverrides(allowPrivate bool, client *http.Client, duckDuckGo, mcp string) {
 	allowPrivateFetch = allowPrivate
 	if client != nil {
 		toolHTTPClient = client
@@ -35,14 +35,22 @@ func SetNetworkOverrides(allowPrivate bool, client *http.Client, duckDuckGo, bin
 	if strings.TrimSpace(duckDuckGo) != "" {
 		ddgSearchURL = duckDuckGo
 	}
-	if strings.TrimSpace(bing) != "" {
-		bingSearchURL = bing
+	if strings.TrimSpace(mcp) != "" {
+		mcpSearchURL = mcp
 	}
 }
 
 func DefaultHTTPClient() *http.Client { return toolHTTPClient }
 func DefaultDuckDuckGoURL() string    { return ddgSearchURL }
-func DefaultBingURL() string          { return bingSearchURL }
+func DefaultMCPURL() string {
+	if strings.TrimSpace(mcpSearchURL) != "" {
+		return mcpSearchURL
+	}
+	return parallelSearchEndpoint
+}
+func SetSearchProviderConfig(config SearchProviderConfig) {
+	searchConfig = config
+}
 
 func RunFetchPage(ctx context.Context, targetURL string) (string, error) {
 	return runFetchPage(ctx, targetURL)
@@ -164,6 +172,10 @@ type Dispatcher struct {
 	AllowPrivateFetch bool         // explicit application/test override; the zero value preserves the safety default
 	HTTPClient        *http.Client // optional ordinary/provider client; never used for fetch_page when FetchHTTPClient is nil
 	FetchHTTPClient   *http.Client // optional policy-aware persistent client for fetch_page
+	SearchConfig      SearchProviderConfig
+	SearchTask        *SearchTask
+	SearchBatch       *SearchBatch
+	SearchOrder       int
 	Hooks             Hooks
 }
 
@@ -210,11 +222,20 @@ func (d Dispatcher) Run(ctx context.Context, runtime any, call contracts.ToolCal
 		if err := decode(&args, name); err != nil {
 			return "", err
 		}
-		return runWebSearchWithClient(ctx, args.Query, d.HTTPClient)
+		if d.SearchTask == nil {
+			return runWebSearchWithConfig(ctx, args.Query, d.HTTPClient, d.SearchConfig)
+		}
+		if d.SearchBatch != nil {
+			return d.SearchTask.searchWithBatch(ctx, args.Query, d.HTTPClient, d.SearchConfig, d.SearchBatch, d.SearchOrder)
+		}
+		return d.SearchTask.search(ctx, args.Query, d.HTTPClient, d.SearchConfig)
 	case FetchPage:
 		var args FetchPageArgs
 		if err := decode(&args, name); err != nil {
 			return "", err
+		}
+		if d.SearchTask != nil {
+			return d.SearchTask.fetch(ctx, args.URL, d.FetchHTTPClient)
 		}
 		if d.FetchHTTPClient != nil {
 			return runFetchPageWithClient(ctx, args.URL, d.FetchHTTPClient)

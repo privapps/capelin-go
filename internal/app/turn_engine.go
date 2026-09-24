@@ -3,6 +3,7 @@ package app
 import (
 	"capelin-go/internal/agent"
 	"capelin-go/internal/contracts"
+	"capelin-go/internal/tools"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,75 @@ import (
 	"strings"
 	"time"
 )
+
+type searchTaskContextKey struct{}
+type searchBatchContextKey struct{}
+
+type searchBatchContext struct {
+	batch     *tools.SearchBatch
+	orderByID map[string]int
+}
+
+func withSearchTask(ctx context.Context, task *tools.SearchTask) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if searchTaskFromContext(ctx) != nil {
+		return ctx
+	}
+	if task == nil {
+		task = tools.NewSearchTask()
+	}
+	return context.WithValue(ctx, searchTaskContextKey{}, task)
+}
+
+func searchTaskFromContext(ctx context.Context) *tools.SearchTask {
+	if ctx == nil {
+		return nil
+	}
+	task, _ := ctx.Value(searchTaskContextKey{}).(*tools.SearchTask)
+	return task
+}
+
+func withSearchBatch(ctx context.Context, calls []contracts.ToolCall) context.Context {
+	searchCount := 0
+	for _, call := range calls {
+		if call.Function.Name == toolWebSearch && strings.TrimSpace(call.ID) != "" {
+			searchCount++
+		}
+	}
+	if searchCount == 0 {
+		return ctx
+	}
+	batch := &searchBatchContext{
+		batch:     tools.NewSearchBatch(searchCount),
+		orderByID: make(map[string]int, searchCount),
+	}
+	order := 0
+	for _, call := range calls {
+		if call.Function.Name != toolWebSearch || strings.TrimSpace(call.ID) == "" {
+			continue
+		}
+		batch.orderByID[call.ID] = order
+		order++
+	}
+	return context.WithValue(ctx, searchBatchContextKey{}, batch)
+}
+
+func searchBatchFromContext(ctx context.Context, callID string) (*tools.SearchBatch, int, bool) {
+	if ctx == nil {
+		return nil, 0, false
+	}
+	batch, _ := ctx.Value(searchBatchContextKey{}).(*searchBatchContext)
+	if batch == nil {
+		return nil, 0, false
+	}
+	order, ok := batch.orderByID[callID]
+	if !ok {
+		return nil, 0, false
+	}
+	return batch.batch, order, ok
+}
 
 // turnToolResult is retained for the protocol-compatibility adapters. New
 // turns use contracts.ToolResult through agent.ToolRunner.
@@ -57,8 +127,9 @@ func (r appToolRunner) Run(ctx context.Context, calls []contracts.ToolCall) []ag
 // implementations, policy checks, validation, formatting, and subagent
 // orchestration stay behind this compatibility wrapper.
 type appToolCapability struct {
-	catalog []contracts.Tool
-	runner  appToolRunner
+	catalog    []contracts.Tool
+	runner     appToolRunner
+	searchTask *tools.SearchTask
 }
 
 func (c appToolCapability) Tools() []contracts.Tool {
@@ -66,6 +137,8 @@ func (c appToolCapability) Tools() []contracts.Tool {
 }
 
 func (c appToolCapability) Run(ctx context.Context, calls []contracts.ToolCall) []agent.ToolResult {
+	ctx = withSearchTask(ctx, c.searchTask)
+	ctx = withSearchBatch(ctx, calls)
 	return c.runner.Run(ctx, calls)
 }
 
@@ -75,7 +148,8 @@ func newAppToolCapability(toolset []contracts.Tool, a *app, runtime *agentRuntim
 	}
 	profile := a.runtimeProfileFor(runtime)
 	return appToolCapability{
-		catalog: append([]contracts.Tool(nil), toolset...),
+		catalog:    append([]contracts.Tool(nil), toolset...),
+		searchTask: tools.NewSearchTask(),
 		runner: appToolRunner{
 			runtime: runtime,
 			bindParentCtx: func(ctx context.Context) {
@@ -104,6 +178,7 @@ func newAppToolCapability(toolset []contracts.Tool, a *app, runtime *agentRuntim
 					},
 					HandleResult: func(call contracts.ToolCall, output string) contracts.ToolResult {
 						result := contracts.ToolResult{Call: call, Output: output}
+						result.DisplayOutput = conciseToolDisplay(call.Function.Name, output)
 						if commandFailed(call, output) {
 							runtime.recordRecoverableToolError(fmt.Errorf("%s reported a command failure", call.Function.Name))
 							result.IsError = true

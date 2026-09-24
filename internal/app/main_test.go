@@ -3130,9 +3130,9 @@ func TestRunTurnLoopReasoningWithToolCalls(t *testing.T) {
 
 	// Mock the search URL so web_search doesn't make real HTTP requests.
 	mockSearchServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			w.Header().Set("Content-Type", "application/rss+xml")
-			fmt.Fprint(w, `<rss><channel><item><title>Test Result</title><link>https://example.com</link><description>test query evidence</description></item></channel></rss>`)
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"results\":[{\"title\":\"Test Result\",\"url\":\"https://example.com\",\"snippet\":\"test query evidence\"}]}"}]}}`)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html")
@@ -3140,17 +3140,17 @@ func TestRunTurnLoopReasoningWithToolCalls(t *testing.T) {
 	}))
 	defer mockSearchServer.Close()
 	origDDG := ddgSearchURL
-	origBing := bingSearchURL
+	origMCP := mcpSearchURL
 	ddgSearchURL = mockSearchServer.URL
-	bingSearchURL = mockSearchServer.URL
+	mcpSearchURL = mockSearchServer.URL
 	// Use the ordinary test transport so the local fixture is reachable while
 	// the application still exercises the normal tool dispatcher and summary
 	// extraction path.
-	tools.SetNetworkOverrides(true, &http.Client{}, ddgSearchURL, bingSearchURL)
+	tools.SetNetworkOverrides(true, &http.Client{}, ddgSearchURL, mcpSearchURL)
 	defer func() {
 		ddgSearchURL = origDDG
-		bingSearchURL = origBing
-		tools.SetNetworkOverrides(allowPrivateFetch, toolHTTPClient, ddgSearchURL, bingSearchURL)
+		mcpSearchURL = origMCP
+		tools.SetNetworkOverrides(allowPrivateFetch, toolHTTPClient, ddgSearchURL, mcpSearchURL)
 	}()
 
 	a := &app{

@@ -415,6 +415,7 @@ func (a *app) runGoal(ctx context.Context, session *interactiveSession, objectiv
 		a.writeInteractiveSystem("[goal] --yolo is required before using /goal")
 		return false
 	}
+	ctx = withSearchTask(ctx, nil)
 	session.goalCompleted = false
 	goalProfile := a.cfg.goalRuntimeProfile()
 	if goalProfile.MaxGoalIterations <= 0 {
