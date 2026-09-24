@@ -20,6 +20,12 @@ type failingSearchBody struct{}
 func (failingSearchBody) Read([]byte) (int, error) { return 0, errors.New("fixture body read failed") }
 func (failingSearchBody) Close() error             { return nil }
 
+type failingSearchTransport struct{}
+
+func (failingSearchTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("global search client must not be used")
+}
+
 type searchFixtureTransport struct {
 	transportError bool
 	parserError    bool
@@ -120,6 +126,16 @@ func TestRunToolWebSearchRegressionMatrix(t *testing.T) {
 			wantSummary:  "Trusted Search",
 			wantPresent:  []string{"Fallback: no", "Trusted Search", "https://mixed.example/result"},
 			wantAbsent:   []string{"Duplicate Trusted Search", "Malformed Trusted Search", "javascript:bad", "Trusted porn result", "unsafe.example", "Must not be used"},
+		},
+		{
+			name:             "rejected first duplicate does not get accepted",
+			ddgBody:          `<div class="result web-result"><a class="result__a" href="https://duplicate.example/result#unsafe">Trusted porn result</a><div class="result__snippet">trusted search evidence</div></div><div class="result web-result"><a class="result__a" href="https://duplicate.example/result#clean">Clean Duplicate</a><div class="result__snippet">trusted search evidence</div></div>`,
+			bingBody:         `<rss><channel><item><title>Bing Recovery</title><link>https://bing.example/recovery</link><description>trusted search evidence</description></item></channel></rss>`,
+			wantProvider:     "Search provider: Bing",
+			wantFallbackText: "DuckDuckGo returned no trustworthy results",
+			wantSummary:      "Bing Recovery",
+			wantPresent:      []string{"Fallback: yes", "Bing Recovery"},
+			wantAbsent:       []string{"Clean Duplicate", "duplicate.example"},
 		},
 		{
 			name:             "both providers rejected",
@@ -238,7 +254,7 @@ func TestRunToolWebSearchRegressionMatrix(t *testing.T) {
 
 			a := &app{
 				cfg:     config{workspaceRoot: t.TempDir(), toolMaxParallel: 1, toolTimeoutSec: 30, allowedTools: map[string]bool{toolWebSearch: true}},
-				client:  &client{endpoint: modelServer.URL + "/chat/completions", http: &http.Client{}},
+				client:  &client{endpoint: modelServer.URL + "/chat/completions", http: searchClient},
 				toolset: buildAgentTools(map[string]bool{toolWebSearch: true}),
 				sink:    &spySink{onToolResult: func(_ string, _ bool, detail string) { observedToolOutput = detail }},
 			}
@@ -279,5 +295,40 @@ func TestRunToolWebSearchRegressionMatrix(t *testing.T) {
 				t.Error("Bing was called after a trustworthy DuckDuckGo response")
 			}
 		})
+	}
+}
+
+func TestRunToolWebSearchUsesApplicationHTTPClient(t *testing.T) {
+	oldClient, oldDDG, oldBing := tools.DefaultHTTPClient(), tools.DefaultDuckDuckGoURL(), tools.DefaultBingURL()
+	t.Cleanup(func() {
+		tools.SetNetworkOverrides(false, oldClient, oldDDG, oldBing)
+	})
+
+	searchServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/bing" {
+			t.Fatal("Bing was called after the application client returned DuckDuckGo results")
+		}
+		if r.Method != http.MethodPost || r.FormValue("kp") != "1" {
+			t.Fatalf("unexpected DuckDuckGo request: method=%s kp=%q", r.Method, r.FormValue("kp"))
+		}
+		_, _ = fmt.Fprint(w, `<div class="result web-result"><a class="result__a" href="https://example.com/docs">Trusted Search</a><div class="result__snippet">trusted search evidence</div></div>`)
+	}))
+	defer searchServer.Close()
+
+	tools.SetNetworkOverrides(true, &http.Client{Transport: failingSearchTransport{}}, searchServer.URL+"/ddg", searchServer.URL+"/bing")
+	a := &app{
+		cfg:     config{workspaceRoot: t.TempDir(), allowedTools: map[string]bool{toolWebSearch: true}},
+		client:  &client{http: &http.Client{}},
+		toolset: buildAgentTools(map[string]bool{toolWebSearch: true}),
+	}
+
+	result, err := a.runTool(context.Background(), types.ToolCall{
+		Function: types.FunctionCall{Name: toolWebSearch, Arguments: `{"query":"trusted search"}`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "Search provider: DuckDuckGo") || !strings.Contains(result, "Trusted Search") {
+		t.Fatalf("web search did not use the application's HTTP client: %q", result)
 	}
 }

@@ -9,7 +9,7 @@ import (
 )
 
 func TestQualityGateSearchResultsNormalizesFiltersAndDeduplicates(t *testing.T) {
-	results, report := qualityGateSearchResults("trusted search", []searchResult{
+	results := qualityGateSearchResults("trusted search", []searchResult{
 		{Title: "Trusted Search", URL: "HTTPS://Example.com:443/docs#section", Abstract: "Trusted search documentation"},
 		{Title: "Duplicate", URL: "https://example.com/docs#other", Abstract: "trusted search"},
 		{Title: "", URL: "https://empty.example", Abstract: "trusted search"},
@@ -18,8 +18,8 @@ func TestQualityGateSearchResultsNormalizesFiltersAndDeduplicates(t *testing.T) 
 		{Title: "Completely unrelated", URL: "https://unrelated.example", Abstract: "nothing relevant"},
 	})
 
-	if report.accepted != 1 || len(results) != 1 {
-		t.Fatalf("quality gate accepted %d results %#v, want one", report.accepted, results)
+	if len(results) != 1 {
+		t.Fatalf("quality gate accepted %d results %#v, want one", len(results), results)
 	}
 	if results[0].URL != "https://example.com/docs" {
 		t.Fatalf("normalized URL = %q, want canonical HTTPS URL", results[0].URL)
@@ -27,12 +27,12 @@ func TestQualityGateSearchResultsNormalizesFiltersAndDeduplicates(t *testing.T) 
 }
 
 func TestQualityGateSearchResultsRejectsQueriesWithoutMeaningfulTerms(t *testing.T) {
-	results, report := qualityGateSearchResults("the and", []searchResult{{
+	results := qualityGateSearchResults("the and", []searchResult{{
 		Title:    "The official result",
 		URL:      "https://example.com/result",
 		Abstract: "A valid-looking record",
 	}})
-	if report.accepted != 0 || len(results) != 0 {
+	if len(results) != 0 {
 		t.Fatalf("stopword-only query accepted %#v, want no trustworthy results", results)
 	}
 }
@@ -45,41 +45,41 @@ func TestQualityGateSearchResultsAcceptsTechnicalAndInflectedMatches(t *testing.
 		{query: "C++", result: searchResult{Title: "C++ programming guide", URL: "https://example.com/cpp"}},
 		{query: "run benchmarks", result: searchResult{Title: "Running Benchmarks", URL: "https://example.com/benchmarks", Abstract: "How to run useful benchmarks"}},
 	} {
-		results, report := qualityGateSearchResults(test.query, []searchResult{test.result})
-		if report.accepted != 1 || len(results) != 1 {
+		results := qualityGateSearchResults(test.query, []searchResult{test.result})
+		if len(results) != 1 {
 			t.Errorf("query %q rejected legitimate result: %#v", test.query, results)
 		}
 	}
 }
 
 func TestQualityGateSearchResultsRejectsTechnicalPrefixFalsePositives(t *testing.T) {
-	results, report := qualityGateSearchResults("C++", []searchResult{{
+	results := qualityGateSearchResults("C++", []searchResult{{
 		Title: "Cooking recipes",
 		URL:   "https://example.com/cooking",
 	}})
-	if report.accepted != 0 || len(results) != 0 {
+	if len(results) != 0 {
 		t.Fatalf("unrelated C++ result accepted: %#v", results)
 	}
 }
 
 func TestQualityGateSearchResultsKeepsLegitimateAmbiguousSafetyTerms(t *testing.T) {
-	results, report := qualityGateSearchResults("nude mice cancer", []searchResult{{
+	results := qualityGateSearchResults("nude mice cancer", []searchResult{{
 		Title:    "Nude mice in cancer research",
 		URL:      "https://example.com/research",
 		Abstract: "A scientific study",
 	}})
-	if report.accepted != 1 || len(results) != 1 {
+	if len(results) != 1 {
 		t.Fatalf("legitimate ambiguous result rejected: %#v", results)
 	}
 }
 
 func TestQualityGateSearchResultsRejectsExplicitAdultDomains(t *testing.T) {
 	for _, host := range []string{"pornhub.com", "xvideos.com", "xhamster.com", "xnxx.com"} {
-		results, report := qualityGateSearchResults("adult videos", []searchResult{{
+		results := qualityGateSearchResults("adult videos", []searchResult{{
 			Title: "Adult videos",
 			URL:   "https://" + host + "/watch/example",
 		}})
-		if report.accepted != 0 || len(results) != 0 {
+		if len(results) != 0 {
 			t.Errorf("explicit adult domain %q accepted: %#v", host, results)
 		}
 	}

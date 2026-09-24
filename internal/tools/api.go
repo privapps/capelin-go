@@ -210,7 +210,7 @@ func (d Dispatcher) Run(ctx context.Context, runtime any, call contracts.ToolCal
 		if err := decode(&args, name); err != nil {
 			return "", err
 		}
-		return runWebSearch(ctx, args.Query)
+		return runWebSearchWithClient(ctx, args.Query, d.HTTPClient)
 	case FetchPage:
 		var args FetchPageArgs
 		if err := decode(&args, name); err != nil {

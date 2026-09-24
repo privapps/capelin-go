@@ -226,10 +226,6 @@ const (
 	searchProviderBing       searchProvider = "Bing"
 )
 
-type searchQualityReport struct {
-	accepted int
-}
-
 func specWebSearch() contracts.Tool {
 	return contracts.Tool{
 		Type: "function",
@@ -605,8 +601,15 @@ func specCancelSubagent() contracts.Tool {
 }
 
 func runWebSearch(ctx context.Context, query string) (string, error) {
-	primaryResults, primaryErr := runDuckDuckGoSearch(ctx, query)
-	primaryResults, _ = qualityGateSearchResults(query, primaryResults)
+	return runWebSearchWithClient(ctx, query, toolHTTPClient)
+}
+
+func runWebSearchWithClient(ctx context.Context, query string, client *http.Client) (string, error) {
+	if client == nil {
+		client = toolHTTPClient
+	}
+	primaryResults, primaryErr := runDuckDuckGoSearchWithClient(ctx, query, client)
+	primaryResults = qualityGateSearchResults(query, primaryResults)
 	if primaryErr == nil && len(primaryResults) > 0 {
 		return formatSearchResponse(searchProviderDuckDuckGo, false, "", primaryResults), nil
 	}
@@ -615,8 +618,8 @@ func runWebSearch(ctx context.Context, query string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	fallbackResults, fallbackErr := runBingSearch(ctx, query)
-	fallbackResults, _ = qualityGateSearchResults(query, fallbackResults)
+	fallbackResults, fallbackErr := runBingSearchWithClient(ctx, query, client)
+	fallbackResults = qualityGateSearchResults(query, fallbackResults)
 	if fallbackErr == nil && len(fallbackResults) > 0 {
 		return formatSearchResponse(searchProviderBing, true, fallbackReason, fallbackResults), nil
 	}
@@ -663,17 +666,14 @@ func formatNoTrustworthyResults(primaryReason, fallbackReason string) string {
 // qualityGateSearchResults normalizes and validates provider records before
 // they become search evidence. The first result for a canonical URL wins so a
 // provider cannot fill the response with duplicate records.
-func qualityGateSearchResults(query string, results []searchResult) ([]searchResult, searchQualityReport) {
+func qualityGateSearchResults(query string, results []searchResult) []searchResult {
 	if len(results) == 0 {
-		return nil, searchQualityReport{}
+		return nil
 	}
 
 	accepted := make([]searchResult, 0, min(len(results), maxSearchResults))
 	seen := make(map[string]struct{}, len(results))
 	for _, result := range results {
-		if strings.TrimSpace(result.Title) == "" {
-			continue
-		}
 		normalizedURL, err := normalizeSearchURL(result.URL)
 		if err != nil {
 			continue
@@ -685,17 +685,23 @@ func qualityGateSearchResults(query string, results []searchResult) ([]searchRes
 		if _, ok := seen[normalizedURL]; ok {
 			continue
 		}
+		// The first valid canonical URL claims the record even when its
+		// metadata is later rejected, so a provider cannot bypass the gate by
+		// repeating the URL with sanitized metadata.
+		seen[normalizedURL] = struct{}{}
+		if result.Title == "" {
+			continue
+		}
 		if !isRelevantSearchResult(query, result) || isUnsafeSearchResult(result) {
 			continue
 		}
-		seen[normalizedURL] = struct{}{}
 		accepted = append(accepted, result)
 	}
 
 	if len(accepted) > maxSearchResults {
 		accepted = accepted[:maxSearchResults]
 	}
-	return accepted, searchQualityReport{accepted: len(accepted)}
+	return accepted
 }
 
 func normalizeSearchURL(raw string) (string, error) {
@@ -912,6 +918,10 @@ func isUnsafeSearchResult(result searchResult) bool {
 }
 
 func runDuckDuckGoSearch(ctx context.Context, query string) ([]searchResult, error) {
+	return runDuckDuckGoSearchWithClient(ctx, query, toolHTTPClient)
+}
+
+func runDuckDuckGoSearchWithClient(ctx context.Context, query string, client *http.Client) ([]searchResult, error) {
 	form := url.Values{}
 	form.Set("q", query)
 	form.Set("b", "")
@@ -930,7 +940,7 @@ func runDuckDuckGoSearch(ctx context.Context, query string) ([]searchResult, err
 	req.Header.Set("User-Agent", contracts.CapelinUserAgent)
 	req.Header.Set("DNT", "1")
 
-	resp, err := clientWithUserAgent(toolHTTPClient).Do(req)
+	resp, err := clientWithUserAgent(client).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("web search: %w", err)
 	}
@@ -952,6 +962,10 @@ func runDuckDuckGoSearch(ctx context.Context, query string) ([]searchResult, err
 }
 
 func runBingSearch(ctx context.Context, query string) ([]searchResult, error) {
+	return runBingSearchWithClient(ctx, query, toolHTTPClient)
+}
+
+func runBingSearchWithClient(ctx context.Context, query string, client *http.Client) ([]searchResult, error) {
 	endpoint, err := url.Parse(bingSearchURL)
 	if err != nil {
 		return nil, fmt.Errorf("bing search: %w", err)
@@ -970,7 +984,7 @@ func runBingSearch(ctx context.Context, query string) ([]searchResult, error) {
 	}
 	req.Header.Set("User-Agent", contracts.CapelinUserAgent)
 
-	resp, err := clientWithUserAgent(toolHTTPClient).Do(req)
+	resp, err := clientWithUserAgent(client).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("bing search: %w", err)
 	}
