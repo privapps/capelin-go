@@ -17,10 +17,13 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"golang.org/x/net/html"
 )
@@ -216,12 +219,23 @@ type searchResult struct {
 	Abstract string
 }
 
+type searchProvider string
+
+const (
+	searchProviderDuckDuckGo searchProvider = "DuckDuckGo"
+	searchProviderBing       searchProvider = "Bing"
+)
+
+type searchQualityReport struct {
+	accepted int
+}
+
 func specWebSearch() contracts.Tool {
 	return contracts.Tool{
 		Type: "function",
 		Function: contracts.ToolSpec{
 			Name:        WebSearch,
-			Description: "Search the web using DuckDuckGo with Bing fallback and return result titles, URLs, and abstracts.",
+			Description: "Search the web with quality-gated DuckDuckGo results and Bing fallback; return the selected provider, result titles, URLs, and abstracts.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -591,23 +605,311 @@ func specCancelSubagent() contracts.Tool {
 }
 
 func runWebSearch(ctx context.Context, query string) (string, error) {
-	results, err := runDuckDuckGoSearch(ctx, query)
-	if err == nil {
-		return formatSearchResults(results), nil
+	primaryResults, primaryErr := runDuckDuckGoSearch(ctx, query)
+	primaryResults, _ = qualityGateSearchResults(query, primaryResults)
+	if primaryErr == nil && len(primaryResults) > 0 {
+		return formatSearchResponse(searchProviderDuckDuckGo, false, "", primaryResults), nil
 	}
 
-	bingResults, bingErr := runBingSearch(ctx, query)
-	if bingErr == nil {
-		return formatSearchResults(bingResults), nil
+	fallbackReason := searchAttemptReason(searchProviderDuckDuckGo, primaryErr)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	fallbackResults, fallbackErr := runBingSearch(ctx, query)
+	fallbackResults, _ = qualityGateSearchResults(query, fallbackResults)
+	if fallbackErr == nil && len(fallbackResults) > 0 {
+		return formatSearchResponse(searchProviderBing, true, fallbackReason, fallbackResults), nil
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 
-	if errors.Is(err, errNoSearchResults) && errors.Is(bingErr, errNoSearchResults) {
-		return "(no results)", nil
-	}
-	return "", fmt.Errorf("web search failed: duckduckgo: %v; bing: %w", err, bingErr)
+	return formatNoTrustworthyResults(fallbackReason, searchAttemptReason(searchProviderBing, fallbackErr)), nil
 }
 
 var errNoSearchResults = errors.New("no search results")
+
+func searchAttemptReason(provider searchProvider, providerErr error) string {
+	if providerErr != nil {
+		if errors.Is(providerErr, errNoSearchResults) {
+			return fmt.Sprintf("%s returned no results", provider)
+		}
+		// Do not include provider response bodies or parser details in the
+		// tool result: an error body can contain the same polluted content the
+		// quality gate is intended to keep away from the agent.
+		return fmt.Sprintf("%s request or response failed", provider)
+	}
+	return fmt.Sprintf("%s returned no trustworthy results", provider)
+}
+
+func formatSearchResponse(provider searchProvider, fallback bool, fallbackReason string, results []searchResult) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Search provider: %s\n", provider)
+	if fallback {
+		b.WriteString("Fallback: yes\n")
+		fmt.Fprintf(&b, "Fallback reason: %s\n", fallbackReason)
+	} else {
+		b.WriteString("Fallback: no\n")
+	}
+	b.WriteString("\n")
+	b.WriteString(formatSearchResults(results))
+	return b.String()
+}
+
+func formatNoTrustworthyResults(primaryReason, fallbackReason string) string {
+	return fmt.Sprintf("Search provider: none\nFallback: yes\nFallback reason: %s; %s\nSearch status: no trustworthy results\n\nNo trustworthy search results were found. Rejected results are omitted.", primaryReason, fallbackReason)
+}
+
+// qualityGateSearchResults normalizes and validates provider records before
+// they become search evidence. The first result for a canonical URL wins so a
+// provider cannot fill the response with duplicate records.
+func qualityGateSearchResults(query string, results []searchResult) ([]searchResult, searchQualityReport) {
+	if len(results) == 0 {
+		return nil, searchQualityReport{}
+	}
+
+	accepted := make([]searchResult, 0, min(len(results), maxSearchResults))
+	seen := make(map[string]struct{}, len(results))
+	for _, result := range results {
+		if strings.TrimSpace(result.Title) == "" {
+			continue
+		}
+		normalizedURL, err := normalizeSearchURL(result.URL)
+		if err != nil {
+			continue
+		}
+		result.Title = strings.TrimSpace(result.Title)
+		result.URL = normalizedURL
+		result.Abstract = strings.TrimSpace(result.Abstract)
+
+		if _, ok := seen[normalizedURL]; ok {
+			continue
+		}
+		if !isRelevantSearchResult(query, result) || isUnsafeSearchResult(result) {
+			continue
+		}
+		seen[normalizedURL] = struct{}{}
+		accepted = append(accepted, result)
+	}
+
+	if len(accepted) > maxSearchResults {
+		accepted = accepted[:maxSearchResults]
+	}
+	return accepted, searchQualityReport{accepted: len(accepted)}
+}
+
+func normalizeSearchURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.ContainsAny(raw, "\r\n") {
+		return "", errors.New("empty or invalid search URL")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("unsupported search URL scheme %q", parsed.Scheme)
+	}
+	if parsed.Hostname() == "" || parsed.Opaque != "" || parsed.User != nil {
+		return "", errors.New("search URL has no usable public URL form")
+	}
+	port := parsed.Port()
+	portNumber := 0
+	if port != "" {
+		portNumber, err = strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return "", errors.New("search URL has an invalid port")
+		}
+	}
+
+	host := strings.ToLower(parsed.Hostname())
+	normalizedPort := strconv.Itoa(portNumber)
+	if port == "" || (parsed.Scheme == "http" && portNumber == 80) || (parsed.Scheme == "https" && portNumber == 443) {
+		parsed.Host = host
+	} else if strings.Contains(host, ":") {
+		parsed.Host = "[" + host + "]:" + normalizedPort
+	} else {
+		parsed.Host = host + ":" + normalizedPort
+	}
+	parsed.Fragment = ""
+	if parsed.Path == "" {
+		parsed.Path = "/"
+	} else {
+		trailingSlash := strings.HasSuffix(parsed.Path, "/")
+		parsed.Path = path.Clean(parsed.Path)
+		if !strings.HasPrefix(parsed.Path, "/") {
+			parsed.Path = "/" + parsed.Path
+		}
+		if trailingSlash && parsed.Path != "/" {
+			parsed.Path += "/"
+		}
+		parsed.RawPath = ""
+	}
+	return parsed.String(), nil
+}
+
+func isRelevantSearchResult(query string, result searchResult) bool {
+	queryTerms := meaningfulSearchTerms(query)
+	if len(queryTerms) == 0 {
+		// A query made only of stop words provides no reliable relevance
+		// signal. Treating every provider record as relevant would let an
+		// otherwise successful response bypass the quality gate.
+		return false
+	}
+	resultTerms := make(map[string]struct{})
+	for _, term := range searchTokens(result.Title + " " + result.Abstract) {
+		resultTerms[term] = struct{}{}
+	}
+	for _, term := range technicalSearchTokens(result.Title + " " + result.Abstract) {
+		resultTerms[term] = struct{}{}
+	}
+	matches := 0
+	for _, term := range queryTerms {
+		for resultTerm := range resultTerms {
+			if searchTermsMatch(term, resultTerm) {
+				matches++
+				break
+			}
+		}
+	}
+	// Require nearly all content-bearing query terms. This keeps a result
+	// containing one incidental word from passing a multi-term relevance check,
+	// while allowing a long query to omit one term when a provider shortens a
+	// title or abstract.
+	requiredMatches := len(queryTerms)
+	if requiredMatches > 3 {
+		requiredMatches--
+	}
+	return matches >= requiredMatches
+}
+
+func searchTermsMatch(queryTerm, resultTerm string) bool {
+	if queryTerm == resultTerm {
+		return true
+	}
+	if strings.ContainsAny(queryTerm, "+#") || strings.ContainsAny(resultTerm, "+#") {
+		return false
+	}
+	queryStem := strings.TrimSuffix(queryTerm, "s")
+	resultStem := strings.TrimSuffix(resultTerm, "s")
+	if queryStem == resultStem {
+		return true
+	}
+	if len(queryStem) >= 3 && strings.HasPrefix(resultStem, queryStem) {
+		return true
+	}
+	return len(resultStem) >= 3 && strings.HasPrefix(queryStem, resultStem)
+}
+
+func meaningfulSearchTerms(text string) []string {
+	terms := searchTokens(text)
+	technicalTerms := technicalSearchTokens(text)
+	if len(technicalTerms) > 0 {
+		terms = technicalTerms
+		for _, term := range searchTokens(text) {
+			if len([]rune(term)) >= 2 && !searchStopWords[term] {
+				terms = append(terms, term)
+			}
+		}
+	}
+	meaningful := make([]string, 0, len(terms))
+	for _, term := range terms {
+		if len([]rune(term)) < 2 || searchStopWords[term] {
+			continue
+		}
+		meaningful = append(meaningful, term)
+	}
+	return meaningful
+}
+
+func technicalSearchTokens(text string) []string {
+	runes := []rune(strings.ToLower(text))
+	var tokens []string
+	for i := 0; i < len(runes); {
+		if !unicode.IsLetter(runes[i]) && !unicode.IsNumber(runes[i]) {
+			i++
+			continue
+		}
+		start := i
+		for i < len(runes) && (unicode.IsLetter(runes[i]) || unicode.IsNumber(runes[i])) {
+			i++
+		}
+		if i < len(runes) && runes[i] == '#' {
+			i++
+		} else if i+1 < len(runes) && runes[i] == '+' && runes[i+1] == '+' {
+			i += 2
+		}
+		candidate := string(runes[start:i])
+		if strings.ContainsAny(candidate, "+#") {
+			tokens = append(tokens, candidate)
+		}
+	}
+	return tokens
+}
+
+var searchStopWords = map[string]bool{
+	"a": true, "an": true, "and": true, "are": true, "as": true, "at": true,
+	"be": true, "by": true, "for": true, "from": true, "how": true, "in": true,
+	"is": true, "it": true, "of": true, "on": true, "or": true, "the": true,
+	"to": true, "what": true, "when": true, "where": true, "which": true,
+	"who": true, "why": true, "with": true,
+}
+
+func searchTokens(text string) []string {
+	var tokens []string
+	var current strings.Builder
+	flush := func() {
+		if current.Len() > 0 {
+			tokens = append(tokens, current.String())
+			current.Reset()
+		}
+	}
+	for _, r := range strings.ToLower(text) {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			current.WriteRune(r)
+			continue
+		}
+		flush()
+	}
+	flush()
+	return tokens
+}
+
+func isUnsafeSearchResult(result searchResult) bool {
+	text := strings.ToLower(result.Title + " " + result.URL + " " + result.Abstract)
+	if parsed, err := url.Parse(result.URL); err == nil {
+		for _, marker := range []string{
+			"porn", "hentai", "sexcam", "camgirl", "onlyfans", "xvideos",
+			"xhamster", "xnxx", "redtube", "youporn", "spankbang", "brazzers",
+		} {
+			if strings.Contains(strings.ToLower(parsed.Hostname()), marker) {
+				return true
+			}
+		}
+	}
+	terms := make(map[string]struct{})
+	for _, term := range searchTokens(text) {
+		terms[term] = struct{}{}
+	}
+	for _, term := range []string{
+		"porn", "porno", "pornography", "hentai", "sexcam", "camgirl",
+		"camgirls", "blowjob", "blowjobs", "milf", "onlyfans",
+	} {
+		if _, ok := terms[term]; ok {
+			return true
+		}
+	}
+	for _, phrase := range []string{
+		"adult entertainment", "adult videos", "free porn", "make money fast",
+		"crypto giveaway",
+	} {
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+	return false
+}
 
 func runDuckDuckGoSearch(ctx context.Context, query string) ([]searchResult, error) {
 	form := url.Values{}
@@ -646,9 +948,6 @@ func runDuckDuckGoSearch(ctx context.Context, query string) ([]searchResult, err
 	if len(results) == 0 {
 		return nil, errNoSearchResults
 	}
-	if len(results) > maxSearchResults {
-		results = results[:maxSearchResults]
-	}
 	return results, nil
 }
 
@@ -662,6 +961,7 @@ func runBingSearch(ctx context.Context, query string) ([]searchResult, error) {
 	params.Set("setlang", "en-US")
 	params.Set("mkt", "en-US")
 	params.Set("format", "rss")
+	params.Set("adlt", "strict")
 	endpoint.RawQuery = params.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
@@ -687,9 +987,6 @@ func runBingSearch(ctx context.Context, query string) ([]searchResult, error) {
 	}
 	if len(results) == 0 {
 		return nil, errNoSearchResults
-	}
-	if len(results) > maxSearchResults {
-		results = results[:maxSearchResults]
 	}
 	return results, nil
 }
@@ -727,7 +1024,7 @@ func parseDDGResults(r io.Reader) ([]searchResult, error) {
 	walk = func(n *html.Node) {
 		if n.Type == html.ElementNode && n.Data == "div" {
 			cls := htmlAttr(n, "class")
-			if strings.Contains(cls, "result") && strings.Contains(cls, "web-result") {
+			if hasHTMLClass(cls, "result") || hasHTMLClass(cls, "web-result") {
 				if r := extractDDGResult(n); r != nil {
 					results = append(results, *r)
 				}
@@ -740,6 +1037,15 @@ func parseDDGResults(r io.Reader) ([]searchResult, error) {
 	}
 	walk(doc)
 	return results, nil
+}
+
+func hasHTMLClass(classAttribute, wanted string) bool {
+	for _, className := range strings.Fields(classAttribute) {
+		if className == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 type bingRSSFeed struct {

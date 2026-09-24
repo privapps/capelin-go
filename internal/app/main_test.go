@@ -3130,15 +3130,23 @@ func TestRunTurnLoopReasoningWithToolCalls(t *testing.T) {
 
 	// Mock the search URL so web_search doesn't make real HTTP requests.
 	mockSearchServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/rss+xml")
+			fmt.Fprint(w, `<rss><channel><item><title>Test Result</title><link>https://example.com</link><description>test query evidence</description></item></channel></rss>`)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, `<html><body><div class="result"><a class="result__a" href="https://example.com">Test Result</a><a class="result__snippet">Test snippet</a></div></body></html>`)
+		fmt.Fprint(w, `<html><body><div class="result"><a class="result__a" href="https://unsafe.example/porn">Test porn result</a><a class="result__snippet">test query evidence</a></div></body></html>`)
 	}))
 	defer mockSearchServer.Close()
 	origDDG := ddgSearchURL
 	origBing := bingSearchURL
 	ddgSearchURL = mockSearchServer.URL
 	bingSearchURL = mockSearchServer.URL
-	tools.SetNetworkOverrides(allowPrivateFetch, toolHTTPClient, ddgSearchURL, bingSearchURL)
+	// Use the ordinary test transport so the local fixture is reachable while
+	// the application still exercises the normal tool dispatcher and summary
+	// extraction path.
+	tools.SetNetworkOverrides(true, &http.Client{}, ddgSearchURL, bingSearchURL)
 	defer func() {
 		ddgSearchURL = origDDG
 		bingSearchURL = origBing
@@ -3150,6 +3158,7 @@ func TestRunTurnLoopReasoningWithToolCalls(t *testing.T) {
 			workspaceRoot:   t.TempDir(),
 			toolTimeoutSec:  30,
 			toolMaxParallel: 4,
+			allowedTools:    map[string]bool{toolWebSearch: true},
 		},
 		client: &client{
 			endpoint: mockServer.URL + "/chat/completions",
@@ -3178,6 +3187,12 @@ func TestRunTurnLoopReasoningWithToolCalls(t *testing.T) {
 	}
 	if !strings.Contains(reasoning, "web_search") {
 		t.Fatalf("expected reasoning to contain tool call name, got: %q", reasoning)
+	}
+	if !strings.Contains(reasoning, "Test Result") {
+		t.Fatalf("expected reasoning to contain the downstream web-search summary, got: %q", reasoning)
+	}
+	if strings.Contains(reasoning, "Search provider:") {
+		t.Fatalf("provider provenance was exposed as a search summary instead of metadata: %q", reasoning)
 	}
 	if !strings.Contains(reasoning, "Tool calls:") {
 		t.Fatalf("expected reasoning to contain tool calls section, got: %q", reasoning)
