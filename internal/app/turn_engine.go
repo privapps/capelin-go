@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -176,6 +177,7 @@ func newAppToolCapability(toolset []contracts.Tool, a *app, runtime *agentRuntim
 					Serialize: func(call contracts.ToolCall) bool {
 						return isGoalControlTool(call.Function.Name)
 					},
+					SerializeKey: sameFileMutationKey,
 					HandleResult: func(call contracts.ToolCall, output string) contracts.ToolResult {
 						result := contracts.ToolResult{Call: call, Output: output}
 						result.DisplayOutput = conciseToolDisplay(call.Function.Name, output)
@@ -216,6 +218,28 @@ func newAppToolCapability(toolset []contracts.Tool, a *app, runtime *agentRuntim
 				},
 			)},
 	}
+}
+
+// sameFileMutationKey gives the batch runner a stable lane for edit_file
+// calls that target the same path. The edit tool performs the authoritative
+// workspace/path validation; this key only prevents same-batch calls from
+// racing one another while allowing different files to use the configured
+// parallelism.
+func sameFileMutationKey(call contracts.ToolCall) string {
+	if call.Function.Name != toolEditFile {
+		return ""
+	}
+	var args struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+		return ""
+	}
+	path := strings.TrimSpace(args.Path)
+	if path == "" {
+		return ""
+	}
+	return toolEditFile + ":" + filepath.Clean(filepath.FromSlash(path))
 }
 
 func correctedRetryRecovery(runtime *agentRuntime, call contracts.ToolCall) *contracts.ToolRecovery {

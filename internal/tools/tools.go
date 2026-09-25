@@ -6,6 +6,9 @@ import (
 	"capelin-go/internal/policy"
 	"capelin-go/internal/skills"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -191,9 +194,10 @@ type appendFileArgs struct {
 }
 
 type editFileArgs struct {
-	Path   string `json:"path"`
-	OldStr string `json:"old_str"`
-	NewStr string `json:"new_str"`
+	Path        string `json:"path"`
+	OldStr      string `json:"old_str"`
+	NewStr      string `json:"new_str"`
+	ContentHash string `json:"content_hash"`
 }
 
 type executeProgramArgs struct {
@@ -275,7 +279,7 @@ func specReadFile() contracts.Tool {
 		Type: "function",
 		Function: contracts.ToolSpec{
 			Name:        ReadFile,
-			Description: "Read a file from local workspace with optional line range.",
+			Description: "Read a file from local workspace with optional line range. The result includes a compact full-file content hash for a guarded edit.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -333,15 +337,16 @@ func specEditFile() contracts.Tool {
 		Type: "function",
 		Function: contracts.ToolSpec{
 			Name:        EditFile,
-			Description: "Replace an exact string in a file. Fails if old_str is not found or appears more than once.",
+			Description: "Replace an exact string in a file only when content_hash matches the current full-file SHA-256 snapshot. Accepts the compact hash returned by read_file and legacy full SHA-256 hashes. Fails if old_str is not found or appears more than once.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"path":    map[string]any{"type": "string", "description": "Relative file path"},
-					"old_str": map[string]any{"type": "string", "description": "Exact string to find (must appear exactly once)"},
-					"new_str": map[string]any{"type": "string", "description": "Replacement string"},
+					"path":         map[string]any{"type": "string", "description": "Relative file path"},
+					"old_str":      map[string]any{"type": "string", "description": "Exact string to find (must appear exactly once)"},
+					"new_str":      map[string]any{"type": "string", "description": "Replacement string"},
+					"content_hash": map[string]any{"type": "string", "description": "The sha256-128:<22 unpadded base64url> content_hash returned by read_file; legacy sha256:<64 lowercase hex> values are accepted during migration"},
 				},
-				"required":             []string{"path", "old_str", "new_str"},
+				"required":             []string{"path", "old_str", "new_str", "content_hash"},
 				"additionalProperties": false,
 			},
 		},
@@ -1302,6 +1307,7 @@ func runReadFile(workspaceRoot string, yolo bool, args readFileArgs) (string, er
 	if len(data) > maxFileBytes {
 		return "", fmt.Errorf("read file: file too large (%d bytes)", len(data))
 	}
+	contentHash := formatContentHash(data)
 
 	content := string(data)
 	lines := strings.Split(content, "\n")
@@ -1324,7 +1330,75 @@ func runReadFile(workspaceRoot string, yolo bool, args readFileArgs) (string, er
 	for i := start; i <= end; i++ {
 		fmt.Fprintf(&b, "%d. %s\n", i, lines[i-1])
 	}
-	return strings.TrimRight(b.String(), "\n"), nil
+	return fmt.Sprintf("content_hash: %s\n\n%s", contentHash, strings.TrimRight(b.String(), "\n")), nil
+}
+
+const (
+	contentHashFormat       = "sha256-128:<22 unpadded base64url>"
+	legacyContentHashFormat = "sha256:<64 lowercase hex>"
+)
+
+type parsedContentHash struct {
+	digest [sha256.Size]byte
+	full   bool
+}
+
+func formatContentHash(data []byte) string {
+	sum := sha256.Sum256(data)
+	return "sha256-128:" + base64.RawURLEncoding.EncodeToString(sum[:sha256.Size/2])
+}
+
+func parseContentHash(value string) (parsedContentHash, error) {
+	var parsed parsedContentHash
+	if value == "" {
+		return parsed, errors.New("content_hash is required; reread the file and retry with the content_hash returned by read_file")
+	}
+	algorithm, digest, ok := strings.Cut(value, ":")
+	if !ok || algorithm == "" {
+		return parsed, fmt.Errorf("content_hash is invalid; expected %s or legacy %s", contentHashFormat, legacyContentHashFormat)
+	}
+	if algorithm == "sha256-128" {
+		if len(digest) != base64.RawURLEncoding.EncodedLen(sha256.Size/2) {
+			return parsed, fmt.Errorf("content_hash is invalid; expected %s", contentHashFormat)
+		}
+		decoded, err := base64.RawURLEncoding.DecodeString(digest)
+		if err != nil || len(decoded) != sha256.Size/2 || base64.RawURLEncoding.EncodeToString(decoded) != digest {
+			return parsed, fmt.Errorf("content_hash is invalid; expected %s", contentHashFormat)
+		}
+		copy(parsed.digest[:sha256.Size/2], decoded)
+		return parsed, nil
+	}
+	if algorithm != "sha256" {
+		return parsed, fmt.Errorf("content_hash algorithm %q is unsupported; expected %s or legacy %s", algorithm, contentHashFormat, legacyContentHashFormat)
+	}
+	if len(digest) != sha256.Size*2 {
+		return parsed, fmt.Errorf("content_hash is invalid; expected %s", legacyContentHashFormat)
+	}
+	for _, char := range digest {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+			return parsed, fmt.Errorf("content_hash is invalid; expected %s", legacyContentHashFormat)
+		}
+	}
+	decoded, err := hex.DecodeString(digest)
+	if err != nil || len(decoded) != sha256.Size {
+		return parsed, fmt.Errorf("content_hash is invalid; expected %s", legacyContentHashFormat)
+	}
+	copy(parsed.digest[:], decoded)
+	parsed.full = true
+	return parsed, nil
+}
+
+func validateContentHash(value string) error {
+	_, err := parseContentHash(value)
+	return err
+}
+
+func contentHashMatches(expected parsedContentHash, data []byte) bool {
+	current := sha256.Sum256(data)
+	if expected.full {
+		return expected.digest == current
+	}
+	return bytes.Equal(expected.digest[:sha256.Size/2], current[:sha256.Size/2])
 }
 
 func atomicWrite(path string, data []byte) error {
@@ -1366,6 +1440,11 @@ func runWriteFile(workspaceRoot string, yolo bool, args writeFileArgs) (string, 
 	if err != nil {
 		return "", err
 	}
+	editLock, err := acquireEditFileLock(resolved)
+	if err != nil {
+		return "", fmt.Errorf("write file: %w", err)
+	}
+	defer editLock.release()
 	if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
 		return "", fmt.Errorf("write file: %w", err)
 	}
@@ -1385,6 +1464,11 @@ func runAppendFile(workspaceRoot string, yolo bool, args appendFileArgs) (string
 	if err != nil {
 		return "", err
 	}
+	editLock, err := acquireEditFileLock(resolved)
+	if err != nil {
+		return "", fmt.Errorf("append file: %w", err)
+	}
+	defer editLock.release()
 	if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
 		return "", fmt.Errorf("append file: %w", err)
 	}
@@ -1408,16 +1492,29 @@ func runEditFile(workspaceRoot string, yolo bool, args editFileArgs) (string, er
 	if args.OldStr == "" {
 		return "", errors.New("edit_file old_str is required")
 	}
+	expectedHash, err := parseContentHash(args.ContentHash)
+	if err != nil {
+		return "", fmt.Errorf("edit_file %w", err)
+	}
 	resolved, err := resolvePathForTool(workspaceRoot, path, yolo)
 	if err != nil {
 		return "", err
 	}
+	editLock, err := acquireEditFileLock(resolved)
+	if err != nil {
+		return "", fmt.Errorf("edit file: %w", err)
+	}
+	defer editLock.release()
 	data, err := os.ReadFile(resolved)
 	if err != nil {
 		return "", fmt.Errorf("edit file: %w", err)
 	}
 	if len(data) > maxFileBytes {
 		return "", fmt.Errorf("edit file: file too large (%d bytes)", len(data))
+	}
+	currentHash := formatContentHash(data)
+	if !contentHashMatches(expectedHash, data) {
+		return "", fmt.Errorf("edit file: snapshot is stale for %s (expected %s, current %s); reread the file and retry with its content_hash", filepath.ToSlash(path), args.ContentHash, currentHash)
 	}
 	content := string(data)
 	count := strings.Count(content, args.OldStr)
@@ -1435,7 +1532,7 @@ func runEditFile(workspaceRoot string, yolo bool, args editFileArgs) (string, er
 	if err := atomicWrite(resolved, []byte(updated)); err != nil {
 		return "", fmt.Errorf("edit file: %w", err)
 	}
-	return fmt.Sprintf("edited %s", filepath.ToSlash(path)), nil
+	return fmt.Sprintf("edited %s\ncontent_hash: %s", filepath.ToSlash(path), formatContentHash([]byte(updated))), nil
 }
 
 type execResult struct {

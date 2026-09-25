@@ -147,3 +147,51 @@ func TestConfiguredToolRunnerSerializesClassifiedCalls(t *testing.T) {
 		}
 	}
 }
+
+func TestConfiguredToolRunnerSerializesMatchingKeysOnly(t *testing.T) {
+	calls := []contracts.ToolCall{
+		{ID: "a1", Function: contracts.FunctionCall{Name: "edit_file", Arguments: `{"path":"a.txt"}`}},
+		{ID: "a2", Function: contracts.FunctionCall{Name: "edit_file", Arguments: `{"path":"a.txt"}`}},
+		{ID: "b1", Function: contracts.FunctionCall{Name: "edit_file", Arguments: `{"path":"b.txt"}`}},
+	}
+	started := make(chan string, len(calls))
+	release := make(chan struct{})
+	runner := NewToolRunner(ToolRunnerConfig{MaxParallel: 3, Timeout: time.Second}, func(_ context.Context, call contracts.ToolCall) (string, error) {
+		started <- call.ID
+		if call.ID == "a1" || call.ID == "b1" {
+			<-release
+		}
+		return call.ID, nil
+	}, ToolRunnerHooks{
+		SerializeKey: func(call contracts.ToolCall) string {
+			return call.Function.Arguments
+		},
+	})
+
+	done := make(chan []contracts.ToolResult, 1)
+	go func() { done <- runner.Run(context.Background(), calls) }()
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for independent keyed calls")
+		}
+	}
+	select {
+	case got := <-started:
+		t.Fatalf("same-key call started before its predecessor completed: %q", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+
+	select {
+	case results := <-done:
+		for i, result := range results {
+			if result.Call.ID != calls[i].ID || result.Output != calls[i].ID {
+				t.Fatalf("result[%d]=%#v, want call/output %q", i, result, calls[i].ID)
+			}
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for keyed runner")
+	}
+}

@@ -69,6 +69,22 @@ Enable only the tools needed for a task:
 
 The assistant still operates inside the working-folder boundary. `edit_file` requires the text to be found exactly once, which helps prevent an unintended broad replacement.
 
+### Version-guarded file edits
+
+`read_file` reports a compact `sha256-128:<22-character unpadded base64url>` content hash for the complete raw file bytes. It is the first 128 bits of SHA-256, encoded without padding. The hash covers the whole file even when `start_line` or `end_line` limits the numbered text returned to the assistant. Numbered file content remains available for ordinary reading, but it is not the value that is hashed.
+
+`edit_file` requires that inspected hash in addition to `path`, `old_str`, and `new_str`. The expected hash is compared with the file immediately before the exact replacement. Guarded edits hold a per-file lock through the read, comparison, and atomic rename, so concurrent Capelin edit calls—including calls from separate Capelin processes—cannot pass the check against one version and then overwrite another version. An older call that omits the hash is rejected with a migration/retry error; it cannot fall back to an unguarded edit. The existing exact-once `old_str` check, workspace confinement, permission gate, and atomic write still apply.
+
+If the hash is stale, the edit fails without changing the file. Recover by calling `read_file` again, using the newly returned compact full-file hash, and constructing the edit against that fresh content. During migration, `edit_file` also accepts a legacy `sha256:<64 lowercase hex>` value saved by an earlier session; successful edits always return the compact format. Capelin does not automatically merge, rebase, or retry stale edits. Malformed, padded, alternate-alphabet, MD4/MD5, or otherwise unsupported hash values are rejected before mutation as well.
+
+A successful edit reports the hash of the resulting complete file. Use that post-edit hash as the expected hash for a subsequent edit to the same file.
+
+When several mutating calls target one file in the same tool batch, their compare-and-swap checks use a deterministic order. Calls based on one original hash cannot silently overwrite one another: the first matching edit can succeed and a later stale call fails, leaving the successful complete file bytes intact. Mutations for different files may still run with bounded parallelism.
+
+The canonical local tool name and permission remain `edit_file`; enable it with `--allow-tool edit_file` (or use the normal `--yolo` policy). Child assistants inherit the parent’s allowed capabilities and may only narrow them. Server mode does not expose local file tools, so it does not expose workspace content hashes or filesystem access.
+
+Per-line Hashline addressing is out of scope for this increment. There are no Hashline identifiers, line-hash ranges, relocation, or automatic conflict resolution here; edits use the full-file hash plus exact string replacement.
+
 ## Optional program execution
 
 `execute_program` is disabled by default. When enabled, it runs a named

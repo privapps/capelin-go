@@ -234,9 +234,10 @@ func TestRunEditFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runWriteFile: %v", err)
 	}
+	initialHash := rawContentHash([]byte("hello world\ngoodbye"))
 
 	// Successful edit.
-	out, err := runEditFile(root, false, editFileArgs{Path: "e.txt", OldStr: "hello world", NewStr: "hi there"})
+	out, err := runEditFile(root, false, editFileArgs{Path: "e.txt", OldStr: "hello world", NewStr: "hi there", ContentHash: initialHash})
 	if err != nil {
 		t.Fatalf("runEditFile: %v", err)
 	}
@@ -249,7 +250,7 @@ func TestRunEditFile(t *testing.T) {
 	}
 
 	// Error: old_str not found.
-	_, err = runEditFile(root, false, editFileArgs{Path: "e.txt", OldStr: "not present", NewStr: "x"})
+	_, err = runEditFile(root, false, editFileArgs{Path: "e.txt", OldStr: "not present", NewStr: "x", ContentHash: rawContentHash([]byte("hi there\ngoodbye"))})
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("expected not-found error, got: %v", err)
 	}
@@ -259,7 +260,7 @@ func TestRunEditFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runWriteFile dup: %v", err)
 	}
-	_, err = runEditFile(root, false, editFileArgs{Path: "dup.txt", OldStr: "foo", NewStr: "bar"})
+	_, err = runEditFile(root, false, editFileArgs{Path: "dup.txt", OldStr: "foo", NewStr: "bar", ContentHash: rawContentHash([]byte("foo\nfoo\n"))})
 	if err == nil || !strings.Contains(err.Error(), "times") {
 		t.Fatalf("expected duplicate-match error, got: %v", err)
 	}

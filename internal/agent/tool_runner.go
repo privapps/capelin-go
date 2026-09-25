@@ -38,6 +38,11 @@ type ToolRunnerHooks struct {
 	// Serialize identifies calls that must execute in their original response
 	// order. Calls not selected by the hook retain bounded parallel execution.
 	Serialize func(call contracts.ToolCall) bool
+	// SerializeKey identifies calls that must execute in their original response
+	// order relative to other calls with the same non-empty key. Calls with
+	// different keys retain bounded parallel execution. This is useful for
+	// compare-and-swap style mutations where only same-resource calls conflict.
+	SerializeKey func(call contracts.ToolCall) string
 	// HandleResult lets the application preserve a successful dispatch's
 	// structured output while adding application-owned result classification.
 	// The agent package does not interpret the returned result.
@@ -71,6 +76,12 @@ func (r configuredToolRunner) Run(ctx context.Context, calls []contracts.ToolCal
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.SetLimit(r.config.MaxParallel)
 	serialized := make([]bool, len(calls))
+	type keyedCall struct {
+		index int
+		call  contracts.ToolCall
+	}
+	lanes := make(map[string][]keyedCall)
+	laneOrder := make([]string, 0)
 
 	for index, call := range calls {
 		index, call := index, call
@@ -78,8 +89,28 @@ func (r configuredToolRunner) Run(ctx context.Context, calls []contracts.ToolCal
 		if serialized[index] {
 			continue
 		}
+		key := ""
+		if r.hooks.SerializeKey != nil {
+			key = r.hooks.SerializeKey(call)
+		}
+		if key != "" {
+			if _, ok := lanes[key]; !ok {
+				laneOrder = append(laneOrder, key)
+			}
+			lanes[key] = append(lanes[key], keyedCall{index: index, call: call})
+			continue
+		}
 		group.Go(func() error {
 			results[index] = r.runCall(groupCtx, call)
+			return nil
+		})
+	}
+	for _, key := range laneOrder {
+		lane := lanes[key]
+		group.Go(func() error {
+			for _, item := range lane {
+				results[item.index] = r.runCall(groupCtx, item.call)
+			}
 			return nil
 		})
 	}
