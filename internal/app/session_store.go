@@ -115,6 +115,14 @@ func (s *sessionStore) list() ([]sessionView, error) {
 	return result, nil
 }
 
+func (s *sessionStore) archive(id string) error {
+	s.syncDependencies()
+	if s == nil || s.backend == nil {
+		return errors.New("session store is unavailable")
+	}
+	return s.backend.Archive(id)
+}
+
 func (s *sessionStore) currentTime() time.Time {
 	if s == nil || s.now == nil {
 		return time.Now().UTC()
@@ -130,6 +138,13 @@ func (s *sessionStore) pathFor(id string) string {
 		return ""
 	}
 	return s.backend.Path(id)
+}
+
+func (s *sessionStore) archivedPathFor(id string) string {
+	if s == nil || s.backend == nil {
+		return ""
+	}
+	return s.backend.ArchivedPath(id)
 }
 
 func toDurableSnapshot(view sessionView) sessionpkg.Snapshot {

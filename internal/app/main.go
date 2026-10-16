@@ -251,12 +251,11 @@ func (c *client) agentProvider() agent.Provider {
 		return providers.New(providers.Config{})
 	}
 	return providers.New(providers.Config{
-		Endpoint:      c.endpoint,
-		Token:         c.token,
-		Model:         c.model,
-		Debug:         c.debug,
-		HTTP:          c.http,
-		FreeTierTools: tools.FreeTierTools,
+		Endpoint: c.endpoint,
+		Token:    c.token,
+		Model:    c.model,
+		Debug:    c.debug,
+		HTTP:     c.http,
 	})
 }
 
@@ -514,7 +513,8 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT")
 	fmt.Fprintln(w, "     TOOL_MAX_PARALLEL, TOOL_TIMEOUT_SECONDS, TOOL_RETRY_ON_TIMEOUT")
-	fmt.Fprintln(w, "Provider defaults: ENDPOINT=https://opencode.ai/zen/v1/chat/completions MODEL=deepseek-v4-flash-free TOKEN=public REASONING_EFFORT=high")
+	fmt.Fprintln(w, "Provider defaults: ENDPOINT=https://opencode.ai/zen/v1/chat/completions MODEL=deepseek-v4.1-flash-free TOKEN=public REASONING_EFFORT=high")
+	fmt.Fprintln(w, "OpenCode Zen also accepts https://opencode.ai/inference/v1/chat/completions; both exact endpoints allow an optional trailing slash. TOKEN=public enables anonymous free-tier access without an API key.")
 	fmt.Fprintln(w, "Configuration precedence: CLI flags > environment > saved config > built-in defaults")
 	fmt.Fprintln(w, "Opt-in tools (repeatable): --allow-tool write_file --allow-tool edit_file --allow-tool append_file --allow-tool execute_program --allow-tool execute_skill")
 	fmt.Fprintln(w, "Ordinary limits: root iterations 40, goal-loop baseline 20, subagent depth/parallelism/iterations 1/4/20, aggregate chars 12000, tools parallel/timeout 8/60s")
@@ -526,10 +526,12 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "Async result retention: --async-result-ttl-seconds N (env ASYNC_RESULT_TTL_SECONDS; default 3600 seconds; process-wide, restart required)")
 	fmt.Fprintln(w, "Iteration limit: --max-iterations N (ordinary default 40; goal-run default 256; env MAX_ITERATIONS; always wraps up gracefully on limit)")
 	fmt.Fprintln(w, "Goal loop limit: --max-goal-iterations N (ordinary baseline 20; goal-run default 64; env MAX_GOAL_ITERATIONS; accepted /goal only)")
-	fmt.Fprintln(w, "Interactive goal: /goal <objective> starts a fresh objective generation and checklist; bare /goal or a clear request such as 'finish the goal' resumes the current incomplete objective and its persisted checklist (requires --yolo)")
+	fmt.Fprintln(w, "Interactive goal: /goal <objective> starts a fresh objective generation and checklist; /goal resume, bare /goal, or a clear request such as 'finish the goal' continues the current unfinished goal and checklist (requires --yolo; when no unfinished goal exists, start one with /goal <objective>)")
 	fmt.Fprintln(w, "Goal completion: a completed checklist must be followed by a valid complete_goal summary and evidence claim")
 	fmt.Fprintln(w, "Context budget: --context-window N (env CONTEXT_WINDOW) proactively compacts when conversation exceeds 75% of the character budget; when unset, recovery is reactive-only (compact after overflow)")
-	fmt.Fprintln(w, "Interactive sessions: /compact, /session-new [prompt], /session-list, /session-resume [ID|PREFIX], /exit, /quit")
+	fmt.Fprintln(w, "Interactive sessions: /recap, /plan <task>, /archive, /compact, /session-new [prompt], /session-list, /session-resume [ID|PREFIX], /exit, /quit")
+	fmt.Fprintln(w, "Interactive /archive saves the current session and exits; archived sessions stay out of active lists and resume by explicit ID or unique prefix.")
+	fmt.Fprintln(w, "Interactive /recap and /plan <task> generate no-tools outputs saved in conversation history; planning does not execute the task or change a goal checklist.")
 	fmt.Fprintln(w, "Interactive /compact summarizes retained conversation history without tools; it accepts no arguments and can be cancelled.")
 	fmt.Fprintln(w, "Subagent limits (flags, env vars, or config file):")
 	fmt.Fprintln(w, "  --subagent-max-depth N              (ordinary 1; goal-run 2; env SUBAGENT_MAX_DEPTH)")
@@ -791,7 +793,12 @@ func (a *app) runInteractiveInitialQuestion(ctx context.Context, session *intera
 	// Only /goal is dispatched here; all other initial text remains an ordinary
 	// interactive turn, preserving the REPL's local-command behavior.
 	if objective, ok := leadingCommandArgument(question, "/goal"); ok {
-		stopped := a.runGoal(ctx, session, objective)
+		var stopped bool
+		if isInteractiveGoalResumeArgument(objective) {
+			stopped = a.runInteractiveGoalResume(ctx, session)
+		} else {
+			stopped = a.runGoal(ctx, session, objective)
+		}
 		a.triggerInteractiveIdleHook()
 		return stopped
 	}
@@ -807,6 +814,7 @@ func (a *app) runInteractive(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	a.replayStartupAssistantReply(session)
 	defer a.finishInteractiveIdleHook()
 	defer a.finishInteractiveSession(session)
 
@@ -1003,6 +1011,18 @@ func (a *app) handleInteractiveInput(ctx context.Context, session *interactiveSe
 			fmt.Fprintf(os.Stderr, "[capelin-go] /session-list failed: %v\n", err)
 		}
 		return false
+	case "/archive":
+		archivedID := ""
+		if session != nil {
+			archivedID = session.id
+		}
+		if err := a.archiveInteractiveSession(session); err != nil {
+			a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] /archive failed: %v", err))
+		} else {
+			a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] archived session %s; exiting interactive mode", archivedID))
+			return true
+		}
+		return false
 	case "/compact":
 		messageCount, err := a.compactAndPersistInteractiveSession(ctx, session)
 		if err != nil {
@@ -1014,6 +1034,11 @@ func (a *app) handleInteractiveInput(ctx context.Context, session *interactiveSe
 			return false
 		}
 		a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] compacted conversation to %d messages", messageCount))
+		return false
+	case "/recap":
+		if err := a.runInteractiveNoToolsTurn(ctx, session, interactiveRecapPrompt); err != nil {
+			a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] /recap failed: %v", err))
+		}
 		return false
 	case "/save":
 		if strings.TrimSpace(session.lastResponse) == "" {
@@ -1038,6 +1063,26 @@ func (a *app) handleInteractiveInput(ctx context.Context, session *interactiveSe
 			}
 			return false
 		}
+		if arg, ok := interactiveCommandArgument(input, "/recap"); ok {
+			if arg != "" {
+				a.writeInteractiveSystem("[capelin-go] /recap accepts no arguments")
+				return false
+			}
+		}
+		if arg, ok := interactiveCommandArgument(input, "/plan"); ok {
+			if arg == "" {
+				a.writeInteractiveSystem("[capelin-go] usage: /plan <task>")
+				return false
+			}
+			if err := a.runInteractiveNoToolsTurn(ctx, session, interactivePlanPrompt(arg)); err != nil {
+				a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] /plan failed: %v", err))
+			}
+			return false
+		}
+		if arg, ok := interactiveCommandArgument(input, "/archive"); ok && arg != "" {
+			a.writeInteractiveSystem("[capelin-go] /archive accepts no arguments")
+			return false
+		}
 		if arg, ok := interactiveCommandArgument(input, "/session-new"); ok {
 			if err := a.switchToNewSession(session); err != nil {
 				fmt.Fprintf(os.Stderr, "[capelin-go] /session-new failed: %v\n", err)
@@ -1051,10 +1096,15 @@ func (a *app) handleInteractiveInput(ctx context.Context, session *interactiveSe
 		if arg, ok := interactiveCommandArgument(input, "/session-resume"); ok {
 			if err := a.switchToSavedSession(session, arg); err != nil {
 				fmt.Fprintf(os.Stderr, "[capelin-go] /session-resume failed: %v\n", err)
+			} else {
+				a.replaySavedAssistantReply(session)
 			}
 			return false
 		}
 		if arg, ok := interactiveCommandArgument(input, "/goal"); ok {
+			if isInteractiveGoalResumeArgument(arg) {
+				return a.runInteractiveGoalResume(ctx, session)
+			}
 			return a.runGoal(ctx, session, arg)
 		}
 		return a.runInteractiveTurn(ctx, session, input)

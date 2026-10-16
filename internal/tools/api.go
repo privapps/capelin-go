@@ -125,30 +125,6 @@ func Build(enabled map[string]bool) []contracts.Tool {
 	return result
 }
 
-// FreeTierTools returns the small catalog that OpenCode Zen makes available
-// for its public tier. The provider chooses when to add these capabilities;
-// their names, descriptions, and schemas remain owned by the tools package.
-func FreeTierTools() []contracts.Tool {
-	return []contracts.Tool{
-		{
-			Type: "function",
-			Function: contracts.ToolSpec{
-				Name:        ReadFile,
-				Description: "Read a file from the workspace.",
-				Parameters:  map[string]any{"type": "object"},
-			},
-		},
-		{
-			Type: "function",
-			Function: contracts.ToolSpec{
-				Name:        ExecuteProgram,
-				Description: "Execute a local program directly with an explicit executable and argument vector; never invoke or parse a shell.",
-				Parameters:  map[string]any{"type": "object"},
-			},
-		},
-	}
-}
-
 // Hooks are the only application-facing part of the dispatcher. Concrete web,
 // filesystem, process, and skill execution remains owned by this package;
 // subagents and todo state are application workflows supplied as callbacks.

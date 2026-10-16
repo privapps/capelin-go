@@ -24,6 +24,11 @@ func TestFormatContentHashUsesCanonicalTruncatedSHA256(t *testing.T) {
 			data: []byte("hello"),
 			want: "sha256-128:LPJNul-wow4m6Dsqxbning",
 		},
+		{
+			name: "binary bytes",
+			data: []byte{0x00, 0xff, 0x80, 0x41, 0x0a, 0x7f},
+			want: "sha256-128:ACMg4Gu1NvyXvYT0Z-1oVg",
+		},
 	}
 
 	for _, test := range tests {

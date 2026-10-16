@@ -71,9 +71,8 @@ same bounded goal workflow as entering `/goal` at the REPL:
 ./capelin-go --interactive --yolo '/goal inspect the repository and verify the result'
 ```
 
-Other initial prompts remain ordinary interactive turns. Existing local slash
-commands such as `/save`, `/compact`, and session commands are handled only
-when entered at the REPL.
+Other initial prompts remain ordinary interactive turns. Local slash commands
+such as `/save`, `/compact`, and session commands are handled at the REPL.
 
 
 - `/exit` or `/quit` ends the session without sending a prompt to the model.
@@ -86,14 +85,28 @@ when entered at the REPL.
   skill bookkeeping, and can be cancelled. A failed or cancelled compaction
   leaves the existing session unchanged; compaction is manual and never
   automatic.
+- `/recap` asks for a fresh concise summary of the current conversation without
+  tools. A successful summary is saved as an assistant message for later turns.
+- `/plan <task>` asks for an actionable plan without tools. It does not execute
+  the task or change a goal checklist; a successful plan is saved as an
+  assistant message for later turns.
+- `/archive` saves the current conversation under
+  `.capelin-go/archived/<session-id>.json` and exits interactive mode.
+  Archived sessions disappear from `/session-list` and bare `--resume`; resume
+  one with its explicit ID or unique prefix using `--interactive --resume <id>`
+  or `/session-resume <id>`. If saving or moving the snapshot fails, the command
+  reports how to recover the existing conversation and keeps the REPL open.
 - `/session-new [prompt]` saves the current conversation and switches to a
   blank session; an optional prompt is sent as its first turn. Outstanding
   subagents from the previous conversation are asked to cancel and become
   invisible to the new one; a failed switch changes nothing.
-- `/session-list` shows full saved session IDs newest-first and marks the current
+- `/session-list` shows full active session IDs newest-first and marks the current
   session. Each row includes a label, recent direct input, message count, update
-  time, and checklist progress. `/session-resume [ID|PREFIX]` switches to an exact,
-  unique-prefix, or newest saved session.
+  time, and checklist progress. `/session-resume [ID|PREFIX]` switches to an exact
+  ID, unique prefix, or newest active session; explicit IDs and unique prefixes
+  also find archived sessions. After a successful switch, the REPL prints the
+  selected session's last successful assistant reply once, using saved state
+  and the legacy message-history fallback when needed.
 
 Local status commands use the reserved `::` namespace. They are answered
 locally from current state: they never reach the model, never append
@@ -117,6 +130,9 @@ they also work while a turn or `/goal` is running.
 - `::stats` shows portable process and runtime diagnostics.
 
 - `/goal <objective>` — start a fresh bounded objective generation and checklist; prior completion claims and the previous checklist are not inherited; requires `--yolo`
+- `/goal resume` — explicitly continue the current unfinished objective with
+  its persisted checklist and any work already recorded; if none exists, the
+  command points to `/goal <objective>`; requires `--yolo`
 - `/goal` — resume the current incomplete objective with its persisted checklist and any work already recorded; requires `--yolo`
 
 For shell automation, a quoted leading `/goal <objective>` is also supported in
@@ -137,11 +153,18 @@ succeeds. Incomplete goals retain their latest state for interactive resume
 with `--interactive --resume <id>` followed by bare `/goal`. Clear conversational
 requests such as `finish the goal` also continue a persisted active goal.
 
-Interactive sessions are saved atomically under `.capelin-go/sessions/` after
-successful turns, checklist updates, switches, and exit. The REPL prints the
-current UUID and a `--resume <id>` hint when it exits. Startup resume accepts
-`./capelin-go -i --resume [ID|PREFIX]` (a bare `--resume` selects the newest
-valid snapshot).
+Active interactive sessions are saved atomically under `.capelin-go/sessions/`
+after successful turns, checklist updates, switches, and exit. `/archive` moves
+a session snapshot to `.capelin-go/archived/`; archived snapshots stay there
+when explicitly resumed and saved again. Startup resume accepts
+`./capelin-go -i --resume [ID|PREFIX]`. A bare `--resume` selects the newest
+valid active snapshot, while an explicit ID or unique prefix can select an
+active or archived snapshot. The REPL prints the selected session's last
+successful assistant reply once before processing an optional initial prompt
+or showing the prompt. This display comes from saved state and makes no provider
+request; older snapshots fall back to their latest non-empty assistant message.
+If no assistant reply is saved, nothing is replayed. The REPL prints the
+current UUID and a `--resume <id>` hint when it exits.
 
 Goal execution is bounded: completion requires a non-empty authoritative
 checklist in which every item is `completed`, plus a valid goal-only
@@ -418,10 +441,10 @@ Enable everything (all tools + unrestricted paths):
 ## Environment variables
 
 - `--server-port PORT` (or `--server PORT`) — start HTTP server on given port (server mode)
-- `--resume [ID|PREFIX]` — resume the newest valid, exact, or unique-prefix interactive session
-- `ENDPOINT` — complete model URL (default: `https://opencode.ai/zen/v1/chat/completions`). When its URL path ends with `/responses` (with an optional trailing slash), capelin-go uses the official OpenAI Responses API schema; all other paths use Chat Completions.
-- `MODEL` — model ID (default: `deepseek-v4-flash-free`)
-- `TOKEN` — API token (default: `public`)
+- `--resume [ID|PREFIX]` — with `-i`, resume the newest valid active session or select an active or archived session by explicit ID or unique prefix
+- `ENDPOINT` — complete model URL (default: `https://opencode.ai/zen/v1/chat/completions`). OpenCode Zen also accepts `https://opencode.ai/inference/v1/chat/completions`; both exact endpoints allow an optional trailing slash. When the URL path ends with `/responses`, capelin-go uses the official OpenAI Responses API schema; all other paths use Chat Completions.
+- `MODEL` — model ID (default: `deepseek-v4.1-flash-free`)
+- `TOKEN` — API token (default: `public`, the anonymous OpenCode Zen credential that works without an API key)
 - `REASONING_EFFORT` — passed through to the model backend (default: `high`); set to `none` or `nil` to omit the field entirely from the request
 - `SYSTEM_PROMPT` (or `systemPrompt`) — prompt override
 - `SEARCH_PROVIDER` (or `--search-provider`) — hosted MCP fallback provider: `parallel` (default) or `exa`; DuckDuckGo remains the primary provider
@@ -470,7 +493,7 @@ On first run capelin-go creates `~/.local/capelin-go/config.ini` with default va
 # select it, and ordinary limits return after the goal stops.
 
 ENDPOINT = https://opencode.ai/zen/v1/chat/completions
-MODEL = deepseek-v4-flash-free
+MODEL = deepseek-v4.1-flash-free
 TOKEN = public
 REASONING_EFFORT = high
 SYSTEM_PROMPT =

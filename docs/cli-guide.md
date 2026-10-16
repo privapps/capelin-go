@@ -96,17 +96,18 @@ You can also start with a first question:
 ./capelin-go --interactive "inspect this folder and suggest a cleanup plan"
 ```
 
-A first question whose trimmed text is a leading `/goal <objective>` is
-interpreted as a goal command rather than ordinary model text and uses the same
-profile, checklist, skill preparation, status output, and completion handshake
-as an interactive `/goal` entered later:
+A first question whose trimmed text is a leading `/goal <objective>`, bare
+`/goal`, or `/goal resume` is interpreted as a goal command rather than
+ordinary model text and uses the same profile, checklist, skill preparation,
+status output, and completion handshake as an interactive `/goal` entered
+later:
 
 ```bash
 ./capelin-go --interactive --yolo '/goal inspect this folder and verify the result'
 ```
 
-Initial prompts that do not begin with `/goal` remain ordinary turns. Existing
-REPL commands such as `/save`, `/compact`, and session commands are unchanged.
+Initial prompts that are not goal commands remain ordinary turns. Other local
+slash commands are handled when entered at the REPL.
 
 Every ordinary line is sent as a new turn. Follow-up questions can refer to earlier answers without repeating the full context.
 
@@ -120,6 +121,22 @@ Every ordinary line is sent as a new turn. Follow-up questions can refer to earl
   bookkeeping, and supports the existing cancellation controls. A provider,
   validation, cancellation, or persistence failure leaves the prior session
   unchanged. Compaction is an explicit command; it is not automatic.
+- `/recap` generates a fresh concise summary of the current conversation with
+  tools unavailable. The successful summary is saved as an assistant message,
+  so later turns can refer to it. A failed or cancelled request leaves the
+  conversation unchanged.
+- `/plan <task>` creates a plan for the supplied task with tools unavailable.
+  It does not execute the task or change a goal checklist. A successful plan is
+  saved as an assistant message for later turns; a failed or cancelled request
+  leaves the conversation unchanged.
+- `/archive` saves the current conversation under
+  `.capelin-go/archived/<session-id>.json` and exits interactive mode.
+  Archived sessions are hidden from `/session-list` and bare `--resume`. Resume
+  an archived session by explicit ID or unique prefix with
+  `./capelin-go -i --resume <id>` or `/session-resume <id>`. An explicitly
+  resumed session stays archived when saved or archived again. If saving or
+  moving the snapshot fails, Capelin reports an error and keeps the current
+  REPL and conversation available by ID.
 - `/session-new [prompt]` saves the current session, creates a blank one, and
   optionally submits `prompt` as its first normal turn. A successful switch also
   retires the conversation's agent scope: outstanding subagents from the old
@@ -127,16 +144,27 @@ Every ordinary line is sent as a new turn. Follow-up questions can refer to earl
   can no longer be listed, read, run, awaited, or cancelled. If saving or
   creating the destination session fails, the current conversation, its agent
   scope, and its visible workers are left unchanged.
-- `/session-list` lists valid saved UUIDs newest-first and marks the current
+- `/session-list` lists valid active UUIDs newest-first and marks the current
   session. It also shows a deterministic label, recent direct input, message
   count, update timestamp, and checklist progress. `/session-resume [ID|PREFIX]`
-  switches to an exact ID, unique prefix, or newest valid snapshot.
+  switches to an exact ID, unique prefix, or newest active snapshot. An explicit
+  ID or unique prefix can also select an archived session. After a successful
+  switch, Capelin prints the selected session's last successful assistant reply
+  once from saved state, using the legacy message-history fallback when needed.
 - `/goal <objective>` starts a fresh objective generation and checklist:
   prior completion claims and the previous checklist are not inherited as the
-  new objective's authoritative plan. Bare `/goal` resumes the current
-  incomplete objective with its persisted checklist and any work already
-  recorded. Clear conversational requests such as `finish the goal` also
-  continue a persisted active goal. These commands require `--yolo`.
+  new objective's authoritative plan. `/goal resume` explicitly continues the
+  current unfinished objective with its persisted checklist and progress; if
+  none exists, it says so and points to `/goal <objective>`. Bare `/goal` and
+  clear conversational requests such as `finish the goal` also continue a
+  persisted active goal. These commands require `--yolo`.
+
+When starting with `--interactive --resume`, Capelin displays the selected
+session's last successful assistant reply once before processing an optional
+initial prompt or showing the REPL prompt. It uses saved state without a
+provider request or conversation change. For older snapshots without a saved
+last-response value, it displays the latest non-empty assistant message when
+available; if no assistant reply exists, startup continues without replay.
 
 ### Local status commands
 
@@ -187,10 +215,19 @@ completion offers `::agents`, `::limits`, `::session`, `::stats`, and `::todos`.
 An unrecognized `::` command is also consumed locally and answers with the list
 of available status commands.
 
-Sessions are persisted atomically in `.capelin-go/sessions/`. Use
-`--resume [ID|PREFIX]` with `-i` to resume at startup; a bare `--resume` picks
-the newest valid snapshot. On exit, Capelin prints only the current UUID and a
-`--resume <id>` continuation hint.
+`/archive` saves the current snapshot, reports its ID, and exits the interactive
+session. A failed save or move reports the recovery ID and leaves the REPL
+available. No blank session is created by archiving.
+
+Active sessions are persisted atomically in `.capelin-go/sessions/`; archived
+snapshots live in `.capelin-go/archived/`. Use `--resume [ID|PREFIX]` with
+`-i` to resume at startup. Bare `--resume` picks the newest valid active
+snapshot, while an explicit ID or unique prefix can also select an archived
+session. Archived sessions remain archived after saving. Startup resume
+displays the saved last assistant reply once before the optional initial prompt
+or REPL prompt, without making a provider request; older snapshots use the
+latest non-empty assistant message when available. On exit, Capelin prints the
+current UUID and a `--resume <id>` continuation hint.
 
 The ordinary goal-loop baseline is 20 outer iterations. An accepted goal uses
 the separate goal profile's default of 64. Set
@@ -217,7 +254,7 @@ seconds initially, then every thirty seconds) with total and current-turn elapse
 time.
 
 The four built-in provider defaults are `ENDPOINT=https://opencode.ai/zen/v1/chat/completions`,
-`MODEL=deepseek-v4-flash-free`, `TOKEN=public`, and
+`MODEL=deepseek-v4.1-flash-free`, `TOKEN=public`, and
 `REASONING_EFFORT=high`. CLI flags override environment settings, which
 override saved `config.ini` values, which override built-in defaults. Saved
 numeric values equal to the ordinary defaults are treated as generated
@@ -323,17 +360,24 @@ Settings are applied in this order, from strongest to weakest:
 3. `config.ini`;
 4. built-in defaults.
 
-Interactive session snapshots and goal checklists are stored separately under
-`.capelin-go/sessions/` in the current workspace. They are not part of the
-user-level `config.ini` file; use `/session-list` or `--resume` to access them.
+Active interactive session snapshots and goal checklists are stored under
+`.capelin-go/sessions/`; archived snapshots are stored under
+`.capelin-go/archived/` in the current workspace. They are not part of the
+user-level `config.ini` file. Use `/session-list` or bare `--resume` for active
+sessions, and resume an archived session with an explicit ID.
 
 Common settings:
+
+The OpenCode Zen provider also accepts the exact endpoint
+`https://opencode.ai/inference/v1/chat/completions`; either supported endpoint
+may end with `/`. The default `TOKEN=public` is the anonymous free-tier
+credential and does not require an API key.
 
 | Setting | Purpose | Default |
 | --- | --- | --- |
 | `ENDPOINT` | Complete AI service URL | `https://opencode.ai/zen/v1/chat/completions` |
-| `MODEL` | Model name sent to the service | `deepseek-v4-flash-free` |
-| `TOKEN` | Token for the AI service | `public` |
+| `MODEL` | Model name sent to the service | `deepseek-v4.1-flash-free` |
+| `TOKEN` | Token for the AI service; `public` works anonymously with OpenCode Zen | `public` |
 | `REASONING_EFFORT` | Reasoning setting passed to the service | `high` |
 | `SYSTEM_PROMPT` | Extra instructions for the assistant | built-in instructions |
 | `MAX_ITERATIONS` | Maximum tool-use rounds for the main task | `40` ordinary (`256` goal profile) |

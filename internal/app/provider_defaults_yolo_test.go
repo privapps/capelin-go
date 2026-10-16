@@ -18,7 +18,7 @@ func TestLoadConfigYoloKeepsOrdinaryLimitsInApplicationRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if cfg.endpoint != "https://opencode.ai/zen/v1/chat/completions" || cfg.model != "deepseek-v4-flash-free" || cfg.token != "public" || cfg.reasoning != "high" {
+	if cfg.endpoint != "https://opencode.ai/zen/v1/chat/completions" || cfg.model != "deepseek-v4.1-flash-free" || cfg.token != "public" || cfg.reasoning != "high" {
 		t.Fatalf("unexpected provider defaults: %+v", cfg)
 	}
 	if cfg.maxIterations != 40 || cfg.maxGoalIterations != 20 || cfg.toolMaxParallel != 8 || cfg.toolTimeoutSec != 60 {

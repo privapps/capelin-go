@@ -473,6 +473,20 @@ func (a *app) handleInteractiveInputAsync(
 			}
 		})
 		return false
+	case "/archive":
+		archivedID := ""
+		if session != nil {
+			archivedID = session.id
+		}
+		var err error
+		controller.withSession(func() { err = a.archiveInteractiveSession(session) })
+		if err != nil {
+			a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] /archive failed: %v", err))
+		} else {
+			a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] archived session %s; exiting interactive mode", archivedID))
+			return true
+		}
+		return false
 	case "/compact":
 		return startTurn(func(turnCtx context.Context, worker *interactiveSession) (bool, error) {
 			a.writeInteractiveSystem("[capelin-go] compacting conversation…")
@@ -487,6 +501,10 @@ func (a *app) handleInteractiveInputAsync(
 			}
 			worker.successMessage = fmt.Sprintf("[capelin-go] compacted conversation to %d messages", len(worker.messages))
 			return false, nil
+		})
+	case "/recap":
+		return startTurn(func(turnCtx context.Context, worker *interactiveSession) (bool, error) {
+			return false, a.runInteractiveNoToolsTurn(turnCtx, worker, interactiveRecapPrompt)
 		})
 	case "/save":
 		var response string
@@ -527,6 +545,23 @@ func (a *app) handleInteractiveInputAsync(
 			return false, nil
 		})
 	}
+	if arg, ok := interactiveCommandArgument(input, "/recap"); ok && arg != "" {
+		a.writeInteractiveSystem("[capelin-go] /recap accepts no arguments")
+		return false
+	}
+	if arg, ok := interactiveCommandArgument(input, "/plan"); ok {
+		if arg == "" {
+			a.writeInteractiveSystem("[capelin-go] usage: /plan <task>")
+			return false
+		}
+		return startTurn(func(turnCtx context.Context, worker *interactiveSession) (bool, error) {
+			return false, a.runInteractiveNoToolsTurn(turnCtx, worker, interactivePlanPrompt(arg))
+		})
+	}
+	if arg, ok := interactiveCommandArgument(input, "/archive"); ok && arg != "" {
+		a.writeInteractiveSystem("[capelin-go] /archive accepts no arguments")
+		return false
+	}
 	if arg, ok := interactiveCommandArgument(input, "/session-new"); ok {
 		var err error
 		controller.withSession(func() { err = a.switchToNewSession(session) })
@@ -546,11 +581,19 @@ func (a *app) handleInteractiveInputAsync(
 		controller.withSession(func() { err = a.switchToSavedSession(session, arg) })
 		if err != nil {
 			a.writeInteractiveSystem(fmt.Sprintf("[capelin-go] /session-resume failed: %v", err))
+		} else {
+			a.replaySavedAssistantReply(session)
 		}
 		return false
 	}
 	if arg, ok := interactiveCommandArgument(input, "/goal"); ok {
 		return startTurn(func(turnCtx context.Context, worker *interactiveSession) (bool, error) {
+			if isInteractiveGoalResumeArgument(arg) {
+				if !a.cfg.yolo || !hasUnfinishedInteractiveGoal(worker) {
+					worker.skipCommit = true
+				}
+				return a.runInteractiveGoalResume(turnCtx, worker), nil
+			}
 			return a.runGoal(turnCtx, worker, arg), nil
 		})
 	}

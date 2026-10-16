@@ -89,7 +89,9 @@ func TestPrintUsageDescribesProviderAndRuntimeProfileContract(t *testing.T) {
 	text := help.String()
 	for _, want := range []string{
 		"ENDPOINT=https://opencode.ai/zen/v1/chat/completions",
-		"MODEL=deepseek-v4-flash-free",
+		"MODEL=deepseek-v4.1-flash-free",
+		"https://opencode.ai/inference/v1/chat/completions",
+		"anonymous free-tier access without an API key",
 		"TOKEN=public",
 		"REASONING_EFFORT=high",
 		"MODEL_REQUEST_TIMEOUT_SECONDS",
@@ -106,6 +108,14 @@ func TestPrintUsageDescribesProviderAndRuntimeProfileContract(t *testing.T) {
 		"Saved numeric values equal to ordinary defaults are baseline values",
 		"--yolo enables permissions and path access only; it does not select goal budgets",
 		"stopping/completing a goal restores ordinary limits",
+		"/recap",
+		"/plan <task>",
+		"Interactive /archive saves the current session and exits",
+		"/archive",
+		"no-tools outputs saved in conversation history",
+		"planning does not execute the task or change a goal checklist",
+		"/goal resume",
+		"no unfinished goal exists",
 		"IDLE_HOOK_COMMAND, IDLE_HOOK_ARGS",
 		"IDLE_HOOK_MODE",
 	} {
@@ -1508,7 +1518,7 @@ func TestConfigFileCreatedWithDefaults(t *testing.T) {
 	if cfg["ENDPOINT"] != "https://opencode.ai/zen/v1/chat/completions" {
 		t.Fatalf("unexpected ENDPOINT: %q", cfg["ENDPOINT"])
 	}
-	if cfg["MODEL"] != "deepseek-v4-flash-free" {
+	if cfg["MODEL"] != "deepseek-v4.1-flash-free" {
 		t.Fatalf("unexpected MODEL: %q", cfg["MODEL"])
 	}
 	if cfg["REASONING_EFFORT"] != "high" {

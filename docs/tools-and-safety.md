@@ -73,6 +73,8 @@ The assistant still operates inside the working-folder boundary. `edit_file` req
 
 `read_file` reports a compact `sha256-128:<22-character unpadded base64url>` content hash for the complete raw file bytes. It is the first 128 bits of SHA-256, encoded without padding. The hash covers the whole file even when `start_line` or `end_line` limits the numbered text returned to the assistant. Numbered file content remains available for ordinary reading, but it is not the value that is hashed.
 
+The compact value is 33 characters, compared with 71 characters for the legacy full SHA-256 value. Repeating it in a read-to-edit exchange uses 38 fewer characters of model context. The shorter value retains only 128 bits of SHA-256, so it has a smaller collision margin than the full digest; it is intended to detect accidental stale snapshots, not to prove file identity against an adversary.
+
 `edit_file` requires that inspected hash in addition to `path`, `old_str`, and `new_str`. The expected hash is compared with the file immediately before the exact replacement. Guarded edits hold a per-file lock through the read, comparison, and atomic rename, so concurrent Capelin edit calls—including calls from separate Capelin processes—cannot pass the check against one version and then overwrite another version. An older call that omits the hash is rejected with a migration/retry error; it cannot fall back to an unguarded edit. The existing exact-once `old_str` check, workspace confinement, permission gate, and atomic write still apply.
 
 If the hash is stale, the edit fails without changing the file. Recover by calling `read_file` again, using the newly returned compact full-file hash, and constructing the edit against that fresh content. During migration, `edit_file` also accepts a legacy `sha256:<64 lowercase hex>` value saved by an earlier session; successful edits always return the compact format. Capelin does not automatically merge, rebase, or retry stale edits. Malformed, padded, alternate-alphabet, MD4/MD5, or otherwise unsupported hash values are rejected before mutation as well.
@@ -189,13 +191,18 @@ output `12000` characters, tool parallelism `8`, and a `60`-second tool
 timeout. Only an accepted `/goal` selects the larger values above.
 
 Provider defaults are `https://opencode.ai/zen/v1/chat/completions`,
-`deepseek-v4-flash-free`, `public`, and `high` for endpoint, model, token, and
+`deepseek-v4.1-flash-free`, `public`, and `high` for endpoint, model, token, and
 reasoning effort. CLI values override environment values, which override saved
 configuration, which override built-in defaults. Saved numeric values equal to
 ordinary defaults are generated baselines for goal fallback; custom saved
 values remain explicit. An active goal snapshot stores no budget-mode key:
 resuming it recomputes the current goal profile, while completing or stopping
 the goal restores ordinary limits for later turns.
+
+OpenCode Zen also accepts the exact URL
+`https://opencode.ai/inference/v1/chat/completions`, with an optional trailing
+slash on either supported endpoint. `TOKEN=public` uses anonymous free-tier
+access without requiring an API key.
 
 During long accepted-goal turns, the existing output sink emits a generic
 working heartbeat after about five seconds and every thirty seconds, including

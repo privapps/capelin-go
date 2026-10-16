@@ -33,9 +33,6 @@ type Config struct {
 	Model    string
 	Debug    bool
 	HTTP     *http.Client
-	// FreeTierTools supplies the application-owned catalog required by the
-	// public OpenCode Zen tier.
-	FreeTierTools func() []contracts.Tool
 }
 
 func IsResponsesEndpoint(endpoint string) bool {
@@ -63,7 +60,8 @@ func IsOpenCodeZenEndpoint(endpoint string) bool {
 		parsed.RawQuery == "" &&
 		!parsed.ForceQuery &&
 		parsed.Fragment == "" &&
-		(parsed.Path == "/zen/v1/chat/completions" || parsed.Path == "/zen/v1/chat/completions/")
+		(parsed.Path == "/zen/v1/chat/completions" || parsed.Path == "/zen/v1/chat/completions/" ||
+			parsed.Path == "/inference/v1/chat/completions" || parsed.Path == "/inference/v1/chat/completions/")
 }
 
 func New(cfg Config) contracts.Provider {

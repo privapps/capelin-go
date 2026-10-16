@@ -27,7 +27,7 @@ func TestZenEditFileMappingPreservesHashContract(t *testing.T) {
 			Description: "Replace an exact string using a compact or legacy full-file content hash.",
 			Parameters:  parameters,
 		},
-	}}, false, nil)
+	}}, false)
 	if err != nil {
 		t.Fatalf("map edit_file for Zen: %v", err)
 	}

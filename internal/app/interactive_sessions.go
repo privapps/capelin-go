@@ -97,6 +97,101 @@ func (a *app) startInteractiveSession() (*interactiveSession, error) {
 	return a.newInteractiveSession([]contracts.Message{{Role: "system", Content: a.systemPromptWithSkills()}})
 }
 
+// replaySavedAssistantReply presents saved assistant output without changing
+// conversation history or persistence state.
+func (a *app) replaySavedAssistantReply(session *interactiveSession) {
+	if a == nil || session == nil || a.sink == nil {
+		return
+	}
+	reply := strings.TrimSpace(session.lastResponse)
+	if reply == "" {
+		for index := len(session.messages) - 1; index >= 0; index-- {
+			message := session.messages[index]
+			if message.Role != "assistant" {
+				continue
+			}
+			if reply = strings.TrimSpace(message.Content); reply != "" {
+				break
+			}
+		}
+	}
+	if reply != "" {
+		a.sink.WriteContent(rootAgentID, reply)
+	}
+}
+
+// replayStartupAssistantReply presents saved assistant output once when
+// interactive mode starts from a persisted session.
+func (a *app) replayStartupAssistantReply(session *interactiveSession) {
+	if a == nil || (!a.cfg.resumeRequested && strings.TrimSpace(a.cfg.resumeID) == "") {
+		return
+	}
+	a.replaySavedAssistantReply(session)
+}
+
+const interactiveRecapPrompt = "Write a concise recap of the conversation so far. Include the user's goal, key decisions, completed work, and open questions or next steps. Do not use tools or take action."
+
+func interactivePlanPrompt(task string) string {
+	return "Create a clear, actionable plan for the task below. Planning only: do not execute the task, change a checklist, or use tools.\n\nTask:\n" + strings.TrimSpace(task)
+}
+
+// runInteractiveNoToolsTurn runs a recap or planning request against an
+// isolated copy of the conversation. It commits the new user and assistant
+// messages only after the provider succeeds and the resulting snapshot can be
+// saved. Interactive controller workers remain ephemeral until their normal
+// turn completion commits them.
+func (a *app) runInteractiveNoToolsTurn(ctx context.Context, session *interactiveSession, question string) error {
+	if session == nil {
+		return errors.New("interactive session is nil")
+	}
+	candidate := cloneInteractiveSession(a, session)
+	if candidate.runtime == nil {
+		candidate.runtime = a.rootRuntime()
+		a.attachInteractiveRuntime(candidate)
+	}
+	ctx = withSearchTask(ctx, nil)
+	prepared, newlyLoaded := prepareSkillPrompt(question, a.skills, candidate.loadedSkills)
+	messages, response, _, providerState, err := a.runTurnLoopWithState(
+		ctx,
+		candidate.messages,
+		prepared,
+		candidate.runtime,
+		nil,
+		true,
+		candidate.providerState,
+	)
+	if err != nil {
+		return err
+	}
+	response = strings.TrimSpace(response)
+	if response == "" {
+		return errors.New("provider returned an empty response")
+	}
+	candidate.messages = messages
+	candidate.providerState = cloneProviderState(providerState)
+	candidate.lastResponse = response
+	if len(newlyLoaded) > 0 {
+		for _, name := range newlyLoaded {
+			candidate.loadedSkills[name] = true
+		}
+	}
+	if strings.TrimSpace(question) != "" && isDirectInteractivePrompt(question) {
+		candidate.lastInput = strings.TrimSpace(question)
+		if strings.TrimSpace(candidate.topic) == "" {
+			candidate.topic = candidate.lastInput
+		}
+	}
+	if !session.ephemeral {
+		if err := a.saveInteractiveSessionCandidate(candidate); err != nil {
+			return err
+		}
+	}
+	commitInteractiveTurn(session, candidate)
+	a.attachInteractiveRuntime(session)
+	a.attachInteractiveSaver(session)
+	return nil
+}
+
 func (a *app) initializeInteractiveSession(session *interactiveSession) error {
 	if session == nil {
 		return fmt.Errorf("interactive session is nil")
@@ -321,6 +416,28 @@ func (a *app) switchToSavedSession(session *interactiveSession, selector string)
 	return nil
 }
 
+func (a *app) archiveInteractiveSession(session *interactiveSession) error {
+	if session == nil {
+		return errors.New("interactive session is nil")
+	}
+	id := strings.TrimSpace(session.id)
+	if id == "" {
+		return errors.New("current interactive session has no saved ID")
+	}
+	store, err := a.ensureSessionStore()
+	if err != nil {
+		return fmt.Errorf("open session store: %w", err)
+	}
+	if err := a.saveInteractiveSession(session); err != nil {
+		return fmt.Errorf("save session %s before archiving: %w; the current conversation remains available with --resume %s", id, err, id)
+	}
+	if err := store.archive(id); err != nil {
+		return fmt.Errorf("archive session %s: %w; the current conversation remains available with --resume %s", id, err, id)
+	}
+	a.finishAgentScopeSwitch(nil)
+	return nil
+}
+
 func (a *app) listInteractiveSessions(current *interactiveSession) error {
 	store, err := a.ensureSessionStore()
 	if err != nil {
@@ -403,6 +520,33 @@ func isDirectInteractivePrompt(content string) bool {
 	return !strings.HasPrefix(content, "Start working toward this objective:") &&
 		!strings.HasPrefix(content, "Continue working toward the objective.") &&
 		!strings.HasPrefix(content, "[SYSTEM]")
+}
+
+func isInteractiveGoalResumeArgument(argument string) bool {
+	return strings.EqualFold(strings.TrimSpace(argument), "resume")
+}
+
+func hasUnfinishedInteractiveGoal(session *interactiveSession) bool {
+	if session == nil {
+		return false
+	}
+	if session.activeGoal != nil {
+		return !validGoalCompletion(session.activeGoal, session.todos)
+	}
+	// Older snapshots can contain a checklist without objective metadata. Keep
+	// those sessions resumable through the existing legacy-goal recovery path.
+	return len(session.todos) > 0
+}
+
+func (a *app) runInteractiveGoalResume(ctx context.Context, session *interactiveSession) bool {
+	if session == nil || !a.cfg.yolo {
+		return a.runGoal(ctx, session, "")
+	}
+	if !hasUnfinishedInteractiveGoal(session) {
+		a.writeInteractiveSystem("[goal] no unfinished goal to resume; use /goal <objective> to start a goal")
+		return false
+	}
+	return a.runGoal(ctx, session, "")
 }
 
 func (a *app) runGoal(ctx context.Context, session *interactiveSession, objective string) bool {

@@ -10,7 +10,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +27,8 @@ func TestIsOpenCodeZenEndpointRequiresExactHTTPSEndpoint(t *testing.T) {
 	}{
 		{endpoint: "https://opencode.ai/zen/v1/chat/completions", want: true},
 		{endpoint: "https://opencode.ai/zen/v1/chat/completions/", want: true},
+		{endpoint: "https://opencode.ai/inference/v1/chat/completions", want: true},
+		{endpoint: "https://opencode.ai/inference/v1/chat/completions/", want: true},
 		{endpoint: "http://opencode.ai/zen/v1/chat/completions", want: false},
 		{endpoint: "https://opencode.ai:443/zen/v1/chat/completions", want: false},
 		{endpoint: "https://api.opencode.ai/zen/v1/chat/completions", want: false},
@@ -33,6 +37,7 @@ func TestIsOpenCodeZenEndpointRequiresExactHTTPSEndpoint(t *testing.T) {
 		{endpoint: "https://opencode.ai/zen/v1/chat/completions?model=free", want: false},
 		{endpoint: "https://opencode.ai/zen/v1/chat%2Fcompletions", want: false},
 		{endpoint: "https://opencode.ai/zen/v1/chat/completions?", want: false},
+		{endpoint: "https://opencode.ai/inference/v1/chat/completions?model=free", want: false},
 		{endpoint: "https://user@opencode.ai/zen/v1/chat/completions", want: false},
 		{endpoint: "https://opencode.ai.evil.example/zen/v1/chat/completions", want: false},
 	}
@@ -70,11 +75,10 @@ func TestProviderFactoryRoutesExactZenEndpointToBufferedSSEAdapter(t *testing.T)
 	defer server.Close()
 
 	provider := New(Config{
-		Endpoint:      "https://opencode.ai/zen/v1/chat/completions",
-		Token:         "public",
-		Model:         "zen-model",
-		HTTP:          zenTestClient(server.URL),
-		FreeTierTools: testFreeTierTools,
+		Endpoint: "https://opencode.ai/zen/v1/chat/completions",
+		Token:    "public",
+		Model:    "zen-model",
+		HTTP:     zenTestClient(server.URL),
 	})
 	if _, ok := provider.(*OpenCodeZen); !ok {
 		t.Fatalf("factory provider = %T, want *OpenCodeZen", provider)
@@ -103,7 +107,7 @@ func TestProviderFactoryRoutesExactZenEndpointToBufferedSSEAdapter(t *testing.T)
 	}
 	sessionPattern := regexp.MustCompile(`^ses_[0-9a-f]{12}[A-Za-z0-9]{14}$`)
 	requestPattern := regexp.MustCompile(`^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$`)
-	var sessionID, requestID string
+	var previousSessionTime, previousRequestTime uint64
 	for index, request := range requests {
 		if request.body["stream"] != true {
 			t.Errorf("request %d stream = %#v, want true", index+1, request.body["stream"])
@@ -128,8 +132,8 @@ func TestProviderFactoryRoutesExactZenEndpointToBufferedSSEAdapter(t *testing.T)
 			}
 			wireNames[name] = true
 		}
-		if !wireNames["read"] || !wireNames["bash"] {
-			t.Errorf("request %d Zen wire tools = %#v, want read and bash", index+1, wireNames)
+		if !wireNames["read"] || wireNames["bash"] || len(wireTools) != 1 {
+			t.Errorf("request %d Zen wire tools = %#v, want only an inert read compatibility tool", index+1, wireNames)
 		}
 		if request.body["model"] != "zen-model" {
 			t.Errorf("request %d model = %#v, want zen-model", index+1, request.body["model"])
@@ -158,17 +162,61 @@ func TestProviderFactoryRoutesExactZenEndpointToBufferedSSEAdapter(t *testing.T)
 		if !requestPattern.MatchString(request.header.Get("x-opencode-request")) {
 			t.Errorf("request %d request ID = %q, want msg_ ID", index+1, request.header.Get("x-opencode-request"))
 		}
-		if index == 0 {
-			sessionID = request.header.Get("x-opencode-session")
-			requestID = request.header.Get("x-opencode-request")
-		} else {
-			if request.header.Get("x-opencode-session") != sessionID {
-				t.Errorf("session changed from %q to %q", sessionID, request.header.Get("x-opencode-session"))
-			}
-			if request.header.Get("x-opencode-request") == requestID {
-				t.Errorf("request ID %q was reused", requestID)
-			}
+		sessionTime, err := strconv.ParseUint(request.header.Get("x-opencode-session")[4:16], 16, 64)
+		if err != nil {
+			t.Fatalf("parse session time field: %v", err)
 		}
+		requestTime, err := strconv.ParseUint(request.header.Get("x-opencode-request")[4:16], 16, 64)
+		if err != nil {
+			t.Fatalf("parse request time field: %v", err)
+		}
+		if sessionTime+requestTime != (uint64(1)<<48)-1 {
+			t.Errorf("request %d descending/ascending time fields = %012x/%012x, want complements", index+1, sessionTime, requestTime)
+		}
+		const encodedMillisMask = zenIDTimeMask >> 12
+		encodedMillis := requestTime >> 12
+		currentMillis := uint64(time.Now().UnixMilli()) & encodedMillisMask
+		forwardDelta := (encodedMillis - currentMillis) & encodedMillisMask
+		backwardDelta := (currentMillis - encodedMillis) & encodedMillisMask
+		if forwardDelta > 60_000 && backwardDelta > 60_000 {
+			t.Errorf("request %d ID timestamp decodes to millisecond field %012x, not near current time %012x", index+1, encodedMillis, currentMillis)
+		}
+		if index > 0 && (sessionTime >= previousSessionTime || requestTime <= previousRequestTime) {
+			t.Errorf("request %d IDs did not advance: session=%012x request=%012x after %012x/%012x", index+1, sessionTime, requestTime, previousSessionTime, previousRequestTime)
+		}
+		previousSessionTime, previousRequestTime = sessionTime, requestTime
+	}
+}
+
+func TestProviderFactoryRoutesInferenceZenEndpointToBufferedSSEAdapter(t *testing.T) {
+	var body zenRequest
+	var header http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header = r.Header.Clone()
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode inference Zen request: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	provider := New(Config{
+		Endpoint: "https://opencode.ai/inference/v1/chat/completions",
+		HTTP:     zenTestClient(server.URL),
+	})
+	if _, ok := provider.(*OpenCodeZen); !ok {
+		t.Fatalf("factory provider = %T, want *OpenCodeZen", provider)
+	}
+	if _, err := provider.Complete(context.Background(), provider.Initialize(nil, "hello"), nil, "model", ""); err != nil {
+		t.Fatalf("inference Zen completion: %v", err)
+	}
+	if !body.Stream || len(body.Tools) != 1 || body.Tools[0].Function.Name != "read" {
+		t.Fatalf("inference Zen request = %#v, want stream and one read placeholder", body)
+	}
+	if !strings.HasPrefix(header.Get("User-Agent"), "opencode/") || header.Get("x-opencode-session") == "" || header.Get("x-opencode-request") == "" {
+		t.Fatalf("inference Zen headers = %v, want OpenCode user agent and request IDs", header)
 	}
 }
 
@@ -251,8 +299,15 @@ func TestOpenCodeZenMapsWriteResponseTool(t *testing.T) {
 			t.Errorf("decode Zen request: %v", err)
 			return
 		}
-		if len(request.Tools) != 1 || request.Tools[0].Function.Name != "write" {
-			t.Errorf("wire tools = %#v, want one write tool", request.Tools)
+		if len(request.Tools) != 2 {
+			t.Errorf("wire tools = %#v, want write plus an inert read placeholder", request.Tools)
+		}
+		wireNames := map[string]bool{}
+		for _, tool := range request.Tools {
+			wireNames[tool.Function.Name] = true
+		}
+		if !wireNames["write"] || !wireNames["read"] || wireNames["bash"] {
+			t.Errorf("wire tool names = %#v, want write and inert read only", wireNames)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-write","type":"function","function":{"name":"write","arguments":"{\"filePath\":\"notes.txt\",\"content\":\"hello\"}"}}]}}]}`+"\n\ndata: [DONE]\n\n")
@@ -293,50 +348,131 @@ func TestZenToolNameMapsOpenCodeFileToolsWithoutChangingAppendSemantics(t *testi
 	}
 }
 
-func TestZenFreeTierExecuteProgramDescriptionIsDirect(t *testing.T) {
-	for _, tool := range testFreeTierTools() {
-		if tool.Function.Name != "execute_program" {
-			continue
-		}
-		for _, want := range []string{"directly", "executable", "argument vector", "never invoke or parse a shell"} {
-			if !strings.Contains(tool.Function.Description, want) {
-				t.Fatalf("execute_program description %q does not contain %q", tool.Function.Description, want)
-			}
-		}
-		return
+func TestOpenCodeZenAnonymousAndPaidToolWirePolicy(t *testing.T) {
+	readSchema := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"filePath": map[string]any{"type": "string"}},
+		"required":   []any{"filePath"},
 	}
-	t.Fatal("Zen free-tier tools did not include execute_program")
+	tests := []struct {
+		name          string
+		token         string
+		tools         []contracts.Tool
+		wantAuth      string
+		wantNames     []string
+		wantRealRead  bool
+		wantInertRead bool
+	}{
+		{name: "public without tools", token: "public", wantAuth: "Bearer public", wantNames: []string{"read"}, wantInertRead: true},
+		{name: "empty token without tools", token: "", wantNames: []string{"read"}, wantInertRead: true},
+		{name: "paid without tools", token: "paid-token", wantAuth: "Bearer paid-token"},
+		{
+			name:  "public with real read",
+			token: "public",
+			tools: []contracts.Tool{{Type: "function", Function: contracts.ToolSpec{
+				Name: "read_file", Description: "Read only an authorized file.", Parameters: readSchema,
+			}}},
+			wantAuth: "Bearer public", wantNames: []string{"read"}, wantRealRead: true,
+		},
+		{
+			name:  "paid tool mapping",
+			token: "paid-token",
+			tools: []contracts.Tool{{Type: "function", Function: contracts.ToolSpec{
+				Name: "write_file", Description: "Write an authorized file.", Parameters: map[string]any{"type": "object"},
+			}}},
+			wantAuth: "Bearer paid-token", wantNames: []string{"write"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var request map[string]any
+			var authorization string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				authorization = r.Header.Get("Authorization")
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Errorf("decode Zen request: %v", err)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				if test.wantRealRead {
+					_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-read","type":"function","function":{"name":"read","arguments":"{\"filePath\":\"notes.txt\"}"}}]},"finish_reason":"tool_calls"}]}`+"\n\ndata: [DONE]\n\n")
+					return
+				}
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+			}))
+			defer server.Close()
+
+			provider := New(Config{
+				Endpoint: "https://opencode.ai/zen/v1/chat/completions",
+				Token:    test.token,
+				HTTP:     zenTestClient(server.URL),
+			})
+			completion, err := provider.Complete(context.Background(), provider.Initialize(nil, "inspect"), test.tools, "model", "")
+			if err != nil {
+				t.Fatalf("Zen completion: %v", err)
+			}
+			if got := completion.ToolCalls(); test.wantRealRead && (len(got) != 1 || got[0].Function.Name != "read_file") {
+				t.Fatalf("real read response mapping = %#v, want read_file", got)
+			}
+			if request["stream"] != true {
+				t.Fatalf("stream = %#v, want true", request["stream"])
+			}
+			wireTools, _ := request["tools"].([]any)
+			var gotNames []string
+			for _, raw := range wireTools {
+				function := raw.(map[string]any)["function"].(map[string]any)
+				gotNames = append(gotNames, function["name"].(string))
+			}
+			if !reflect.DeepEqual(gotNames, test.wantNames) {
+				t.Fatalf("wire tool names = %#v, want %#v", gotNames, test.wantNames)
+			}
+			if authorization != test.wantAuth {
+				t.Fatalf("authorization = %q, want %q", authorization, test.wantAuth)
+			}
+			if test.wantInertRead {
+				function := wireTools[0].(map[string]any)["function"].(map[string]any)
+				if strings.TrimSpace(function["description"].(string)) == "" || function["parameters"].(map[string]any)["additionalProperties"] != false {
+					t.Fatalf("inert read schema = %#v, want a minimal closed object schema", function)
+				}
+			}
+			if test.wantRealRead {
+				function := wireTools[0].(map[string]any)["function"].(map[string]any)
+				if function["description"] != "Read only an authorized file." || !reflect.DeepEqual(function["parameters"], readSchema) {
+					t.Fatalf("real read schema changed on wire: %#v", function)
+				}
+			}
+		})
+	}
 }
 
-func TestZenPublicTierRequiresFreeTierTools(t *testing.T) {
+func TestOpenCodeZenRejectsInertReadCompatibilityCall(t *testing.T) {
+	var names []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request zenRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode Zen request: %v", err)
+			return
+		}
+		for _, tool := range request.Tools {
+			names = append(names, tool.Function.Name)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-read","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`+"\n\ndata: [DONE]\n\n")
+	}))
+	defer server.Close()
+
 	provider := New(Config{
 		Endpoint: "https://opencode.ai/zen/v1/chat/completions",
 		Token:    "public",
+		HTTP:     zenTestClient(server.URL),
 	})
-	_, err := provider.Complete(context.Background(), provider.Initialize(nil, "hello"), nil, "model", "")
-	if err == nil || !strings.Contains(err.Error(), "free-tier tool catalog is unavailable") {
-		t.Fatalf("public Zen without catalog error = %v, want explicit catalog error", err)
+	_, err := provider.Complete(context.Background(), provider.Initialize(nil, "read a file"), nil, "model", "")
+	if err == nil || !strings.Contains(err.Error(), "inert read compatibility tool") {
+		t.Fatalf("inert read call error = %v, want rejection before tool execution", err)
 	}
-}
-
-func testFreeTierTools() []contracts.Tool {
-	return []contracts.Tool{
-		{
-			Type: "function",
-			Function: contracts.ToolSpec{
-				Name:        "read_file",
-				Description: "Read a file from the workspace.",
-				Parameters:  map[string]any{"type": "object"},
-			},
-		},
-		{
-			Type: "function",
-			Function: contracts.ToolSpec{
-				Name:        "execute_program",
-				Description: "Execute a local program directly with an explicit executable and argument vector; never invoke or parse a shell.",
-				Parameters:  map[string]any{"type": "object"},
-			},
-		},
+	if !reflect.DeepEqual(names, []string{"read"}) {
+		t.Fatalf("advertised tool names = %#v, want only inert read", names)
 	}
 }
 

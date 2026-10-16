@@ -17,7 +17,7 @@ const (
 )
 
 var skillNameCommands = []string{
-	"/compact", "/exit", "/goal", "/quit", "/save",
+	"/archive", "/compact", "/exit", "/goal", "/plan", "/quit", "/recap", "/save",
 	"/session-list", "/session-new", "/session-resume",
 }
 
@@ -213,6 +213,16 @@ func (c *interactiveCompleter) Do(line []rune, pos int) ([][]rune, int) {
 	if pos > len(line) {
 		pos = len(line)
 	}
+	if tokenStart, prefix, ok := currentGoalResumeToken(line, pos); ok {
+		if strings.HasPrefix("resume", prefix) {
+			suffix := strings.TrimPrefix("resume", prefix)
+			if pos == len(line) {
+				suffix += " "
+			}
+			return [][]rune{[]rune(suffix)}, pos - tokenStart
+		}
+		return nil, 0
+	}
 
 	if tokenStart, prefix, ok := currentSlashToken(line, pos); ok {
 		return completionCandidates(prefix, skillNameCommands, tokenStart, line, pos)
@@ -224,6 +234,21 @@ func (c *interactiveCompleter) Do(line []rune, pos int) ([][]rune, int) {
 		return completionCandidates(prefix, c.skillNames, tokenStart, line, pos)
 	}
 	return nil, 0
+}
+
+func currentGoalResumeToken(line []rune, pos int) (start int, prefix string, ok bool) {
+	start = pos
+	for start > 0 && isSkillNameRune(line[start-1]) {
+		start--
+	}
+	commandEnd := start
+	for commandEnd > 0 && isInteractiveTokenBoundary(line[commandEnd-1]) {
+		commandEnd--
+	}
+	if string(line[:commandEnd]) != "/goal" || commandEnd == start {
+		return 0, "", false
+	}
+	return start, string(line[start:pos]), true
 }
 
 // currentPrefixedToken finds the leading sentinel-prefixed token at the cursor.

@@ -229,6 +229,24 @@ func TestLoadExistingConfigMissingEndpointAddsDefaultAndPreservesValues(t *testi
 
 }
 
+func TestLoadModelAndTokenEnvironmentOverridesSavedConfig(t *testing.T) {
+	path := isolateLoad(t)
+	writeConfig(t, path, map[string]string{
+		"MODEL": "saved-model",
+		"TOKEN": "saved-token",
+	})
+	t.Setenv("MODEL", "environment-model")
+	t.Setenv("TOKEN", "environment-token")
+
+	cfg, err := Load([]string{"task"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Model != "environment-model" || cfg.Token != "environment-token" {
+		t.Fatalf("environment overrides = model %q token %q; want environment values", cfg.Model, cfg.Token)
+	}
+}
+
 func TestLoadModelRequestTimeoutUsesPrecedence(t *testing.T) {
 	path := isolateLoad(t)
 	t.Setenv("MODEL_REQUEST_TIMEOUT_SECONDS", "240")

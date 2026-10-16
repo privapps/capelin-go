@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	cryptorand "crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"capelin-go/internal/contracts"
 )
@@ -22,20 +22,26 @@ const (
 	openCodeZenUserAgent = "opencode/1.18.32 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 	openCodeZenClient    = "cli"
 	openCodeZenProject   = "global"
-	zenIDRandomBytes     = 6
 	zenIDRandomChars     = 14
+	zenIDCounterMask     = 1<<12 - 1
 )
 
 const zenIDAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+const zenIDTimeMask uint64 = 1<<48 - 1
+
+var zenIDClock = struct {
+	sync.Mutex
+	lastMillis  uint64
+	counter     uint16
+	initialized bool
+}{}
 
 // OpenCodeZen adapts the OpenAI-compatible Zen endpoint. It embeds the
 // protocol-neutral Chat Completions state behavior while replacing only the
 // request/response transport with Zen's required streamed protocol.
 type OpenCodeZen struct {
 	*ChatCompletions
-
-	sessionMu sync.Mutex
-	sessionID string
 }
 
 func NewOpenCodeZen(cfg Config) *OpenCodeZen {
@@ -76,16 +82,14 @@ func (p *OpenCodeZen) Complete(ctx context.Context, state contracts.TurnState, t
 	if model == "" {
 		model = p.cfg.Model
 	}
-	sessionID, err := p.getSessionID()
+	sessionID, requestID, err := newZenIDs()
 	if err != nil {
-		return nil, fmt.Errorf("create OpenCode Zen session ID: %w", err)
-	}
-	requestID, err := newZenID("msg")
-	if err != nil {
-		return nil, fmt.Errorf("create OpenCode Zen request ID: %w", err)
+		return nil, fmt.Errorf("create OpenCode Zen request IDs: %w", err)
 	}
 
-	wireTools, responseTools, err := zenTools(tools, strings.EqualFold(strings.TrimSpace(p.cfg.Token), "public"), p.cfg.FreeTierTools)
+	token := strings.TrimSpace(p.cfg.Token)
+	anonymous := token == "" || strings.EqualFold(token, "public")
+	wireTools, responseTools, err := zenTools(tools, anonymous)
 	if err != nil {
 		return nil, err
 	}
@@ -106,33 +110,56 @@ func (p *OpenCodeZen) Complete(ctx context.Context, state contracts.TurnState, t
 	return p.completeStream(ctx, body, sessionID, requestID, responseTools)
 }
 
-func (p *OpenCodeZen) getSessionID() (string, error) {
-	p.sessionMu.Lock()
-	defer p.sessionMu.Unlock()
-	if p.sessionID == "" {
-		var err error
-		p.sessionID, err = newZenID("ses")
-		if err != nil {
-			return "", err
-		}
+func newZenIDs() (string, string, error) {
+	timeField := nextZenIDTime()
+	sessionTail, err := newZenIDRandomTail()
+	if err != nil {
+		return "", "", err
 	}
-	return p.sessionID, nil
+	requestTail, err := newZenIDRandomTail()
+	if err != nil {
+		return "", "", err
+	}
+	return fmt.Sprintf("ses_%012x%s", zenIDTimeMask-timeField, sessionTail),
+		fmt.Sprintf("msg_%012x%s", timeField, requestTail), nil
 }
 
-func newZenID(prefix string) (string, error) {
-	hexPart := make([]byte, zenIDRandomBytes)
-	if _, err := io.ReadFull(cryptorand.Reader, hexPart); err != nil {
-		return "", err
+func nextZenIDTime() uint64 {
+	// OpenCode stores Unix milliseconds in the high 36 bits and a monotonically
+	// increasing sequence counter in the low 12 bits.
+	currentMillis := uint64(time.Now().UnixMilli())
+	zenIDClock.Lock()
+	defer zenIDClock.Unlock()
+	if !zenIDClock.initialized || currentMillis > zenIDClock.lastMillis {
+		zenIDClock.lastMillis = currentMillis
+		zenIDClock.counter = 1
+		zenIDClock.initialized = true
+	} else {
+		zenIDClock.counter++
+		if zenIDClock.counter > zenIDCounterMask {
+			zenIDClock.lastMillis++
+			zenIDClock.counter = 0
+		}
 	}
-	base62Part := make([]byte, zenIDRandomChars)
-	randomBytes := make([]byte, zenIDRandomChars)
-	if _, err := io.ReadFull(cryptorand.Reader, randomBytes); err != nil {
-		return "", err
+	return ((zenIDClock.lastMillis << 12) + uint64(zenIDClock.counter)) & zenIDTimeMask
+}
+
+func newZenIDRandomTail() (string, error) {
+	result := make([]byte, zenIDRandomChars)
+	for index := range result {
+		var randomByte [1]byte
+		for {
+			if _, err := io.ReadFull(cryptorand.Reader, randomByte[:]); err != nil {
+				return "", err
+			}
+			// 248 is the largest multiple of 62 below 256, avoiding modulo bias.
+			if randomByte[0] < 248 {
+				result[index] = zenIDAlphabet[int(randomByte[0])%len(zenIDAlphabet)]
+				break
+			}
+		}
 	}
-	for index, value := range randomBytes {
-		base62Part[index] = zenIDAlphabet[int(value)%len(zenIDAlphabet)]
-	}
-	return prefix + "_" + hex.EncodeToString(hexPart) + string(base62Part), nil
+	return string(result), nil
 }
 
 func (p *OpenCodeZen) completeStream(ctx context.Context, body []byte, sessionID, requestID string, responseTools map[string]string) (contracts.Completion, error) {
@@ -322,6 +349,9 @@ func parseZenSSE(ctx context.Context, body io.Reader, responseTools map[string]s
 		if !ok {
 			return nil, fmt.Errorf("Zen SSE stream returned unsupported tool %q", call.Name)
 		}
+		if name == "" {
+			return nil, errors.New("Zen SSE stream called the inert read compatibility tool; no read capability was authorized")
+		}
 		typeName := call.Type
 		if typeName == "" {
 			typeName = "function"
@@ -351,9 +381,9 @@ func zenMessages(messages []contracts.Message, reasoning string) []chatMessage {
 	return result
 }
 
-func zenTools(tools []contracts.Tool, requireFreeTierTools bool, freeTierTools func() []contracts.Tool) ([]contracts.Tool, map[string]string, error) {
-	result := make([]contracts.Tool, 0, len(tools)+2)
-	responseTools := make(map[string]string, len(tools)+2)
+func zenTools(tools []contracts.Tool, anonymous bool) ([]contracts.Tool, map[string]string, error) {
+	result := make([]contracts.Tool, 0, len(tools)+1)
+	responseTools := make(map[string]string, len(tools)+1)
 	appendTool := func(tool contracts.Tool) error {
 		canonical := strings.TrimSpace(tool.Function.Name)
 		if canonical == "" {
@@ -376,17 +406,22 @@ func zenTools(tools []contracts.Tool, requireFreeTierTools bool, freeTierTools f
 			return nil, nil, err
 		}
 	}
-	if requireFreeTierTools {
-		if freeTierTools == nil {
-			return nil, nil, errors.New("OpenCode Zen free-tier tool catalog is unavailable")
-		}
-		for _, tool := range freeTierTools() {
-			if _, ok := responseTools[zenToolName(tool.Function.Name)]; ok {
-				continue
-			}
-			if err := appendTool(tool); err != nil {
-				return nil, nil, err
-			}
+	if anonymous {
+		if _, hasAuthorizedRead := responseTools["read"]; !hasAuthorizedRead {
+			result = append(result, contracts.Tool{
+				Type: "function",
+				Function: contracts.ToolSpec{
+					Name:        "read",
+					Description: "Compatibility placeholder. This tool is unavailable.",
+					Parameters: map[string]any{
+						"type":                 "object",
+						"properties":           map[string]any{},
+						"additionalProperties": false,
+					},
+				},
+			})
+			// An empty mapping marks the advertised compatibility tool as inert.
+			responseTools["read"] = ""
 		}
 	}
 	return result, responseTools, nil

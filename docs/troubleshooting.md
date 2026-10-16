@@ -18,9 +18,11 @@ The built-in endpoint is:
 https://opencode.ai/zen/v1/chat/completions
 ```
 
-Set `ENDPOINT`, `MODEL`, or `TOKEN` to the values for another AI service if
-needed. The built-in model is `deepseek-v4-flash-free` and the built-in token is
-`public`.
+OpenCode Zen also accepts `https://opencode.ai/inference/v1/chat/completions`;
+both exact endpoints allow an optional trailing slash. Set `ENDPOINT`, `MODEL`,
+or `TOKEN` to the values for another AI service if needed. The built-in model
+is `deepseek-v4.1-flash-free`. The built-in token is `public`, the anonymous
+free-tier credential, so a new installation can connect without an API key.
 
 ## I see `model request failed`
 

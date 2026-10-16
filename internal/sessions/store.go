@@ -20,6 +20,7 @@ import (
 const (
 	stateDir       = ".capelin-go"
 	snapshotsDir   = "sessions"
+	archivedDir    = "archived"
 	snapshotSuffix = ".json"
 )
 
@@ -175,6 +176,10 @@ func (s *Store) SetAtomicWriter(writer func(string, []byte) error) {
 
 func (s *Store) Directory() string { return filepath.Join(s.workspaceRoot, stateDir, snapshotsDir) }
 
+func (s *Store) ArchivedDirectory() string {
+	return filepath.Join(s.workspaceRoot, stateDir, archivedDir)
+}
+
 // Path returns the canonical durable path for a validated session identifier.
 // It is primarily useful to composition-layer diagnostics and tests; writes
 // still go through Save and its atomic replacement seam.
@@ -184,6 +189,14 @@ func (s *Store) Path(id string) string {
 		return ""
 	}
 	return s.pathFor(id)
+}
+
+func (s *Store) ArchivedPath(id string) string {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if !IsUUID(id) {
+		return ""
+	}
+	return s.archivedPathFor(id)
 }
 
 func (s *Store) Create(messages []contracts.Message) (Snapshot, error) {
@@ -229,14 +242,31 @@ func (s *Store) Save(snapshot Snapshot) error {
 	if err != nil {
 		return fmt.Errorf("encode session %s: %w", id, err)
 	}
-	if err := os.MkdirAll(s.Directory(), 0o700); err != nil {
+	path := s.pathFor(id)
+	directory := s.Directory()
+	archived, err := s.IsArchived(id)
+	if err != nil {
+		return fmt.Errorf("check archive state for session %s: %w", id, err)
+	}
+	if archived {
+		activeExists, err := pathExists(s.pathFor(id))
+		if err != nil {
+			return fmt.Errorf("check active session %s: %w", id, err)
+		}
+		if activeExists {
+			return fmt.Errorf("session %s exists in both active and archive storage", id)
+		}
+		path = s.archivedPathFor(id)
+		directory = s.ArchivedDirectory()
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return fmt.Errorf("create session directory: %w", err)
 	}
 	writer := s.writeAtomic
 	if writer == nil {
 		writer = func(path string, data []byte) error { return atomicWriteFile(path, data, 0o600) }
 	}
-	if err := writer(s.pathFor(id), data); err != nil {
+	if err := writer(path, data); err != nil {
 		return fmt.Errorf("save session %s: %w", id, err)
 	}
 	return nil
@@ -256,6 +286,22 @@ func (s *Store) Resolve(selector string) (Snapshot, error) {
 	if selector == "" {
 		return s.newestValid(files)
 	}
+	archivedFiles, err := sessionFilesIn(s.ArchivedDirectory(), selector)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	byID := make(map[string]sessionFile, len(files)+len(archivedFiles))
+	for _, file := range files {
+		byID[file.id] = file
+	}
+	for _, file := range archivedFiles {
+		byID[file.id] = file
+	}
+	files = files[:0]
+	for _, file := range byID {
+		files = append(files, file)
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].id < files[j].id })
 	if len(files) == 0 {
 		return Snapshot{}, fmt.Errorf("session %q not found", selector)
 	}
@@ -323,7 +369,11 @@ func (s *Store) newestValid(files []sessionFile) (Snapshot, error) {
 }
 
 func (s *Store) sessionFiles(selector string) ([]sessionFile, error) {
-	entries, err := os.ReadDir(s.Directory())
+	return sessionFilesIn(s.Directory(), selector)
+}
+
+func sessionFilesIn(directory, selector string) ([]sessionFile, error) {
+	entries, err := os.ReadDir(directory)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
@@ -343,10 +393,95 @@ func (s *Store) sessionFiles(selector string) ([]sessionFile, error) {
 		if selector != "" && !strings.HasPrefix(id, selector) {
 			continue
 		}
-		files = append(files, sessionFile{id: id, path: filepath.Join(s.Directory(), entry.Name())})
+		files = append(files, sessionFile{id: id, path: filepath.Join(directory, entry.Name())})
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].id < files[j].id })
 	return files, nil
+}
+
+// IsArchived reports whether a session's durable snapshot currently lives in
+// the archive directory. It is also used by Save so an explicitly resumed
+// archived session stays archived across later turns.
+func (s *Store) IsArchived(id string) (bool, error) {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if !IsUUID(id) {
+		return false, fmt.Errorf("invalid session UUID %q", id)
+	}
+	_, err := os.Stat(s.archivedPathFor(id))
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// Archive moves an active snapshot into the archive directory without
+// replacing an existing destination. Calling it for an already archived
+// session is idempotent.
+func (s *Store) Archive(id string) error {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if !IsUUID(id) {
+		return fmt.Errorf("invalid session UUID %q", id)
+	}
+	activePath, archivedPath := s.pathFor(id), s.archivedPathFor(id)
+	activeExists, err := pathExists(activePath)
+	if err != nil {
+		return fmt.Errorf("check active session %s: %w", id, err)
+	}
+	archivedExists, err := pathExists(archivedPath)
+	if err != nil {
+		return fmt.Errorf("check archived session %s: %w", id, err)
+	}
+	if archivedExists {
+		if activeExists {
+			return fmt.Errorf("session %s exists in both active and archive storage", id)
+		}
+		return nil
+	}
+	if !activeExists {
+		return fmt.Errorf("active session %s not found", id)
+	}
+	if err := moveFileNoReplace(activePath, archivedPath); err != nil {
+		return fmt.Errorf("archive session %s: %w", id, err)
+	}
+	return nil
+}
+
+func pathExists(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// moveFileNoReplace uses a same-filesystem hard link to atomically reserve the
+// destination without overwriting it, then removes the source. If source
+// removal fails, it removes the new link so the original remains authoritative.
+func moveFileNoReplace(source, destination string) error {
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return fmt.Errorf("create destination directory: %w", err)
+	}
+	if exists, err := pathExists(destination); err != nil {
+		return err
+	} else if exists {
+		return fs.ErrExist
+	}
+	if err := os.Link(source, destination); err != nil {
+		return err
+	}
+	if err := os.Remove(source); err != nil {
+		if rollbackErr := os.Remove(destination); rollbackErr != nil {
+			return fmt.Errorf("remove source: %w (remove destination link: %v)", err, rollbackErr)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) read(file sessionFile) (Snapshot, error) {
@@ -431,6 +566,9 @@ func cloneGoal(goal *Goal) *Goal {
 }
 
 func (s *Store) pathFor(id string) string { return filepath.Join(s.Directory(), id+snapshotSuffix) }
+func (s *Store) archivedPathFor(id string) string {
+	return filepath.Join(s.ArchivedDirectory(), id+snapshotSuffix)
+}
 func (s *Store) currentTime() time.Time {
 	if s.now == nil {
 		return time.Now().UTC()

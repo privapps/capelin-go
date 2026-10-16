@@ -674,7 +674,7 @@ func TestInteractiveCommandCompleterOffersAllCommands(t *testing.T) {
 	for _, candidate := range candidates {
 		got = append(got, string(candidate))
 	}
-	want := []string{"compact ", "exit ", "goal ", "quit ", "save ", "session-list ", "session-new ", "session-resume "}
+	want := []string{"archive ", "compact ", "exit ", "goal ", "plan ", "quit ", "recap ", "save ", "session-list ", "session-new ", "session-resume "}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected slash-command candidates: got %#v, want %#v", got, want)
 	}
@@ -682,6 +682,11 @@ func TestInteractiveCommandCompleterOffersAllCommands(t *testing.T) {
 	candidates, offset = completer.Do([]rune("/ex"), 3)
 	if offset != 3 || len(candidates) != 1 || string(candidates[0]) != "it " {
 		t.Fatalf("unique /exit completion mismatch: candidates=%q offset=%d", candidates, offset)
+	}
+
+	candidates, offset = completer.Do([]rune("/goal r"), len([]rune("/goal r")))
+	if offset != 1 || len(candidates) != 1 || string(candidates[0]) != "esume " {
+		t.Fatalf("/goal resume completion mismatch: candidates=%q offset=%d", candidates, offset)
 	}
 }
 
@@ -871,5 +876,235 @@ func TestInteractiveInitialTurnCanBeSaved(t *testing.T) {
 	}
 	if string(saved) != "ok" {
 		t.Fatalf("initial response was not saved: %q", saved)
+	}
+}
+
+func TestInteractiveResumeReplayUsesSavedReplyWithoutChangingSession(t *testing.T) {
+	tests := []struct {
+		name         string
+		messages     []types.Message
+		lastResponse string
+		want         string
+	}{
+		{
+			name: "saved last response takes precedence",
+			messages: []types.Message{
+				{Role: "system", Content: "test"},
+				{Role: "assistant", Content: "older history reply"},
+			},
+			lastResponse: "persisted last reply",
+			want:         "persisted last reply",
+		},
+		{
+			name: "legacy snapshot falls back to latest assistant text",
+			messages: []types.Message{
+				{Role: "system", Content: "test"},
+				{Role: "assistant", Content: "legacy reply"},
+				{Role: "tool", Content: "tool output"},
+				{Role: "assistant", Content: "  "},
+			},
+			want: "legacy reply",
+		},
+		{
+			name: "no assistant text produces no replay",
+			messages: []types.Message{
+				{Role: "system", Content: "test"},
+				{Role: "user", Content: "last user input"},
+				{Role: "tool", Content: "tool output"},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testApp := newInteractiveTurnTestApp(t)
+			session, err := testApp.app.newInteractiveSession(test.messages)
+			if err != nil {
+				t.Fatal(err)
+			}
+			session.lastResponse = test.lastResponse
+			if err := testApp.app.saveInteractiveSession(session); err != nil {
+				t.Fatal(err)
+			}
+			store, err := testApp.app.ensureSessionStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := store.pathFor(session.id)
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			originalMessages := cloneMessages(session.messages)
+			originalResponse := session.lastResponse
+
+			var output []string
+			testApp.app.sink.(*spySink).onContent = func(content string) { output = append(output, content) }
+			testApp.app.cfg.resumeRequested = true
+			testApp.app.replayStartupAssistantReply(session)
+
+			if test.want == "" {
+				if len(output) != 0 {
+					t.Fatalf("unexpected replay output: %#v", output)
+				}
+			} else if !reflect.DeepEqual(output, []string{test.want}) {
+				t.Fatalf("replay output = %#v, want one %q", output, test.want)
+			}
+			if got := testApp.userPrompts(); len(got) != 0 {
+				t.Fatalf("resume replay made a provider request: %#v", got)
+			}
+			if !reflect.DeepEqual(session.messages, originalMessages) || session.lastResponse != originalResponse {
+				t.Fatalf("resume replay mutated session state: messages=%#v lastResponse=%q", session.messages, session.lastResponse)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatalf("resume replay changed saved snapshot:\nbefore %s\nafter  %s", before, after)
+			}
+		})
+	}
+}
+
+func TestInteractiveStartupResumeReplaysBeforeInitialPrompt(t *testing.T) {
+	testApp := newInteractiveTurnTestApp(t)
+	var eventsMu sync.Mutex
+	var events []string
+	appendEvent := func(event string) {
+		eventsMu.Lock()
+		events = append(events, event)
+		eventsMu.Unlock()
+	}
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		appendEvent("provider request")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"follow-up answer"}}]}`)
+	}))
+	defer provider.Close()
+	testApp.app.client.endpoint = provider.URL
+	testApp.app.client.http = provider.Client()
+	testApp.app.sink.(*spySink).onContent = func(content string) { appendEvent("content: " + content) }
+
+	store, err := newSessionStore(testApp.workspaceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.create([]types.Message{
+		{Role: "system", Content: "test"},
+		{Role: "user", Content: "previous question"},
+		{Role: "assistant", Content: "history reply"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.LastContent = "saved last reply"
+	if err := store.save(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	testApp.app.cfg.resumeRequested = true
+	testApp.app.cfg.resumeID = snapshot.SessionUUID
+	testApp.app.cfg.initialQuestion = "follow up now"
+
+	stdin, input, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := input.WriteString("/exit\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := input.Close(); err != nil {
+		t.Fatal(err)
+	}
+	originalStdin := os.Stdin
+	os.Stdin = stdin
+	t.Cleanup(func() {
+		os.Stdin = originalStdin
+		_ = stdin.Close()
+	})
+	if err := testApp.app.runInteractive(context.Background()); err != nil {
+		t.Fatalf("interactive startup failed: %v", err)
+	}
+
+	eventsMu.Lock()
+	gotEvents := append([]string(nil), events...)
+	eventsMu.Unlock()
+	wantEvents := []string{"content: saved last reply", "provider request", "content: follow-up answer"}
+	if !reflect.DeepEqual(gotEvents, wantEvents) {
+		t.Fatalf("startup output/request order = %#v, want %#v", gotEvents, wantEvents)
+	}
+}
+
+func TestInteractiveStartupResumeReplaysForExactPrefixAndNewestSelection(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		selector func(firstID, secondID string) string
+		want     string
+	}{
+		{
+			name: "exact ID",
+			selector: func(firstID, _ string) string {
+				return firstID
+			},
+			want: "first saved reply",
+		},
+		{
+			name: "unique prefix",
+			selector: func(firstID, secondID string) string {
+				common := 0
+				for common < len(firstID) && firstID[common] == secondID[common] {
+					common++
+				}
+				return secondID[:common+1]
+			},
+			want: "second saved reply",
+		},
+		{
+			name:     "newest without selector",
+			selector: func(_, _ string) string { return "" },
+			want:     "second saved reply",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testApp := newInteractiveTurnTestApp(t)
+			store, err := newSessionStore(testApp.workspaceRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+			store.now = func() time.Time { return now }
+			first, err := store.create([]types.Message{
+				{Role: "system", Content: "test"},
+				{Role: "assistant", Content: "first saved reply"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			now = now.Add(time.Minute)
+			second, err := store.create([]types.Message{
+				{Role: "system", Content: "test"},
+				{Role: "assistant", Content: "second saved reply"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			testApp.app.sessionStore = store
+			testApp.app.cfg.resumeRequested = true
+			testApp.app.cfg.resumeID = test.selector(first.SessionUUID, second.SessionUUID)
+
+			session, err := testApp.app.startInteractiveSession()
+			if err != nil {
+				t.Fatalf("start resumed session: %v", err)
+			}
+			var output []string
+			testApp.app.sink.(*spySink).onContent = func(content string) { output = append(output, content) }
+			testApp.app.replayStartupAssistantReply(session)
+			if !reflect.DeepEqual(output, []string{test.want}) {
+				t.Fatalf("replay output = %#v, want one %q", output, test.want)
+			}
+			if got := testApp.userPrompts(); len(got) != 0 {
+				t.Fatalf("resume replay made a provider request: %#v", got)
+			}
+		})
 	}
 }

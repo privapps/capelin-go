@@ -17,7 +17,7 @@ import (
 
 const (
 	defaultEndpoint      = "https://opencode.ai/zen/v1/chat/completions"
-	defaultModel         = "deepseek-v4-flash-free"
+	defaultModel         = "deepseek-v4.1-flash-free"
 	defaultReasoning     = "high"
 	defaultMaxIterations = 40
 )
@@ -29,7 +29,7 @@ const defaultConfigFileContent = `# capelin-go configuration
 # Priority: CLI flags > environment variables > this file > built-in defaults.
 
 ENDPOINT = https://opencode.ai/zen/v1/chat/completions
-MODEL = deepseek-v4-flash-free
+MODEL = deepseek-v4.1-flash-free
 TOKEN = public
 REASONING_EFFORT = high
 SYSTEM_PROMPT =

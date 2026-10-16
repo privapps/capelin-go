@@ -65,6 +65,7 @@ func TestFileToolReadReportsFullContentHashAndKeepsLineRanges(t *testing.T) {
 		{name: "trailing newline", content: []byte("alpha\n"), lines: "1. alpha\n2. "},
 		{name: "unicode", content: []byte("héllo 世界"), lines: "1. héllo 世界"},
 		{name: "crlf", content: []byte("first\r\nsecond\r\n"), lines: "1. first\r\n2. second\r\n3. "},
+		{name: "binary bytes", content: []byte{0x00, 0xff, 0x80, 0x41, 0x0a, 0x7f}, lines: "1. \x00\xff\x80A\n2. \x7f"},
 		{name: "line range", content: []byte("one\ntwo\nthree\n"), startLine: 2, endLine: 2, lines: "2. two"},
 	}
 

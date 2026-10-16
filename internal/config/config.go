@@ -17,7 +17,7 @@ import (
 
 const (
 	defaultEndpoint               = "https://opencode.ai/zen/v1/chat/completions"
-	defaultModel                  = "deepseek-v4-flash-free"
+	defaultModel                  = "deepseek-v4.1-flash-free"
 	defaultToken                  = "public"
 	defaultReasoning              = "high"
 	defaultMaxIterations          = 40
@@ -1202,7 +1202,7 @@ const defaultConfigFileContent = `# capelin-go configuration
 # not select that profile, and ordinary limits return after the goal stops.
 
 ENDPOINT = https://opencode.ai/zen/v1/chat/completions
-MODEL = deepseek-v4-flash-free
+MODEL = deepseek-v4.1-flash-free
 TOKEN = public
 REASONING_EFFORT = high
 SYSTEM_PROMPT =
