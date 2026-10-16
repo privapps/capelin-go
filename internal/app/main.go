@@ -227,6 +227,10 @@ type interactiveSession struct {
 	goalCompleted  bool
 	successMessage string
 	skipCommit     bool
+	// archivedForExit is transient state set only after /archive has saved and
+	// moved this session successfully. Interactive shutdown uses it to avoid
+	// writing the archived snapshot again or advertising it as active.
+	archivedForExit bool
 
 	// autoCompactionCount tracks successful automatic compactions within a
 	// single goal run. The goal loop caps this at maxGoalAutoCompactions.
@@ -905,9 +909,7 @@ func (a *app) runInteractiveReadlineSession(ctx context.Context, session *intera
 		draftRestorer.wait()
 		close(promptUpdates)
 		<-promptUpdatesDone
-		if err := a.saveInteractiveSession(session); err != nil {
-			fmt.Fprintf(os.Stderr, "[capelin-go] warning: could not save session: %v\n", err)
-		}
+		a.persistInteractiveSessionAtShutdown(session)
 		a.finishInteractiveIdleHook()
 	}()
 	monitorDone := make(chan struct{})
@@ -969,9 +971,7 @@ func (a *app) runInteractiveFallbackSession(ctx context.Context, session *intera
 	)
 	defer func() {
 		controller.wait()
-		if err := a.saveInteractiveSession(session); err != nil {
-			fmt.Fprintf(os.Stderr, "[capelin-go] warning: could not save session: %v\n", err)
-		}
+		a.persistInteractiveSessionAtShutdown(session)
 		a.finishInteractiveIdleHook()
 	}()
 	monitorDone := make(chan struct{})

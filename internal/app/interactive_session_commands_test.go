@@ -5,6 +5,7 @@ import (
 	"capelin-go/internal/types"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -17,6 +18,27 @@ func recordedInteractiveRequests(testApp *interactiveTurnTestApp) []types.Reques
 	testApp.mu.Lock()
 	defer testApp.mu.Unlock()
 	return append([]types.Request(nil), testApp.requests...)
+}
+
+func finishInteractiveSessionAndCaptureStderr(t *testing.T, testApp *interactiveTurnTestApp, session *interactiveSession) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousStderr := os.Stderr
+	os.Stderr = writer
+	testApp.app.finishInteractiveSession(session)
+	os.Stderr = previousStderr
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(output)
 }
 
 func TestInteractiveRecapAndPlanCommandsPersistWithoutTools(t *testing.T) {
@@ -334,11 +356,28 @@ func TestInteractiveArchiveCommandExitsWithoutCreatingReplacement(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	unrelated, err := testApp.app.newInteractiveSession([]types.Message{
+		{Role: "system", Content: "test"},
+		{Role: "user", Content: "keep this other session active"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	session.lastResponse = "saved final answer"
 	originalID := session.id
 	store, err := testApp.app.ensureSessionStore()
 	if err != nil {
 		t.Fatal(err)
+	}
+	unrelatedPath := store.pathFor(unrelated.id)
+	unrelatedBefore, err := os.ReadFile(unrelatedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writes := 0
+	store.writeAtomic = func(path string, data []byte) error {
+		writes++
+		return os.WriteFile(path, data, 0o600)
 	}
 	var successMessage string
 	testApp.app.sink.(*spySink).onSystem = func(message string) {
@@ -366,6 +405,9 @@ func TestInteractiveArchiveCommandExitsWithoutCreatingReplacement(t *testing.T) 
 	if !strings.Contains(successMessage, "exiting interactive mode") {
 		t.Fatalf("archive success message = %q, want archived ID and exit notice", successMessage)
 	}
+	if strings.Contains(successMessage, "resume with --resume") {
+		t.Fatalf("archive confirmation included the generic resume hint: %q", successMessage)
+	}
 	if _, err := os.Stat(store.pathFor(originalID)); !os.IsNotExist(err) {
 		t.Fatalf("archived session remains active after exit cleanup: %v", err)
 	}
@@ -373,11 +415,65 @@ func TestInteractiveArchiveCommandExitsWithoutCreatingReplacement(t *testing.T) 
 		t.Fatalf("archive snapshot missing after exit cleanup: %v", err)
 	}
 	active, err := store.list()
-	if err != nil || len(active) != 0 {
-		t.Fatalf("active sessions after /archive = %#v err=%v, want none", active, err)
+	if err != nil || len(active) != 1 || active[0].SessionUUID != unrelated.id {
+		t.Fatalf("active sessions after /archive = %#v err=%v, want only unrelated session %s", active, err, unrelated.id)
 	}
-	if _, err := store.resolve(""); err == nil {
-		t.Fatal("bare resume found a replacement session after /archive")
+	unrelatedAfter, err := os.ReadFile(unrelatedPath)
+	if err != nil || !bytes.Equal(unrelatedBefore, unrelatedAfter) {
+		t.Fatalf("archiving changed unrelated session snapshot: err=%v", err)
+	}
+	if writes != 1 {
+		t.Fatalf("session persistence writes through REPL shutdown = %d, want only the archive save", writes)
+	}
+	resolved, err := store.resolve(originalID)
+	if err != nil || resolved.SessionUUID != originalID {
+		t.Fatalf("archived session could not be resumed by explicit ID: snapshot=%#v err=%v", resolved, err)
+	}
+	stderr := finishInteractiveSessionAndCaptureStderr(t, testApp, session)
+	if strings.Contains(stderr, "resume with --resume") {
+		t.Fatalf("outer shutdown printed generic resume hint after archive: %q", stderr)
+	}
+	if writes != 1 {
+		t.Fatalf("outer shutdown saved archived session again: writes=%d", writes)
+	}
+}
+
+func TestInteractiveExitAndQuitKeepSavingResumeHints(t *testing.T) {
+	for _, command := range []string{"/exit", "/quit"} {
+		t.Run(command, func(t *testing.T) {
+			testApp := newInteractiveTurnTestApp(t)
+			session, err := testApp.app.newInteractiveSession([]types.Message{{Role: "system", Content: "test"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			session.lastResponse = "saved before ordinary exit"
+			store, err := testApp.app.ensureSessionStore()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			pipe, done := startInteractiveSessionPipe(t, testApp, session, "")
+			pipe.send(command + "\r")
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("interactive %s loop: %v", command, err)
+				}
+			case <-time.After(2 * time.Second):
+				_ = pipe.Close()
+				<-done
+				t.Fatalf("%s did not exit interactive mode", command)
+			}
+
+			stderr := finishInteractiveSessionAndCaptureStderr(t, testApp, session)
+			if !strings.Contains(stderr, "session "+session.id+"; resume with --resume "+session.id) {
+				t.Fatalf("%s shutdown output omitted resume hint: %q", command, stderr)
+			}
+			snapshot, err := store.resolve(session.id)
+			if err != nil || snapshot.LastContent != "saved before ordinary exit" {
+				t.Fatalf("%s did not preserve its active snapshot: snapshot=%#v err=%v", command, snapshot, err)
+			}
+		})
 	}
 }
 

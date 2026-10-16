@@ -340,10 +340,22 @@ func (a *app) finishInteractiveSession(session *interactiveSession) {
 	if session == nil || strings.TrimSpace(session.id) == "" {
 		return
 	}
+	if session.archivedForExit {
+		return
+	}
 	if err := a.saveInteractiveSession(session); err != nil {
 		fmt.Fprintf(os.Stderr, "[capelin-go] warning: could not save session %s: %v\n", session.id, err)
 	}
 	fmt.Fprintf(os.Stderr, "[capelin-go] session %s; resume with --resume %s\n", session.id, session.id)
+}
+
+func (a *app) persistInteractiveSessionAtShutdown(session *interactiveSession) {
+	if session == nil || session.archivedForExit {
+		return
+	}
+	if err := a.saveInteractiveSession(session); err != nil {
+		fmt.Fprintf(os.Stderr, "[capelin-go] warning: could not save session: %v\n", err)
+	}
 }
 
 func (a *app) switchToNewSession(session *interactiveSession) error {
@@ -435,6 +447,7 @@ func (a *app) archiveInteractiveSession(session *interactiveSession) error {
 		return fmt.Errorf("archive session %s: %w; the current conversation remains available with --resume %s", id, err, id)
 	}
 	a.finishAgentScopeSwitch(nil)
+	session.archivedForExit = true
 	return nil
 }
 
