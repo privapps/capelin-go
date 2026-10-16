@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"capelin-go/internal/contracts"
 )
@@ -516,5 +517,54 @@ func TestToolContinuationIncludesBoundedRecoveryAudit(t *testing.T) {
 		if !strings.Contains(content, want) {
 			t.Fatalf("tool continuation missing %q: %s", want, content)
 		}
+	}
+}
+
+func TestProvidersApplyConfiguredToolResultCap(t *testing.T) {
+	call := contracts.ToolCall{
+		ID: "call-cap", Type: "function",
+		Function: contracts.FunctionCall{Name: "lookup", Arguments: `{}`},
+	}
+	for _, tc := range []struct {
+		name     string
+		provider contracts.Provider
+	}{
+		{name: "chat completions", provider: NewChatCompletions(Config{ToolOutputMaxBytes: 6})},
+		{name: "responses", provider: NewResponses(Config{ToolOutputMaxBytes: 6})},
+		{name: "OpenCode Zen", provider: NewOpenCodeZen(Config{ToolOutputMaxBytes: 6})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := tc.provider.Initialize(nil, "inspect")
+			tc.provider.ApplyToolResults(state, []contracts.ToolResult{{Call: call, Output: "é😃abc"}})
+			messages := state.Messages()
+			if len(messages) != 2 {
+				t.Fatalf("messages=%d, want user plus tool result", len(messages))
+			}
+			got := messages[1].Content
+			if want := "é😃[truncated: 3 bytes]"; got != want {
+				t.Fatalf("tool result = %q, want %q", got, want)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("tool result is invalid UTF-8: %q", got)
+			}
+		})
+	}
+}
+
+func TestTruncateToolOutputUsesDefaultWhenLimitIsUnset(t *testing.T) {
+	input := strings.Repeat("x", defaultToolOutputMaxBytes+1)
+	got := truncateToolOutput(input, 0)
+	want := strings.Repeat("x", defaultToolOutputMaxBytes) + "[truncated: 1 bytes]"
+	if got != want {
+		t.Fatalf("default-limited result length=%d, want %d", len(got), len(want))
+	}
+}
+
+func TestTruncateToolOutputDefaultCountsBytesForMultibyteText(t *testing.T) {
+	input := strings.Repeat("é", defaultToolOutputMaxBytes/2+1)
+	got := truncateToolOutput(input, 0)
+	want := strings.Repeat("é", defaultToolOutputMaxBytes/2) + "[truncated: 2 bytes]"
+	if got != want {
+		t.Fatalf("default-limited multibyte result length=%d, want %d", len(got), len(want))
 	}
 }

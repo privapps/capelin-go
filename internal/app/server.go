@@ -56,7 +56,7 @@ func startServer(cfg config) error {
 	serverCfg.allowedTools = cloneAllowedTools(serverAllowedTools)
 	a := &app{
 		cfg:       serverCfg,
-		client:    &client{endpoint: strings.TrimRight(cfg.endpoint, "/"), token: cfg.token, model: cfg.model, reasoning: cfg.reasoning, debug: cfg.debug, http: cfg.securityPolicy.secureHTTPClient()},
+		client:    &client{endpoint: strings.TrimRight(cfg.endpoint, "/"), token: cfg.token, model: cfg.model, reasoning: cfg.reasoning, debug: cfg.debug, http: cfg.securityPolicy.secureHTTPClient(), toolOutputMaxBytes: cfg.toolOutputMaxBytes},
 		toolset:   buildAgentTools(serverAllowedTools),
 		dataStore: newDataStore(),
 	}

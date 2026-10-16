@@ -62,7 +62,7 @@ func (a *app) newServerExecutionApp(execution *server.ExecutionRequest) (*app, *
 	}
 	serverApp := &app{
 		cfg:       serverCfg,
-		client:    &client{endpoint: strings.TrimRight(execution.RemoteBase, "/"), token: execution.RemoteToken, model: execution.Model, reasoning: execution.Reasoning, debug: a.cfg.debug, http: httpClient},
+		client:    &client{endpoint: strings.TrimRight(execution.RemoteBase, "/"), token: execution.RemoteToken, model: execution.Model, reasoning: execution.Reasoning, debug: a.cfg.debug, http: httpClient, toolOutputMaxBytes: a.cfg.toolOutputMaxBytes},
 		fetchHTTP: httpClient,
 		skills:    a.skills,
 		toolset:   buildAgentTools(execution.AllowedTools),

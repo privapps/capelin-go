@@ -24,6 +24,12 @@ Example:
 
 Search is limited to a manageable number of results per search. Ask for a focused question when you need better results.
 
+Tool results sent back to the model are capped at 16000 UTF-8 bytes by
+default. Set `TOOL_OUTPUT_MAX_BYTES` or `--tool-output-max-bytes N` to change
+the retained prefix limit. A truncation marker reports the omitted byte count
+when a result is longer. This cap applies to provider conversation history;
+the terminal tool-status preview has its own display limit.
+
 ### Read a public page
 
 Ask the assistant to open a known public URL. HTML pages are converted into readable text; other public content is returned as text when possible.

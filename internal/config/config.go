@@ -25,6 +25,7 @@ const (
 	defaultModelRequestTimeoutSec = 300
 	defaultToolMaxParallel        = 8
 	defaultToolTimeoutSec         = 60
+	defaultToolOutputMaxBytes     = 16000
 	defaultToolRetryOnTimeout     = true
 	defaultAsyncTimeoutSeconds    = 15 * 60
 	defaultAsyncResultTTLSeconds  = 60 * 60
@@ -128,6 +129,7 @@ type Config struct {
 	IdleHookSource            string // "" or "cli"/"env"/"saved"
 	ToolMaxParallel           int    // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
 	ToolTimeoutSec            int    // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
+	ToolOutputMaxBytes        int    // maximum UTF-8 bytes retained from each tool result in provider history
 	ToolRetryOnTimeout        bool   // retry once on timeout (0 = disable; empty = default true)
 	ContextWindow             int    // optional conversation budget in characters; 0 = disabled (reactive-only recovery)
 	AgentQuestionPreviewMax   int    // rune budget for rendered question previews (env AGENT_QUESTION_PREVIEW_MAX; default 160)
@@ -164,6 +166,10 @@ const (
 // outside this package (for example the ::limits status view) report the same
 // budget the runtime applies instead of duplicating the literal.
 const DefaultAgentQuestionPreviewMax = 160
+
+// DefaultToolOutputMaxBytes is the default number of UTF-8 bytes retained from
+// each tool result before its truncation marker is appended.
+const DefaultToolOutputMaxBytes = defaultToolOutputMaxBytes
 
 const (
 	IdleHookModeDetached = "detached"
@@ -311,6 +317,7 @@ func Load(args []string) (Config, error) {
 	subagentCfg := SubagentConfig{} // zero = "not set by flag"; env/file/normalize fills gaps
 	toolMaxParallel := 0            // zero = "not set by flag"
 	toolTimeoutSec := 0             // zero = "not set by flag"
+	toolOutputMaxBytes := 0         // zero = "not set by flag"
 	toolRetryOnTimeout := -1        // -1 = "not set by flag"; 0 = explicitly false; 1 = explicitly true
 	contextWindow := 0              // zero = "not set"
 	idleHookFlag := ""
@@ -660,6 +667,24 @@ func Load(args []string) (Config, error) {
 			}
 			toolTimeoutSec = value
 			numericFlags["TOOL_TIMEOUT_SECONDS"] = true
+		case arg == "--tool-output-max-bytes":
+			if i+1 >= len(args) {
+				return Config{}, errors.New("--tool-output-max-bytes requires a value")
+			}
+			i++
+			value, err := parsePositiveInt(args[i], "--tool-output-max-bytes")
+			if err != nil {
+				return Config{}, err
+			}
+			toolOutputMaxBytes = value
+			numericFlags["TOOL_OUTPUT_MAX_BYTES"] = true
+		case strings.HasPrefix(arg, "--tool-output-max-bytes="):
+			value, err := parsePositiveInt(strings.TrimPrefix(arg, "--tool-output-max-bytes="), "--tool-output-max-bytes")
+			if err != nil {
+				return Config{}, err
+			}
+			toolOutputMaxBytes = value
+			numericFlags["TOOL_OUTPUT_MAX_BYTES"] = true
 		case arg == "--tool-retry-on-timeout":
 			toolRetryOnTimeout = 1
 		case arg == "--no-tool-retry-on-timeout":
@@ -845,6 +870,10 @@ func Load(args []string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	toolOutputMaxBytes, _, err = resolvePositiveSetting("TOOL_OUTPUT_MAX_BYTES", toolOutputMaxBytes, numericFlags["TOOL_OUTPUT_MAX_BYTES"], fileCfg, defaultToolOutputMaxBytes)
+	if err != nil {
+		return Config{}, err
+	}
 	modelRequestTimeoutSec, _, err = resolvePositiveSetting("MODEL_REQUEST_TIMEOUT_SECONDS", modelRequestTimeoutSec, numericFlags["MODEL_REQUEST_TIMEOUT_SECONDS"], fileCfg, defaultModelRequestTimeoutSec)
 	if err != nil {
 		return Config{}, err
@@ -943,6 +972,7 @@ func Load(args []string) (Config, error) {
 		IdleHookSource:            idleHookSource,
 		ToolMaxParallel:           toolMaxParallel,
 		ToolTimeoutSec:            toolTimeoutSec,
+		ToolOutputMaxBytes:        toolOutputMaxBytes,
 		ToolRetryOnTimeout:        toolRetryOnTimeout != 0,
 		ContextWindow:             contextWindow,
 		AgentQuestionPreviewMax:   agentQuestionPreviewMax,
@@ -1231,10 +1261,12 @@ SUBAGENT_MAX_ITERATIONS = 20
 SUBAGENT_MODEL =
 SUBAGENT_REASONING_EFFORT =
 
-# Parallel tool execution (env vars: TOOL_MAX_PARALLEL, TOOL_TIMEOUT_SECONDS, TOOL_RETRY_ON_TIMEOUT)
-# Empty = default (8). Also settable via CLI flags.
+# Tool execution limits (env vars: TOOL_MAX_PARALLEL, TOOL_TIMEOUT_SECONDS,
+# TOOL_OUTPUT_MAX_BYTES, TOOL_RETRY_ON_TIMEOUT; also settable via CLI flags).
+# Empty = default (8) for tool parallelism and 16000 for result bytes.
 TOOL_MAX_PARALLEL = 8
 TOOL_TIMEOUT_SECONDS = 60
+TOOL_OUTPUT_MAX_BYTES = 16000
 TOOL_RETRY_ON_TIMEOUT = true
 
 # Local idle hook. Detached mode launches the program and does not wait for it;

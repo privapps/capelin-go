@@ -33,6 +33,9 @@ type Config struct {
 	Model    string
 	Debug    bool
 	HTTP     *http.Client
+	// ToolOutputMaxBytes bounds the number of UTF-8 bytes retained from each
+	// tool result before a truncation marker is appended. Zero uses the default.
+	ToolOutputMaxBytes int
 }
 
 func IsResponsesEndpoint(endpoint string) bool {
@@ -241,7 +244,7 @@ func (p *ChatCompletions) ApplyResponse(state contracts.TurnState, response cont
 func (p *ChatCompletions) ApplyToolResults(state contracts.TurnState, results []contracts.ToolResult) {
 	s := state.(*chatState)
 	for _, result := range results {
-		s.messages = append(s.messages, contracts.Message{Role: "tool", ToolCallID: result.Call.ID, Content: truncateToolOutput(toolResultOutput(result))})
+		s.messages = append(s.messages, contracts.Message{Role: "tool", ToolCallID: result.Call.ID, Content: truncateToolOutput(toolResultOutput(result), p.cfg.ToolOutputMaxBytes)})
 	}
 }
 func (*ChatCompletions) AppendUserPrompt(state contracts.TurnState, content string) {
@@ -401,7 +404,7 @@ func (p *Responses) ApplyResponse(state contracts.TurnState, response contracts.
 func (p *Responses) ApplyToolResults(state contracts.TurnState, results []contracts.ToolResult) {
 	s := state.(*responsesState)
 	for _, result := range results {
-		output := truncateToolOutput(toolResultOutput(result))
+		output := truncateToolOutput(toolResultOutput(result), p.cfg.ToolOutputMaxBytes)
 		s.input = append(s.input, marshal(map[string]any{"type": "function_call_output", "call_id": result.Call.ID, "output": output}))
 		s.messages = append(s.messages, contracts.Message{Role: "tool", ToolCallID: result.Call.ID, Content: output})
 	}
@@ -713,19 +716,27 @@ func cloneRawMessages(messages []json.RawMessage) []json.RawMessage {
 	return result
 }
 
-// toolOutputMaxChars is the fixed character budget for tool results stored in
-// the conversation. Larger results are truncated to fit, and the original
-// full output is still displayed on the terminal because the sink receives it
-// before the provider adapter is called.
-const toolOutputMaxChars = 16000
+const defaultToolOutputMaxBytes = 16000
 
-// truncateToolOutput returns s unchanged when it fits the budget and a
-// truncated copy with an explicit marker otherwise.
-func truncateToolOutput(s string) string {
-	if len(s) <= toolOutputMaxChars {
+// truncateToolOutput returns s unchanged when it fits the byte budget and a
+// truncated copy with an explicit marker otherwise. When the limit lands in
+// the middle of a UTF-8 encoding, it keeps the largest complete-rune prefix
+// that fits within the byte budget.
+func truncateToolOutput(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		maxBytes = defaultToolOutputMaxBytes
+	}
+	if len(s) <= maxBytes {
 		return s
 	}
-	return s[:toolOutputMaxChars] + fmt.Sprintf("[truncated: %d chars]", len(s)-toolOutputMaxChars)
+	cutAt := 0
+	for byteIndex := range s {
+		if byteIndex > maxBytes {
+			break
+		}
+		cutAt = byteIndex
+	}
+	return s[:cutAt] + fmt.Sprintf("[truncated: %d bytes]", len(s)-cutAt)
 }
 
 func toolResultOutput(result contracts.ToolResult) string {

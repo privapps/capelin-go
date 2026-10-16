@@ -198,12 +198,13 @@ completion offers `::agents`, `::limits`, `::session`, `::stats`, and `::todos`.
   one line, for example:
 
   ```text
-  [::limits] profile: ordinary; root iterations: 40; goal iterations: 20; subagent depth: 1; subagent children: 8; subagent parallel: 4; subagent iterations: 20; subagent timeout: 600s; tool parallel: 8; tool timeout: 60s; tool retry: true; preview budget: 160; idle hook: "my-hook" (source=env, mode=detached, timeout=disabled)
+  [::limits] profile: ordinary; root iterations: 40; goal iterations: 20; subagent depth: 1; subagent children: 8; subagent parallel: 4; subagent iterations: 20; subagent timeout: 600s; tool parallel: 8; tool timeout: 60s; tool result cap: 16000 bytes; tool retry: true; preview budget: 160; idle hook: "my-hook" (source=env, mode=detached, timeout=disabled)
   ```
 
   `profile:` is `ordinary` or `goal` and reports `goal` only while an accepted
   `/goal` has the goal profile selected, so goal-run budgets are always
-  distinguishable from ordinary ones. `preview budget:` is the resolved
+  distinguishable from ordinary ones. `tool result cap:` shows the configured
+  byte limit for provider-bound tool results. `preview budget:` is the resolved
   `AGENT_QUESTION_PREVIEW_MAX` value, and the idle-hook field reads
   `idle hook: disabled` when no hook is configured or `--no-idle-hook` was
   used. It accepts no arguments: `::limits anything` replies
@@ -384,6 +385,7 @@ credential and does not require an API key.
 | `MAX_GOAL_ITERATIONS` | Maximum outer iterations for a YOLO-gated `/goal` | `20` ordinary (`64` goal profile) |
 | `TOOL_MAX_PARALLEL` | Maximum tools used at the same time | `8` ordinary (`16` goal profile) |
 | `TOOL_TIMEOUT_SECONDS` | Default time allowed for one tool | `60` ordinary (`300` goal profile) |
+| `TOOL_OUTPUT_MAX_BYTES` | UTF-8 bytes retained from each tool result in provider conversation history before the truncation marker | `16000` |
 | `TOOL_RETRY_ON_TIMEOUT` | Retry a tool once after a timeout | `true` |
 | `IDLE_HOOK_COMMAND` | Local program run when a task or turn goes idle | empty (disabled) |
 | `IDLE_HOOK_ARGS` | Fixed argument vector for the hook, as a JSON string array | empty |
@@ -392,6 +394,12 @@ credential and does not require an API key.
 | `AGENT_QUESTION_PREVIEW_MAX` | Rune budget for bounded status/question previews (positive integer; invalid values fall back to the default) | `160` |
 
 Set reasoning to `none` or `nil` to leave it out of the request.
+
+`TOOL_OUTPUT_MAX_BYTES` can also be set with `--tool-output-max-bytes N`.
+It counts UTF-8 bytes retained from each result before adding a truncation
+marker. If the limit falls inside a multibyte character, the retained prefix
+ends before that character. This setting controls provider conversation
+history; the terminal tool-status preview has its own display limit.
 
 If the endpoint path ends in `/responses`, Capelin uses the Responses request format. Other endpoint paths use the Chat Completions format.
 

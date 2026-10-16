@@ -1,6 +1,7 @@
 package app
 
 import (
+	"capelin-go/internal/output"
 	"capelin-go/internal/types"
 	"context"
 	"encoding/json"
@@ -221,11 +222,19 @@ func TestTurnEngineIterationLimitDiagnosticRespectsEmitOutput(t *testing.T) {
 }
 
 func TestTurnEngineFinalOnlyParity(t *testing.T) {
-	chat := runProtocolFinalOnlyScenario(t, false)
-	responses := runProtocolFinalOnlyScenario(t, true)
+	chatOrdinary := runProtocolFinalOnlyScenario(t, false, false)
+	chatFinalOnly := runProtocolFinalOnlyScenario(t, false, true)
+	responsesOrdinary := runProtocolFinalOnlyScenario(t, true, false)
+	responsesFinalOnly := runProtocolFinalOnlyScenario(t, true, true)
 	want := []string{"content:root:finished"}
-	if !reflect.DeepEqual(chat, want) || !reflect.DeepEqual(responses, want) {
-		t.Fatalf("final-only output mismatch: chat=%v responses=%v", chat, responses)
+	if !reflect.DeepEqual(chatFinalOnly.events, want) || !reflect.DeepEqual(responsesFinalOnly.events, want) {
+		t.Fatalf("final-only output mismatch: chat=%v responses=%v", chatFinalOnly.events, responsesFinalOnly.events)
+	}
+	if !strings.Contains(strings.Join(chatOrdinary.events, "\n"), "intermediate") || !strings.Contains(strings.Join(responsesOrdinary.events, "\n"), "intermediate") {
+		t.Fatalf("ordinary mode did not expose intermediate output: chat=%v responses=%v", chatOrdinary.events, responsesOrdinary.events)
+	}
+	if chatOrdinary.toolResult != chatFinalOnly.toolResult || responsesOrdinary.toolResult != responsesFinalOnly.toolResult {
+		t.Fatalf("--final-only changed provider tool results: chat=(%q, %q), responses=(%q, %q)", chatOrdinary.toolResult, chatFinalOnly.toolResult, responsesOrdinary.toolResult, responsesFinalOnly.toolResult)
 	}
 }
 
@@ -529,7 +538,10 @@ func runProtocolTimeoutRetryScenario(t *testing.T, responses bool) turnRunResult
 	return turnRunResult{result: result, reasoning: reasoning, err: err, modelRequests: modelRequests, toolRequests: int(toolRequests.Load()), sink: sink}
 }
 
-func runProtocolFinalOnlyScenario(t *testing.T, responses bool) []string {
+func runProtocolFinalOnlyScenario(t *testing.T, responses, finalOnly bool) struct {
+	events     []string
+	toolResult string
+} {
 	t.Helper()
 	call := []map[string]any{{
 		"id": "final-only-call", "type": "function",
@@ -539,16 +551,31 @@ func runProtocolFinalOnlyScenario(t *testing.T, responses bool) []string {
 		protocolToolResponseWithContent(responses, "intermediate", call),
 		protocolTextResponse(responses, "finished", ""),
 	}
-	index := 0
+	var requests []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode final-only request: %v", err)
+			return
+		}
+		requests = append(requests, payload)
+		index := len(requests) - 1
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(bodies[index]))
-		index++
 	}))
 	defer server.Close()
 
 	baseSink := &turnEventSink{}
-	sink := &finalOnlySink{wrapped: baseSink}
+	var sink interface {
+		WriteContent(string, string)
+		WriteToolCall(string, string, string)
+		WriteToolResult(string, string, bool, string)
+		WriteSystem(string, string)
+	}
+	sink = baseSink
+	if finalOnly {
+		sink = output.NewFinalOnlySink(baseSink, rootAgentID)
+	}
 	endpoint := server.URL + "/chat/completions"
 	if responses {
 		endpoint = server.URL + "/responses"
@@ -560,7 +587,7 @@ func runProtocolFinalOnlyScenario(t *testing.T, responses bool) []string {
 			toolMaxParallel: 1,
 			toolTimeoutSec:  5,
 			allowedTools:    map[string]bool{toolListFiles: true},
-			finalOnly:       true,
+			finalOnly:       finalOnly,
 		},
 		client: &client{endpoint: endpoint, model: "test-model", http: server.Client()},
 		sink:   sink,
@@ -570,8 +597,17 @@ func runProtocolFinalOnlyScenario(t *testing.T, responses bool) []string {
 	if err != nil {
 		t.Fatalf("final-only turn failed: %v", err)
 	}
-	sink.FlushContent()
-	return baseSink.snapshot()
+	if finalSink, ok := sink.(*output.FinalOnlySink); ok {
+		finalSink.FlushContent()
+	}
+	toolResult, ok := toolResultFromRequest(requests[1], responses, "final-only-call")
+	if !ok {
+		t.Fatal("continuation request omitted the provider tool result")
+	}
+	return struct {
+		events     []string
+		toolResult string
+	}{events: baseSink.snapshot(), toolResult: toolResult}
 }
 
 func runProtocolSubagentScenario(t *testing.T, responses bool) struct {

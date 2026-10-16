@@ -1631,6 +1631,7 @@ func TestInteractiveLimitsReportsEffectiveOrdinaryLimits(t *testing.T) {
 		"subagent timeout: 600s",
 		"tool parallel: 8",
 		"tool timeout: 60s",
+		"tool result cap: 16000 bytes",
 		"tool retry: true",
 		"preview budget: 90",
 		`idle hook: "my-hook" (source=env, mode=detached, timeout=disabled)`,
@@ -1641,6 +1642,20 @@ func TestInteractiveLimitsReportsEffectiveOrdinaryLimits(t *testing.T) {
 	}
 	if strings.Contains(line, "\n") {
 		t.Fatalf("::limits rendered more than one line: %q", line)
+	}
+}
+
+func TestInteractiveLimitsReportsConfiguredToolResultCap(t *testing.T) {
+	testApp := limitsTestApp(t)
+	testApp.app.cfg.toolOutputMaxBytes = 4096
+	if got := testApp.app.formatInteractiveLimits(nil); !strings.Contains(got, "tool result cap: 4096 bytes") {
+		t.Fatalf("::limits omitted configured tool-result cap: %q", got)
+	}
+}
+
+func TestInteractiveLimitsUsesDefaultToolResultCapWhenUnset(t *testing.T) {
+	if got := (&app{}).formatInteractiveLimits(nil); !strings.Contains(got, "tool result cap: 16000 bytes") {
+		t.Fatalf("::limits omitted default tool-result cap: %q", got)
 	}
 }
 
@@ -1672,6 +1687,7 @@ func TestInteractiveLimitsReportsGoalProfileWhenSelected(t *testing.T) {
 		"subagent iterations: 32",
 		"tool parallel: 16",
 		"tool timeout: 300s",
+		"tool result cap: 16000 bytes",
 	} {
 		if !strings.Contains(goalLine, want) {
 			t.Fatalf("goal ::limits output missing %q: %q", want, goalLine)

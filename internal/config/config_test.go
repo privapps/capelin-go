@@ -25,6 +25,7 @@ var numericConfigKeys = []string{
 	"SUBAGENT_MAX_ITERATIONS",
 	"TOOL_MAX_PARALLEL",
 	"TOOL_TIMEOUT_SECONDS",
+	"TOOL_OUTPUT_MAX_BYTES",
 	"ASYNC_TIMEOUT_SECONDS",
 	"ASYNC_RESULT_TTL_SECONDS",
 }
@@ -76,6 +77,86 @@ func TestLoadSearchProviderSelectionAndCredentials(t *testing.T) {
 	}
 }
 
+func TestToolOutputMaxBytesConfigurationPrecedence(t *testing.T) {
+	t.Run("CLI overrides environment and saved values", func(t *testing.T) {
+		path := isolateLoad(t)
+		t.Setenv("TOOL_OUTPUT_MAX_BYTES", "500")
+		writeConfig(t, path, map[string]string{"ENDPOINT": defaultEndpoint, "TOOL_OUTPUT_MAX_BYTES": "400"})
+		cfg, err := Load([]string{"--tool-output-max-bytes", "300", "task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.ToolOutputMaxBytes != 300 {
+			t.Fatalf("CLI tool result cap = %d, want 300", cfg.ToolOutputMaxBytes)
+		}
+	})
+
+	t.Run("environment overrides saved values", func(t *testing.T) {
+		path := isolateLoad(t)
+		writeConfig(t, path, map[string]string{"ENDPOINT": defaultEndpoint, "TOOL_OUTPUT_MAX_BYTES": "400"})
+		t.Setenv("TOOL_OUTPUT_MAX_BYTES", "500")
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.ToolOutputMaxBytes != 500 {
+			t.Fatalf("environment tool result cap = %d, want 500", cfg.ToolOutputMaxBytes)
+		}
+	})
+
+	t.Run("saved value overrides built-in default", func(t *testing.T) {
+		path := isolateLoad(t)
+		writeConfig(t, path, map[string]string{"ENDPOINT": defaultEndpoint, "TOOL_OUTPUT_MAX_BYTES": "400"})
+		cfg, err := Load([]string{"task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.ToolOutputMaxBytes != 400 {
+			t.Fatalf("saved tool result cap = %d, want 400", cfg.ToolOutputMaxBytes)
+		}
+	})
+
+	t.Run("equal-sign flag form", func(t *testing.T) {
+		isolateLoad(t)
+		cfg, err := Load([]string{"--tool-output-max-bytes=300", "task"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.ToolOutputMaxBytes != 300 {
+			t.Fatalf("CLI tool result cap = %d, want 300", cfg.ToolOutputMaxBytes)
+		}
+	})
+}
+
+func TestToolOutputMaxBytesRejectsInvalidValuesFromEverySource(t *testing.T) {
+	for _, value := range []string{"0", "-1", "not-a-number"} {
+		for _, source := range []string{"CLI", "environment", "saved config"} {
+			t.Run(source+"/"+value, func(t *testing.T) {
+				path := isolateLoad(t)
+				var args []string
+				switch source {
+				case "CLI":
+					args = []string{"--tool-output-max-bytes", value, "task"}
+				case "environment":
+					t.Setenv("TOOL_OUTPUT_MAX_BYTES", value)
+					args = []string{"task"}
+				case "saved config":
+					writeConfig(t, path, map[string]string{
+						"ENDPOINT":              defaultEndpoint,
+						"TOOL_OUTPUT_MAX_BYTES": value,
+					})
+					args = []string{"task"}
+				}
+				if _, err := Load(args); err == nil {
+					t.Fatalf("Load accepted %s value %q", source, value)
+				} else if !strings.Contains(err.Error(), "TOOL_OUTPUT_MAX_BYTES") && !strings.Contains(err.Error(), "--tool-output-max-bytes") {
+					t.Fatalf("configuration error does not identify the setting: %v", err)
+				}
+			})
+		}
+	}
+}
+
 func unsetEnvForTest(t *testing.T, key string) {
 	t.Helper()
 	previous, present := os.LookupEnv(key)
@@ -120,6 +201,9 @@ func TestLoadFirstRunUsesProviderDefaultsAndGeneratesOrdinaryConfig(t *testing.T
 		t.Fatalf("unexpected provider defaults: endpoint=%q model=%q token=%q reasoning=%q", cfg.Endpoint, cfg.Model, cfg.Token, cfg.Reasoning)
 	}
 	assertOrdinaryDefaults(t, cfg.OrdinaryProfile())
+	if cfg.ToolOutputMaxBytes != DefaultToolOutputMaxBytes {
+		t.Fatalf("tool result cap = %d, want default %d", cfg.ToolOutputMaxBytes, DefaultToolOutputMaxBytes)
+	}
 	if cfg.AsyncTimeout != 15*time.Minute || cfg.AsyncResultTTL != time.Hour {
 		t.Fatalf("async lifetime defaults = timeout %s, result TTL %s; want 15m and 1h", cfg.AsyncTimeout, cfg.AsyncResultTTL)
 	}
@@ -142,6 +226,7 @@ func TestLoadFirstRunUsesProviderDefaultsAndGeneratesOrdinaryConfig(t *testing.T
 		"SUBAGENT_MAX_ITERATIONS = 20",
 		"TOOL_MAX_PARALLEL = 8",
 		"TOOL_TIMEOUT_SECONDS = 60",
+		"TOOL_OUTPUT_MAX_BYTES = 16000",
 		"ASYNC_TIMEOUT_SECONDS = 900",
 		"ASYNC_RESULT_TTL_SECONDS = 3600",
 		"IDLE_HOOK_COMMAND =",
@@ -509,6 +594,7 @@ func TestLoadRejectsInvalidNonPositiveNumericValuesFromEverySource(t *testing.T)
 		"SUBAGENT_MAX_ITERATIONS":       "--subagent-max-iterations",
 		"TOOL_MAX_PARALLEL":             "--tool-max-parallel",
 		"TOOL_TIMEOUT_SECONDS":          "--tool-timeout-seconds",
+		"TOOL_OUTPUT_MAX_BYTES":         "--tool-output-max-bytes",
 	}
 	for key, flag := range flags {
 		t.Run("CLI/"+key, func(t *testing.T) {

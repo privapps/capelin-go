@@ -395,7 +395,7 @@ func formatInteractiveStats(cfg config) string {
 // interactive session as one line. The format is stable and intentionally
 // compact:
 //
-//	[::limits] profile: ordinary; root iterations: 40; goal iterations: 20; subagent depth: 1; subagent children: 8; subagent parallel: 4; subagent iterations: 20; subagent timeout: 600s; tool parallel: 8; tool timeout: 60s; tool retry: true; preview budget: 160; idle hook: "my-hook" (source=env, mode=detached, timeout=disabled)
+//	[::limits] profile: ordinary; root iterations: 40; goal iterations: 20; subagent depth: 1; subagent children: 8; subagent parallel: 4; subagent iterations: 20; subagent timeout: 600s; tool parallel: 8; tool timeout: 60s; tool result cap: 16000 bytes; tool retry: true; preview budget: 160; idle hook: "my-hook" (source=env, mode=detached, timeout=disabled)
 //
 // Field contract:
 //   - "[::limits] " is the fixed label; every remaining field is a
@@ -409,6 +409,8 @@ func formatInteractiveStats(cfg config) string {
 //     view cannot drift from what the runtime applies. Subagent and tool
 //     timeouts carry a trailing "s" for seconds; "tool retry" is the bare Go
 //     boolean literal true or false.
+//   - "tool result cap:" reports the configured UTF-8 bytes retained from a
+//     provider-bound tool result before its truncation marker.
 //   - "preview budget:" is the resolved agent-question preview cap, or the
 //     built-in default 160 when no positive value is configured.
 //   - "idle hook:" is either the quoted command with its source and timeout,
@@ -435,6 +437,10 @@ func (a *app) formatInteractiveLimits(session *interactiveSession) string {
 	if preview <= 0 {
 		preview = configpkg.DefaultAgentQuestionPreviewMax
 	}
+	toolOutputMaxBytes := cfg.toolOutputMaxBytes
+	if toolOutputMaxBytes <= 0 {
+		toolOutputMaxBytes = configpkg.DefaultToolOutputMaxBytes
+	}
 	fields := []string{
 		"profile: " + label,
 		fmt.Sprintf("root iterations: %d", active.MaxIterations),
@@ -446,6 +452,7 @@ func (a *app) formatInteractiveLimits(session *interactiveSession) string {
 		fmt.Sprintf("subagent timeout: %ds", active.Subagents.DefaultTimeoutSec),
 		fmt.Sprintf("tool parallel: %d", active.ToolMaxParallel),
 		fmt.Sprintf("tool timeout: %ds", active.ToolTimeoutSec),
+		fmt.Sprintf("tool result cap: %d bytes", toolOutputMaxBytes),
 		fmt.Sprintf("tool retry: %t", active.ToolRetryOnTimeout),
 		fmt.Sprintf("preview budget: %d", preview),
 		formatIdleHookLimitsField(cfg),

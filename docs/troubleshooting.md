@@ -166,10 +166,11 @@ Manual `/compact` also works on over-budget conversations: it summarizes
 within a fixed character budget, so the summarization request itself fits the
 window. Existing session identity, metadata, and checklist are preserved.
 
-Tool output entering the conversation is truncated to a fixed character limit
-(full output is still shown in the terminal), and older assistant reasoning
-content is stripped from provider requests. These measures keep history growth
-bounded during long runs.
+Tool output entering the conversation is truncated at the configured byte
+limit, which defaults to 16,000 bytes. Set `TOOL_OUTPUT_MAX_BYTES` or
+`--tool-output-max-bytes` to raise it. Full output is still shown in the
+terminal, and older assistant reasoning content is stripped from provider
+requests. These measures keep history growth bounded during long runs.
 
 To prevent overflow proactively, set `--context-window N` (character budget) or
 `CONTEXT_WINDOW` in the environment; compaction triggers automatically when the

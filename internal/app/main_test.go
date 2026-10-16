@@ -1,6 +1,7 @@
 package app
 
 import (
+	"capelin-go/internal/contracts"
 	"capelin-go/internal/output"
 	"capelin-go/internal/server"
 	"capelin-go/internal/skills"
@@ -72,6 +73,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.modelRequestTimeout != defaultModelRequestTimeout {
 		t.Fatalf("unexpected model request timeout: %s", cfg.modelRequestTimeout)
 	}
+	if cfg.toolOutputMaxBytes != 16000 {
+		t.Fatalf("unexpected tool result byte cap: %d", cfg.toolOutputMaxBytes)
+	}
 	if !cfg.allowedTools[toolListFiles] || !cfg.allowedTools[toolReadFile] {
 		t.Fatal("expected safe default tools to be enabled")
 	}
@@ -80,6 +84,20 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if cfg.allowedTools[toolWriteFile] || cfg.allowedTools[toolExecuteProgram] || cfg.allowedTools[toolEditFile] {
 		t.Fatal("expected mutating/exec tools disabled by default")
+	}
+}
+
+func TestClientProviderUsesConfiguredToolResultCap(t *testing.T) {
+	provider := (&client{toolOutputMaxBytes: 6}).agentProvider()
+	state := provider.Initialize(nil, "inspect")
+	call := contracts.ToolCall{
+		ID: "call-cap", Type: "function",
+		Function: contracts.FunctionCall{Name: "lookup", Arguments: `{}`},
+	}
+	provider.ApplyToolResults(state, []contracts.ToolResult{{Call: call, Output: "é😃abc"}})
+	messages := state.Messages()
+	if got, want := messages[1].Content, "é😃[truncated: 3 bytes]"; got != want {
+		t.Fatalf("configured provider tool result = %q, want %q", got, want)
 	}
 }
 
@@ -102,6 +120,8 @@ func TestPrintUsageDescribesProviderAndRuntimeProfileContract(t *testing.T) {
 		"default 900 seconds",
 		"default 3600 seconds",
 		"--model-request-timeout-seconds",
+		"--tool-output-max-bytes",
+		"TOOL_OUTPUT_MAX_BYTES",
 		"CLI flags > environment > saved config > built-in defaults",
 		"Ordinary limits:",
 		"Goal-run limits:",

@@ -88,6 +88,7 @@ type config struct {
 	noIdleHook          bool
 	toolMaxParallel     int  // max concurrent tool calls per LLM turn (0 = serial; empty = default 8)
 	toolTimeoutSec      int  // per-tool deadline in seconds (0 = no per-tool cap; empty = default 60)
+	toolOutputMaxBytes  int  // maximum UTF-8 bytes retained from each tool result in provider history
 	toolRetryOnTimeout  bool // retry once on timeout (0 = disable; empty = default true)
 	contextWindow       int  // optional conversation budget in characters; 0 = disabled
 	// agentQuestionPreviewMax is the rune budget wired into internal/output at
@@ -242,12 +243,13 @@ type interactiveSession struct {
 }
 
 type client struct {
-	endpoint  string
-	token     string
-	model     string
-	reasoning string
-	debug     bool
-	http      *http.Client
+	endpoint           string
+	token              string
+	model              string
+	reasoning          string
+	debug              bool
+	http               *http.Client
+	toolOutputMaxBytes int
 }
 
 func (c *client) agentProvider() agent.Provider {
@@ -255,11 +257,12 @@ func (c *client) agentProvider() agent.Provider {
 		return providers.New(providers.Config{})
 	}
 	return providers.New(providers.Config{
-		Endpoint: c.endpoint,
-		Token:    c.token,
-		Model:    c.model,
-		Debug:    c.debug,
-		HTTP:     c.http,
+		Endpoint:           c.endpoint,
+		Token:              c.token,
+		Model:              c.model,
+		Debug:              c.debug,
+		HTTP:               c.http,
+		ToolOutputMaxBytes: c.toolOutputMaxBytes,
 	})
 }
 
@@ -322,11 +325,12 @@ func newApp(cfg config) (*app, error) {
 	instance := &app{
 		cfg: cfg,
 		client: &client{
-			endpoint:  strings.TrimRight(cfg.endpoint, "/"),
-			token:     cfg.token,
-			model:     cfg.model,
-			reasoning: cfg.reasoning,
-			debug:     cfg.debug,
+			endpoint:           strings.TrimRight(cfg.endpoint, "/"),
+			token:              cfg.token,
+			model:              cfg.model,
+			reasoning:          cfg.reasoning,
+			debug:              cfg.debug,
+			toolOutputMaxBytes: cfg.toolOutputMaxBytes,
 			http: &http.Client{
 				Timeout: modelRequestTimeout(cfg),
 				Transport: &http.Transport{
@@ -444,6 +448,7 @@ func loadConfig(args []string) (config, error) {
 		noIdleHook:              parsed.NoIdleHook,
 		toolMaxParallel:         parsed.ToolMaxParallel,
 		toolTimeoutSec:          parsed.ToolTimeoutSec,
+		toolOutputMaxBytes:      parsed.ToolOutputMaxBytes,
 		toolRetryOnTimeout:      parsed.ToolRetryOnTimeout,
 		contextWindow:           parsed.ContextWindow,
 		agentQuestionPreviewMax: parsed.AgentQuestionPreviewMax,
@@ -516,7 +521,7 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "     SUBAGENT_MAX_DEPTH, SUBAGENT_MAX_CHILDREN, SUBAGENT_MAX_PARALLEL, SUBAGENT_TIMEOUT_SECONDS")
 	fmt.Fprintln(w, "     SUBAGENT_MAX_RESULT_CHARS, SUBAGENT_MAX_AGGREGATE_CHARS, SUBAGENT_MAX_ITERATIONS")
 	fmt.Fprintln(w, "     SUBAGENT_MODEL, SUBAGENT_REASONING_EFFORT")
-	fmt.Fprintln(w, "     TOOL_MAX_PARALLEL, TOOL_TIMEOUT_SECONDS, TOOL_RETRY_ON_TIMEOUT")
+	fmt.Fprintln(w, "     TOOL_MAX_PARALLEL, TOOL_TIMEOUT_SECONDS, TOOL_OUTPUT_MAX_BYTES, TOOL_RETRY_ON_TIMEOUT")
 	fmt.Fprintln(w, "Provider defaults: ENDPOINT=https://opencode.ai/zen/v1/chat/completions MODEL=deepseek-v4.1-flash-free TOKEN=public REASONING_EFFORT=high")
 	fmt.Fprintln(w, "OpenCode Zen also accepts https://opencode.ai/inference/v1/chat/completions; both exact endpoints allow an optional trailing slash. TOKEN=public enables anonymous free-tier access without an API key.")
 	fmt.Fprintln(w, "Configuration precedence: CLI flags > environment > saved config > built-in defaults")
@@ -551,6 +556,7 @@ func PrintUsage(w io.Writer, executable string) {
 	fmt.Fprintln(w, "Tool execution (flags, env vars, or config file):")
 	fmt.Fprintln(w, "  --tool-max-parallel N               (ordinary 8; goal-run 16; env TOOL_MAX_PARALLEL)")
 	fmt.Fprintln(w, "  --tool-timeout-seconds N            (ordinary 60; goal-run 300; env TOOL_TIMEOUT_SECONDS)")
+	fmt.Fprintln(w, "  --tool-output-max-bytes N           (default 16000 bytes; env TOOL_OUTPUT_MAX_BYTES)")
 	fmt.Fprintln(w, "  --tool-retry-on-timeout             (default true;  env TOOL_RETRY_ON_TIMEOUT)")
 	fmt.Fprintln(w, "  --no-tool-retry-on-timeout          (disable retry)")
 	fmt.Fprintln(w, "All tools + unrestricted paths (does not select goal budgets):  --yolo")
